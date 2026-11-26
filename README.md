@@ -21,26 +21,33 @@ High-performance, async Python library, CLI, and MCP server covering **30 offici
 Requires **Python 3.11+**.
 
 ```bash
-# Install the core package
+# Add to a uv project (recommended)
+uv add legisbr
+
+# Or install with uv pip / pip
+uv pip install legisbr
 pip install legisbr
 
-# Or try the CLI immediately with uvx
+# Install the CLI globally or run it without installing via uv
+uv tool install legisbr
 uvx legisbr list
 ```
 
 ### Optional Extras
 
-| Extra | Install | Purpose |
-| --- | --- | --- |
-| `ocr` | `pip install "legisbr[ocr]"` | Scanned PDF OCR via PydanticAI (OpenAI default) |
-| `ocr-openai` | `pip install "legisbr[ocr-openai]"` | OpenAI / OpenAI-compatible OCR provider |
-| `ocr-anthropic` | `pip install "legisbr[ocr-anthropic]"` | Anthropic Claude OCR provider |
-| `ocr-google` | `pip install "legisbr[ocr-google]"` | Google Gemini OCR provider |
-| `ocr-bedrock` | `pip install "legisbr[ocr-bedrock]"` | AWS Bedrock OCR provider |
-| `proxy` | `pip install "legisbr[proxy]"` | SOCKS/HTTP proxy rotation (`aiohttp-socks`, used for Paraná) |
-| `parquet` | `pip install "legisbr[parquet]"` | Fixed-schema streaming ZSTD Parquet export (`pyarrow`) |
-| `mcp` | `pip install "legisbr[mcp]"` | Model Context Protocol server (`mcp`) for AI agents |
-| `all` | `pip install "legisbr[all]"` | All optional extras combined (zero GPL/AGPL/LGPL) |
+| Extra | `uv` (project) | `pip` / `uv pip` | Purpose |
+| --- | --- | --- | --- |
+| `ocr` | `uv add "legisbr[ocr]"` | `pip install "legisbr[ocr]"` | Scanned PDF OCR via PydanticAI (OpenAI default) |
+| `ocr-openai` | `uv add "legisbr[ocr-openai]"` | `pip install "legisbr[ocr-openai]"` | OpenAI / OpenAI-compatible OCR provider |
+| `ocr-anthropic` | `uv add "legisbr[ocr-anthropic]"` | `pip install "legisbr[ocr-anthropic]"` | Anthropic Claude OCR provider |
+| `ocr-google` | `uv add "legisbr[ocr-google]"` | `pip install "legisbr[ocr-google]"` | Google Gemini OCR provider |
+| `ocr-bedrock` | `uv add "legisbr[ocr-bedrock]"` | `pip install "legisbr[ocr-bedrock]"` | AWS Bedrock OCR provider |
+| `proxy` | `uv add "legisbr[proxy]"` | `pip install "legisbr[proxy]"` | SOCKS/HTTP proxy rotation (`aiohttp-socks`, used for Paraná) |
+| `parquet` | `uv add "legisbr[parquet]"` | `pip install "legisbr[parquet]"` | Fixed-schema streaming ZSTD Parquet export (`pyarrow`) |
+| `mcp` | `uv add "legisbr[mcp]"` | `pip install "legisbr[mcp]"` | Model Context Protocol server (`mcp`) for AI agents |
+| `all` | `uv add "legisbr[all]"` | `pip install "legisbr[all]"` | All optional extras combined (zero GPL/AGPL/LGPL) |
+
+For standalone CLI installs with extras, use `uv tool install "legisbr[parquet,mcp]"` (or `uv pip install "legisbr[all]"` in an existing virtual environment).
 
 ---
 
@@ -170,7 +177,7 @@ Names, codes, and aliases shown by `legisbr list` are case-insensitive. A `run` 
 
 ## MCP Server (Claude Desktop / Claude Code / Agents)
 
-Install with `legisbr[mcp]` (or run directly via `uvx`) to give AI assistants instant, read-only BM25 search over local Brazilian legislation archives.
+Install with `uv add "legisbr[mcp]"`, `uv tool install "legisbr[mcp]"`, `uv pip install "legisbr[mcp]"`, or `pip install "legisbr[mcp]"` (or run directly via `uvx`) to give AI assistants instant, read-only BM25 search over local Brazilian legislation archives.
 
 Tools exposed:
 - `list_sources` — all 30 jurisdictions with local archive coverage and search capabilities.
@@ -283,6 +290,8 @@ Provider credentials follow PydanticAI's standard environment variables (`OPENAI
 ## Development
 
 ```bash
+git clone https://github.com/felipeoes/legisbr.git
+cd legisbr
 uv sync --all-extras --group dev
 uv run ruff check src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
 uv run ruff format --check src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py

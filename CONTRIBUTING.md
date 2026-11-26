@@ -7,8 +7,16 @@ Thank you for helping keep Brazilian federal, state, and environmental legislati
 Requirements: **Python 3.11+** and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
+git clone https://github.com/felipeoes/legisbr.git
+cd legisbr
 uv sync --all-extras --group dev
 uv run pytest tests -m "not integration" -n auto
+```
+
+If you prefer installing editable into an existing virtual environment:
+
+```bash
+uv pip install -e ".[all]"   # or: pip install -e ".[all]"
 ```
 
 ## Fix a Broken State Scraper in 10 Minutes
