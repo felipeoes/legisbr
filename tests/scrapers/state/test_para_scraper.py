@@ -6,11 +6,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
-import pdf_oxide
 import pytest
 from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests
+from pdf_fixtures import make_digital_pdf
 
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION
 from legisbr.scrapers.states.pa import TYPES, ParaAlepaScraper
@@ -23,7 +23,7 @@ def _html(name: str) -> str:
 
 
 def _pdf(text: str) -> bytes:
-    return pdf_oxide.Pdf.from_text(text).to_bytes()
+    return make_digital_pdf(text)
 
 
 class TestTypesConstant(TypesConstantTests):

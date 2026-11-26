@@ -3,64 +3,14 @@
 from __future__ import annotations
 
 import io
-import struct
-import zlib
 
-import pdf_oxide
 import pypdf
 import pytest
+from pdf_fixtures import make_digital_pdf as _make_digital_pdf
+from pdf_fixtures import make_scanned_pdf as _make_scanned_pdf
 
 from legisbr.core.convert import is_pdf_scanned
 from legisbr.core.pdf import run_pdf_task as REAL_RUN_PDF_TASK
-
-
-def _make_digital_pdf(
-    text: str = "Art. 1º Este é um decreto digital com texto suficiente para validação.",
-) -> bytes:
-    """Create a minimal digital PDF with selectable text (no images)."""
-    return pdf_oxide.Pdf.from_text(text).to_bytes()
-
-
-def _make_scanned_pdf() -> bytes:
-    """Create a PDF that looks scanned (full-page image, no text)."""
-
-    def _minimal_png(w: int, h: int) -> bytes:
-        raw = b""
-        for _ in range(h):
-            raw += b"\x00" + b"\xff" * (w * 3)
-        compressed = zlib.compress(raw)
-
-        def _chunk(ctype: bytes, data: bytes) -> bytes:
-            c = ctype + data
-            return (
-                struct.pack(">I", len(data))
-                + c
-                + struct.pack(">I", zlib.crc32(c) & 4294967295)
-            )
-
-        ihdr_data = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-        return (
-            b"\x89PNG\r\n\x1a\n"
-            + _chunk(b"IHDR", ihdr_data)
-            + _chunk(b"IDAT", compressed)
-            + _chunk(b"IEND", b"")
-        )
-
-    raw = pdf_oxide.Pdf.from_image_bytes(_minimal_png(595, 842)).to_bytes()
-    doc = pdf_oxide.PdfDocument.from_bytes(raw)
-    imgs = doc.page_images(0)
-    if not imgs:
-        return raw
-    reader = pypdf.PdfReader(io.BytesIO(raw))
-    writer = pypdf.PdfWriter()
-    page = writer.add_page(reader.pages[0])
-    img = imgs[0]
-    x0, y0 = float(img["x"]), float(img["y"])
-    page.mediabox.lower_left = (x0, y0)
-    page.mediabox.upper_right = (x0 + float(img["width"]), y0 + float(img["height"]))
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue()
 
 
 def _make_png_bytes() -> bytes:

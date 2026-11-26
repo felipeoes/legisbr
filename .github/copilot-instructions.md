@@ -41,7 +41,7 @@ uv run pre-commit run --all-files
   - `store.py` & `archive.py`: SQLite Schema v2 per archive with Portuguese diacritic-insensitive FTS5, streaming JSON/JSONL/ZSTD Parquet export, and read-only multi-archive `ArchiveIndex`.
   - `scraper.py` & `sapl.py`: `BaseScraper` bounded queue workers, resume deduplication, stats, streaming, and shared SAPL API support (`pb`, `pi`, `rr`).
   - `http.py` & `proxy.py`: `HttpClient`, zero-dependency GCRA `RateLimiter`, verified TLS by default, and optional proxy rotation (`legisbr[proxy]`).
-  - `pdf.py`, `convert.py`, `images.py`, `ocr.py`: Permissive `pdf_oxide` + `pypdf` PDF pipeline, HTML/DOCX conversion, bounded single-flight `ImageCache`, and optional PydanticAI `OCR` (`legisbr[ocr-*]`).
+  - `pdf.py`, `convert.py`, `images.py`, `ocr.py`: Permissive `pypdfium2` + `pypdf` + selective `pdfplumber` + `pillow` PDF pipeline, HTML/DOCX conversion, bounded single-flight `ImageCache`, and optional PydanticAI `OCR` (`legisbr[ocr]`).
 - `src/legisbr/scrapers/`: `states/<uf>.py`, `federal/camara.py`, and `environment/{conama,icmbio}.py`.
 
 ## Scraper Contract & Conventions

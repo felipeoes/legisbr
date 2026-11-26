@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
-import pdf_oxide
 import pytest
 from conftest import make_mock_response, make_scraper
+from pdf_fixtures import make_digital_pdf
 
 from legisbr.scrapers.environment.icmbio import (
     COLUMNS,
@@ -464,9 +464,9 @@ _ARTICLE = (
 
 
 def _pdf() -> bytes:
-    return pdf_oxide.Pdf.from_text(
+    return make_digital_pdf(
         "Art. 1º Fica aprovado o plano de manejo da unidade de conservação. " * 20
-    ).to_bytes()
+    )
 
 
 class TestICMBioFetch:
@@ -537,6 +537,33 @@ class TestICMBioFetch:
         ]
         with pytest.raises(ValueError, match="texto-dou"):
             await scraper.fetch(_ref("https://www.in.gov.br/web/dou/-/x-1"))
+
+    def test_clean_dou_pdf_markdown_strips_headers_authenticity_and_icp_brasil(self):
+        raw_md = (
+            "### Seção 1\n\n"
+            "**PORTARIA Nº 1.039, DE 29 DE NOVEMBRO DE 2018**\n\n"
+            "Art. 7º Compete ao órgão:\n\n"
+            "VIII - implementar planos de comunicação;\n\n"
+            "Este documento pode ser verificado no endereço eletrônico\n\n"
+            "228 http://www.in.gov.br/autenticidade.html, pelo código 05152018113000228\n\n"
+            "ISSN 1677-7042\n\n"
+            "Nº 230, sexta-feira, 30 de novembro de 2018\n\n"
+            "IX - planejar e executar diagnósticos ambientais.\n\n"
+            "202 Documento assinado digitalmente conforme MP nº 2.200-2 de 24/08/2001, "
+            "que institui a Infraestrutura de Chaves Públicas Brasileira - ICP-Brasil.| 200.000 | 0 |\n"
+            "|---|---|\n"
+            "| 0 | 100 |"
+        )
+        cleaned = ICMBioScraper._clean_dou_pdf_markdown(raw_md)
+        assert "Seção 1" not in cleaned
+        assert "ISSN 1677-7042" not in cleaned
+        assert "autenticidade.html" not in cleaned
+        assert "ICP-Brasil" not in cleaned
+        assert "MP nº 2.200-2" not in cleaned
+        assert "PORTARIA Nº 1.039" in cleaned
+        assert "VIII - implementar" in cleaned
+        assert "IX - planejar" in cleaned
+        assert "\n| 200.000 | 0 |" in cleaned
 
 
 INTEGRATION_YEAR = 2026

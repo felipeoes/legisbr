@@ -16,6 +16,7 @@ from dataclasses import dataclass
 CORE_ALLOWLIST: frozenset[str] = frozenset(
     {
         "MIT",
+        "MIT-CMU",
         "BSD-2-Clause",
         "BSD-3-Clause",
         "Apache-2.0",
@@ -48,6 +49,12 @@ MANUAL_OVERRIDES: dict[str, str] = {
     # PyPI wheel leaves `License` blank and sets only generic `BSD License` classifier.
     # Upstream repository (mwilliamson/python-cobble) LICENSE file is BSD-2-Clause.
     "cobble": "BSD-2-Clause",
+    # PyPI wheel bundles `LICENSE` (Apache-2.0) while omitting PEP 639 / core metadata `License` fields.
+    "mistralai": "Apache-2.0",
+    # PyPI wheel sets freeform `License: BSD-3-Clause, Apache-2.0, dependency licenses`.
+    # pypdfium2 is dual-licensed Apache-2.0 OR BSD-3-Clause, and all bundled PDFium
+    # BUILD_LICENSES are permissive (Apache-2.0, BSD-2/3-Clause, MIT, Zlib, IJG, Unicode-3.0, FTL).
+    "pypdfium2": "Apache-2.0 OR BSD-3-Clause",
 }
 
 _CLASSIFIER_MAP: dict[str, str] = {

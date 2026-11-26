@@ -1,16 +1,19 @@
-"""Permissive high-performance PDF engine built on ``pdf_oxide`` and ``pypdf``.
+"""Permissive high-performance PDF engine built on ``pypdfium2``, ``pypdf``, ``pdfplumber``, and ``pillow``.
 
-Self-contained (stdlib + ``pdf_oxide`` + ``pypdf`` only) so ``spawn`` worker
-subprocesses start fast without importing ``aiohttp``, ``bs4``, or ``lxml``,
-and ``legisbr.core.convert`` can import from here without circularity.
+Self-contained (stdlib + ``pypdfium2`` at module import; ``pypdf``, ``pdfplumber``,
+and ``PIL`` are imported lazily on demand) so ``spawn`` worker subprocesses start
+fast without importing ``aiohttp``, ``bs4``, ``lxml``, or ``pdfminer`` unless a
+page actually requires ruled-table extraction, slicing, or rendering.
 """
 
 from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
+import ctypes
+import hashlib
 import io
-import json
 import logging
 import multiprocessing
 import os
@@ -21,10 +24,11 @@ import weakref
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-import pdf_oxide
-import pypdf
+import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 
 if TYPE_CHECKING:
     from legisbr.core.ocr import OCR
@@ -76,37 +80,90 @@ _WATERMARK_CHECK_RE = re.compile(r"(?:\n[^\n]{0,2}){15,}")
 _MD_BASE64_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(data:image/[^)]+\)")
 _C1_RE = re.compile(r"[\x80-\x9f]")
 _NON_IMAGE_LINK_RE = re.compile(r"(?<!!)\[([^\]]*)\]\([^)]*\)")
+_MULTI_BLANK_RE = re.compile(r"\n{3,}")
 
-# Legislative structure restoration regexes (citation-safe):
-# 1. Structural headings merged mid-paragraph after punctuation.
-_HEADING_BREAK_RE = re.compile(
-    r"([.!?;:\)])\s+"
-    r"((?:\*\*)?(?:T[ÍI]TULO|CAP[ÍI]TULO|SE[ÇC][ÃA]O|SUBSE[ÇC][ÃA]O|LIVRO)\s+[IVXLCDM\d]+)"
-)
-# 2. New Art. N / § N / Parágrafo único after sentence-ending punctuation or bold closing (**).
-#    Requires uppercase "Art." + preceding terminator so inline citations like
-#    "nos termos do art. 5º", "conforme o Art. 10", or "previsto no § 2º" are never split.
-_ARTICLE_PARAGRAPH_BREAK_RE = re.compile(
-    r"([.!?;:\)]|\*\*)\s+"
-    r"((?:\*\*)?(?:Art\.?\s*\d+[º°oª]?(?:-[A-Z])?\.?|§\s*\d+[º°oª]?\.?|Par[aá]grafo\s+[uú]nico\.?)\s+)"
-)
-# 3. ALL-CAPS heading immediately followed by Art. N (e.g. "DAS DEFINIÇÕES Art. 4º").
-_CAPS_HEADING_ART_RE = re.compile(
-    r"([A-ZÀ-Þ]{3,})\s+((?:\*\*)?Art\.?\s*\d+[º°oª]?(?:-[A-Z])?\.?\s+)"
-)
-# 4. Roman numeral incisos ("I -", "II -", ..., "XXXVIII -") after ";", ":", or "; e".
+# ---------------------------------------------------------------------------
+# Legislative structure restoration regexes (citation-safe, ALL PDF routes)
+# ---------------------------------------------------------------------------
 _ROMAN_NUMERAL = (
     r"(?=[IVXLCDM])M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})"
 )
-_ROMAN_INCISO_BREAK_RE = re.compile(rf"([;:]|;\s*e)\s+({_ROMAN_NUMERAL}\s*[-–—]\s+)")
 
-_WORD_SHAPE_RE = re.compile(r"^(?:[a-zà-ÿ]+|[A-ZÀ-Þ]+|[A-ZÀ-Þ][a-zà-ÿ]+)$")
-_LOWER_WORD_RE = re.compile(r"[a-zà-ÿ]+")
-_COMMON_WORDS = frozenset(
-    "de da do das dos que em no na nos nas para com por os as um uma ao aos se ou "
-    "lei art estado sua seu pelo pela este esta sobre mais não nao como ser sem entre "
-    "dia ano governo poder fica ficam artigo parágrafo inciso".split()
+# 1. Structural headings merged mid-paragraph after punctuation / emphasis / quote.
+_HEADING_BREAK_RE = re.compile(
+    r"([.!?;:\)\"”]|(?:\*{1,3}))\s+"
+    r"((?:\*{1,3})?(?:[\"“])?(?:T[ÍI]TULO|CAP[ÍI]TULO|SE[ÇC][ÃA]O|SUBSE[ÇC][ÃA]O|LIVRO)\s+[IVXLCDM\d]+)"
 )
+
+# 2. New Art. N / Artigo N / Art. 1.º / § N / Parágrafo único after sentence terminator,
+#    bold/italic close (** or *), or closing quote. Supports optional leading bold/italic,
+#    opening quotes ("Art. / “Art. / “§), and bold closing right after number (**Art. 104.**).
+#    Requires uppercase "Art."/"Artigo" + preceding terminator so inline citations like
+#    "nos termos do art. 5º", "conforme o Art. 10", or "observado o § 2º" are never split.
+_ART_LABEL = (
+    r"(?:Artigo|Art\.?)\s*\d+(?:\.\d+)*\.?[º°oª]?(?:-[A-Z])?\.?"
+    r"|§\s*\d+\.?[º°oª]?(?:-[A-Z])?\.?"
+    r"|Par[aá]grafo\s+[uú]nico\.?"
+)
+_ARTICLE_PARAGRAPH_BREAK_RE = re.compile(
+    rf"([.!?;:\)\"”]|(?:\*{{1,3}}))\s+"
+    rf"((?:\*{{1,3}})?(?:[\"“])?(?:{_ART_LABEL})(?:\*{{1,3}})?(?:\s+|(?=[A-ZÀ-Þ]))"
+    rf")"
+)
+
+# 3. ALL-CAPS heading immediately followed by Art. N / Artigo N (e.g. "DAS DEFINIÇÕES Art. 4º").
+_CAPS_HEADING_ART_RE = re.compile(
+    r"([A-ZÀ-Þ]{3,})\s+((?:\*{1,3})?(?:[\"“])?(?:Artigo|Art\.?)\s*\d+\.?[º°oª]?(?:-[A-Z])?\.?(?:\*{1,3})?\s+)"
+)
+
+# 4. Roman numeral incisos ("I -", "II -", "**II** -", "**III -**") after ";", ":", "; e", or italic "*".
+_ROMAN_INCISO_BREAK_RE = re.compile(
+    rf"([;:]|;\s*e|\.\*)\s+((?:\*{{1,3}})?{_ROMAN_NUMERAL}(?:\*{{1,3}})?\s*[-–—](?:\*{{1,3}})?\s+)"
+)
+
+# Line-start structural pattern for paragraph reconstruction (keeps legal clauses on own paragraphs).
+_LEGAL_LINE_START_RE = re.compile(
+    rf"^(?:\*{{1,3}})?(?:[\"“])?(?:"
+    rf"(?:Artigo|Art\.?)\s*\d+"
+    rf"|§\s*\d+"
+    rf"|Par[aá]grafo\s+[uú]nico\b"
+    rf"|(?:T[ÍI]TULO|CAP[ÍI]TULO|SE[ÇC][ÃA]O|SUBSE[ÇC][ÃA]O|LIVRO|ANEXO|TABELA|QUADRO)\b"
+    rf"|{_ROMAN_NUMERAL}\s*[-–—]\s+"
+    rf"|[a-z]\)\s+"
+    rf"|\d+\.\d*\s+"
+    rf"|[•●▪\-–—]\s+"
+    rf")"
+)
+
+# ---------------------------------------------------------------------------
+# Calibrated readability metrics (T0 + large-doc-garble; zero `or common >= 0.3`)
+# ---------------------------------------------------------------------------
+_PURE_WORD = r"(?:[a-zà-ÿ]+|[A-ZÀ-Þ]+|[A-ZÀ-Þ][a-zà-ÿ]+)"
+_LEGAL_TOKEN_RE = re.compile(
+    rf"^(?:"
+    rf"{_PURE_WORD}(?:[-/]{_PURE_WORD})*"
+    rf"|R\$"
+    rf"|\d+(?:[.,]\d+)*(?:[º°oª²³]|m²?|km|ha|cc|ml|mg|kg|MVA|kV|MW|GWh|ppm|%)?"
+    rf"|[A-ZÀ-Þ]{{1,5}}[-/]\d+(?:[.,]\d+)*[A-Z]?"
+    rf"|\d+[-/][A-ZÀ-Þ]{{1,3}}"
+    rf"|[A-ZÀ-Þ]{{1,3}}\d{{1,3}}[A-ZÀ-Þ]?"
+    rf"|[ENW]=\d+(?:[.,]\d+)*m?"
+    rf"|\d+[º°'\"][NSEWO]"
+    rf"|m[²³]"
+    rf"|n[º°oª]"
+    rf")$"
+)
+# Exclude \x02 (PDFium's internal soft-hyphen marker) and normal whitespace \t\n\r.
+_CTRL_CHAR_RE = re.compile(r"[\x00\x01\x03-\x08\x0b\x0c\x0e-\x1f\ufffd]")
+_OCR_NOISE_SYM_RE = re.compile(r"[\^~|`£±¥€™©®¤¦¬¶µ¼½¾¿¡]")
+_MIXED_CASE_WORD_RE = re.compile(
+    r"^[a-zà-ÿ]*[a-zà-ÿ][A-ZÀ-Þ][a-zà-ÿA-ZÀ-Þ]*$"
+    r"|^[A-ZÀ-Þ]{2,}[a-zà-ÿ]+[A-ZÀ-Þ][a-zà-ÿA-ZÀ-Þ]*$"
+)
+# Exclude single lowercase accented vowel inside ALL-CAPS OCR (e.g. ESPíRITO, PARAíBA).
+_ALLCAPS_ACCENT_QUIRK_RE = re.compile(r"^[A-ZÀ-Þ]{2,}[áéíóúâêôãõàç][A-ZÀ-Þ]{1,}$")
+_DIGIT_IN_WORD_RE = re.compile(r"[a-zà-ÿ]{2,}\d[a-zà-ÿ]{2,}")
+_PUNCT_ODD_CHARS = frozenset("!@#$%^&*+={}[]<>~`|\\")
 
 
 def _from_cp1252(match: re.Match[str]) -> str:
@@ -114,7 +171,7 @@ def _from_cp1252(match: re.Match[str]) -> str:
 
 
 def _clean_markdown(text: str) -> str:
-    """Clean markdown fences, cp1252 C1 controls, and non-image links."""
+    """Clean markdown fences, cp1252 C1 controls, non-image links, and excess blank lines."""
     if text.startswith("```markdown"):
         text = text.removeprefix("```markdown").strip()
     elif text.startswith("```md"):
@@ -123,6 +180,7 @@ def _clean_markdown(text: str) -> str:
         text = text.removesuffix("```").strip()
     text = _C1_RE.sub(_from_cp1252, text)
     text = _NON_IMAGE_LINK_RE.sub(r"\1", text)
+    text = _MULTI_BLANK_RE.sub("\n\n", text)
     return text.strip()
 
 
@@ -149,33 +207,139 @@ def _valid_markdown(text: str | None, min_length: int = 50) -> tuple[bool, str]:
     return (True, "")
 
 
-def readable_text(text: str) -> bool:
-    """False for noisy OCR layers: odd-shaped tokens and few Portuguese function words.
+def _text_quality_stats(text: str) -> dict[str, float]:
+    n_ch = len(text)
+    if n_ch == 0:
+        return {
+            "tokens": 0,
+            "odd": 0,
+            "shaped": 1.0,
+            "ctrl_count": 0,
+            "ctrl_ratio": 0.0,
+            "noise_count": 0,
+            "noise_ratio": 0.0,
+            "mix_count": 0,
+            "mix_ratio": 0.0,
+            "dig_w_count": 0,
+            "dig_w_ratio": 0.0,
+            "punct_odd_count": 0,
+            "punct_odd_ratio": 0.0,
+        }
+    ctrl_count = len(_CTRL_CHAR_RE.findall(text))
+    noise_count = len(_OCR_NOISE_SYM_RE.findall(text))
+    alpha_count = sum(1 for c in text if c.isalpha())
+    punct_odd_count = sum(1 for c in text if c in _PUNCT_ODD_CHARS)
 
-    Calibrated on 2012 archives: flags 13 of ~450 PB/PI scans, no clean documents.
-    """
-    shaped = odd = 0
+    shaped = odd = mix = dig_w = 0
     for raw in text.split():
-        token = raw.strip(".,;:()[]\"'“”‘’-–—ºª°§/")
-        if any(c.isalpha() for c in token):
-            if _WORD_SHAPE_RE.match(token):
-                shaped += 1
-            else:
-                odd += 1
-    words = [w for w in _LOWER_WORD_RE.findall(text.lower()) if len(w) >= 2]
-    if shaped + odd < 20 or not words:
+        tok = raw.strip(".,;:()[]\"'“”‘’-–—ºª°§/*")
+        if not tok or not any(c.isalpha() for c in tok):
+            continue
+        if "://" in tok or "www." in tok or "\\" in tok:
+            shaped += 1
+            continue
+        if _LEGAL_TOKEN_RE.match(tok) or _ALLCAPS_ACCENT_QUIRK_RE.match(tok):
+            shaped += 1
+        else:
+            odd += 1
+        if len(tok) >= 4 and "-" not in tok and "/" not in tok and "'" not in tok:
+            if (
+                _MIXED_CASE_WORD_RE.match(tok)
+                and not tok.startswith(("Mc", "Mac"))
+                and not _ALLCAPS_ACCENT_QUIRK_RE.match(tok)
+            ):
+                mix += 1
+        if _DIGIT_IN_WORD_RE.search(tok):
+            dig_w += 1
+
+    total_tok = shaped + odd
+    return {
+        "tokens": total_tok,
+        "odd": odd,
+        "shaped": shaped / total_tok if total_tok else 1.0,
+        "ctrl_count": ctrl_count,
+        "ctrl_ratio": ctrl_count / n_ch,
+        "noise_count": noise_count,
+        "noise_ratio": noise_count / n_ch,
+        "mix_count": mix,
+        "mix_ratio": mix / max(1, total_tok),
+        "dig_w_count": dig_w,
+        "dig_w_ratio": dig_w / max(1, total_tok),
+        "punct_odd_count": punct_odd_count,
+        "punct_odd_ratio": punct_odd_count / max(1, alpha_count + punct_odd_count),
+    }
+
+
+def _page_has_cmap_gibberish(text: str) -> bool:
+    """True when a single page has severe C0 control-char / missing-ToUnicode corruption."""
+    stripped = text.strip()
+    if len(stripped) < 60:
+        return False
+    ctrl_count = len(_CTRL_CHAR_RE.findall(text))
+    if ctrl_count >= 25:
+        if (ctrl_count / len(text)) > 0.025:
+            return True
+        # Missing ToUnicode maps (e.g. RN id=56 pp.20-31) emit C0 controls + pure punctuation.
+        alpha_count = sum(1 for c in text if c.isalpha())
+        punct_odd = sum(1 for c in text if c in _PUNCT_ODD_CHARS)
+        if punct_odd / max(1, alpha_count + punct_odd) > 0.20:
+            return True
+    return False
+
+
+def readable_text(text: str, *, strict_ocr_layer: bool = False) -> bool:
+    """Return False for garbled OCR layers or broken-ToUnicode/Caesar-shift text.
+
+    Calibrated with the ``T0 + large-doc-garble`` policy across 6,614 real PDFs:
+    - Removes the permissive ``or common >= 0.3`` bypass.
+    - Keeps digital corpora (AL/MA/PA/RS/CONAMA), ``NAME_LIST`` decrees, Latin
+      botanical lists, and clean ABBYY FineReader PDFs at 0% false positives.
+    - Keeps ES/SE 1-page stamped-header scans cost-effective while catching severe
+      garbled scans (PB 277/58, RR 9, DF 2253) and broken CMaps (DF 361/1851/1885, RN 56).
+    """
+    m = _text_quality_stats(text)
+    if m["ctrl_count"] >= 25 and m["ctrl_ratio"] > 0.025:
+        return False
+    if m["tokens"] < 20:
         return True
-    common = sum(w in _COMMON_WORDS for w in words) / len(words)
-    return shaped / (shaped + odd) >= 0.8 or common >= 0.3
+
+    # Core T0 thresholds (applies to all PDFs)
+    if m["shaped"] < 0.80 and m["odd"] >= 10:
+        return False
+    if m["noise_ratio"] > 0.008 and m["noise_count"] >= 8:
+        return False
+    if m["mix_ratio"] > 0.040 and m["mix_count"] >= 6:
+        return False
+    if m["dig_w_ratio"] > 0.025 and m["dig_w_count"] >= 4:
+        return False
+
+    # Severe multi-page / heavy-garble scan catch (only on confirmed scanned PDFs)
+    if strict_ocr_layer:
+        # Large multi-page garbled OCR (e.g. 57p Readiris DF id=2253) without hitting
+        # short 1-page ES/SE stamped Atos (~80-200 tokens) or clean ABBYY (shaped ~1.00).
+        if m["tokens"] >= 500 and (
+            m["shaped"] < 0.91 or m["mix_ratio"] > 0.018 or m["noise_ratio"] > 0.0023
+        ):
+            return False
+        # Severe mixed-case or punctuation-heavy garble on shorter scans without hitting
+        # clean stamped headers (keeps ES at ~191/2,224 instead of 441).
+        if m["mix_ratio"] > 0.030 and m["mix_count"] >= 5:
+            return False
+        if (
+            m["punct_odd_ratio"] > 0.012
+            and m["punct_odd_count"] >= 16
+            and m["shaped"] < 0.92
+        ):
+            return False
+    return True
 
 
 def _restore_legal_line_breaks(md: str) -> str:
-    """Restore paragraph breaks merged by ``pdf_oxide`` on single-spaced legal PDFs.
+    """Restore paragraph breaks on single-spaced legal PDFs (digital & plain fallback).
 
-    Splits cleanly before ``TÍTULO``/``CAPÍTULO``/``SEÇÃO``, ``Art. N``,
-    ``§ N``, ``Parágrafo único``, and Roman numeral incisos (``I -``, ``II -``)
-    only when preceded by a structural terminator, avoiding inline citations
-    such as ``nos termos do art. 5º`` or ``conforme o Art. 10``.
+    Handles ``TÍTULO``/``CAPÍTULO``/``SEÇÃO``, ``Art. N``, ``Artigo N``, ``Art. 1.º``,
+    bold ``**Art. 104.**``, italic ``*`` terminators, quoted ``"Art.``/``“§``,
+    ``Parágrafo único``, and plain/bold Roman incisos without breaking inline citations.
     """
     if not md:
         return md
@@ -186,191 +350,1185 @@ def _restore_legal_line_breaks(md: str) -> str:
     return out
 
 
-def _open_pdf(data: bytes) -> pdf_oxide.PdfDocument:
+# ---------------------------------------------------------------------------
+# PDFium helpers: open, metadata, page analysis, line extraction, tables, images
+# ---------------------------------------------------------------------------
+def _open_pdf(data: bytes) -> pdfium.PdfDocument:
     try:
-        return pdf_oxide.PdfDocument.from_bytes(data)
+        return pdfium.PdfDocument(data)
     except Exception as exc:
         raise ValueError(f"Could not open PDF: {exc}") from exc
 
 
-def _page_dimensions(
-    doc: pdf_oxide.PdfDocument, page_index: int
-) -> tuple[float, float]:
-    box = doc.page_crop_box(page_index) or doc.page_media_box(page_index)
-    if not box:
-        return (0.0, 0.0)
-    return (abs(float(box[2]) - float(box[0])), abs(float(box[3]) - float(box[1])))
-
-
-def _has_ocr_metadata_pypdf(content: bytes) -> bool:
-    """Inspect ``/Producer`` and ``/Creator`` in the PDF Info dict via ``pypdf``."""
+def _is_valid_zero_page_pdf(data: bytes) -> bool:
+    """Return True if *data* is a valid 0-page PDF (which PDFium refuses to open)."""
     try:
-        reader = pypdf.PdfReader(io.BytesIO(content))
-        meta = reader.metadata
-        if not meta:
-            return False
-        producer = str(meta.get("/Producer") or "").lower()
-        creator = str(meta.get("/Creator") or "").lower()
+        import pypdf
+
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        return len(reader.pages) == 0
+    except Exception:
+        return False
+
+
+def _has_ocr_metadata_doc(doc: pdfium.PdfDocument) -> bool:
+    """Inspect ``/Producer`` and ``/Creator`` natively via ``pypdfium2``."""
+    try:
+        producer = (doc.get_metadata_value("Producer") or "").lower()
+        creator = (doc.get_metadata_value("Creator") or "").lower()
         combined = f"{producer} {creator}"
         return any(kw in combined for kw in _OCR_METADATA_KEYWORDS)
     except Exception:
         return False
 
 
+def _has_ocr_metadata_pypdf(content: bytes) -> bool:
+    """Inspect ``/Producer`` and ``/Creator`` in the PDF Info dict."""
+    try:
+        doc = _open_pdf(content)
+        try:
+            return _has_ocr_metadata_doc(doc)
+        finally:
+            doc.close()
+    except Exception:
+        return False
+
+
 def pdf_page_count(data: bytes) -> int:
     """Return the exact number of pages in a PDF, raising ``ValueError`` if invalid."""
-    doc = _open_pdf(data)
-    return int(doc.page_count)
+    try:
+        doc = _open_pdf(data)
+    except ValueError:
+        if _is_valid_zero_page_pdf(data):
+            return 0
+        raise
+    try:
+        return len(doc)
+    finally:
+        doc.close()
+
+
+@dataclass
+class _ImageInfo:
+    page_index: int
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    ratio: float
+    nbbox: tuple[float, float, float, float]
+    bpp: int
+    sha256: bytes
+    vis_text_overlaps: int
+    any_text_overlaps: int
+    total_vis_text: int
+    raw_len: int
+    is_jpeg: bool
+    obj_index: int
+
+
+@dataclass
+class _PageAnalysis:
+    page_index: int
+    width: float
+    height: float
+    text_raw: str
+    text_len: int
+    img_coverage: float
+    bpp1_unocrd_coverage: float
+    invis_text_ratio: float
+    has_ruled_table_candidate: bool
+    images: list[_ImageInfo]
+
+
+def _normalize_pdfium_soft_hyphens(text: str) -> str:
+    """Clean PDFium soft-hyphen marker (U+0002 / STX)."""
+    if "\x02" not in text:
+        return text
+    text = re.sub(r"\x02\r?\n", "", text)
+    return text.replace("\x02", "-")
+
+
+def _analyze_page(
+    page: pdfium.PdfPage,
+    page_index: int,
+    *,
+    inspect_objects: bool = True,
+    collect_image_hashes: bool = True,
+    image_size_limit: float = 0.1,
+) -> _PageAnalysis:
+    """Single-pass PDFium page inspection: text, image coverage, 1-bit masks, invisible text, rules."""
+    pw, ph = page.get_size()
+    page_area = pw * ph if pw > 0 and ph > 0 else 0.0
+
+    tp = page.get_textpage()
+    try:
+        raw_text = tp.get_text_bounded()
+    finally:
+        tp.close()
+    raw_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    norm_text = _normalize_pdfium_soft_hyphens(raw_text)
+    text_len = len(norm_text.strip())
+
+    pa = _PageAnalysis(
+        page_index=page_index,
+        width=pw,
+        height=ph,
+        text_raw=norm_text,
+        text_len=text_len,
+        img_coverage=0.0,
+        bpp1_unocrd_coverage=0.0,
+        invis_text_ratio=0.0,
+        has_ruled_table_candidate=False,
+        images=[],
+    )
+    if not inspect_objects or page_area <= 0:
+        return pa
+    return _populate_page_objects(
+        page,
+        pa,
+        collect_image_hashes=collect_image_hashes,
+        image_size_limit=image_size_limit,
+    )
+
+
+def _populate_page_objects(
+    page: pdfium.PdfPage,
+    pa: _PageAnalysis,
+    *,
+    collect_image_hashes: bool = True,
+    image_size_limit: float = 0.1,
+) -> _PageAnalysis:
+    """Inspect PDFium page objects (images, invisible text, ruled paths) on an analyzed page."""
+    pw, ph = pa.width, pa.height
+    page_area = pw * ph if pw > 0 and ph > 0 else 0.0
+    if page_area <= 0:
+        return pa
+
+    text_centers: list[tuple[float, float]] = []
+    vis_text_centers: list[tuple[float, float]] = []
+    raw_imgs: list[
+        tuple[float, float, float, float, float, int, bytes, int, bool, int]
+    ] = []
+    txt_objs = 0
+    invis_objs = 0
+    h_xs: list[tuple[float, float, float]] = []
+    v_ys: list[tuple[float, float, float]] = []
+    rects = 0
+    img_idx = 0
+
+    try:
+        for obj in page.get_objects(max_depth=4):
+            ot = obj.type
+            if ot == pdfium_c.FPDF_PAGEOBJ_TEXT:
+                txt_objs += 1
+                try:
+                    left, b, r, t = obj.get_bounds()
+                    cx, cy = (left + r) * 0.5, (b + t) * 0.5
+                    text_centers.append((cx, cy))
+                    rm = pdfium_c.FPDFTextObj_GetTextRenderMode(obj)
+                    if rm == pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE:
+                        invis_objs += 1
+                    else:
+                        vis_text_centers.append((cx, cy))
+                except Exception:
+                    pass
+            elif ot == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                cur_idx = img_idx
+                img_idx += 1
+                try:
+                    left, b, r, t = obj.get_bounds()
+                    w, h = max(0.0, r - left), max(0.0, t - b)
+                    ratio = (w * h) / page_area
+                    meta = pdfium_c.FPDF_IMAGEOBJ_METADATA()
+                    bpp = (
+                        int(meta.bits_per_pixel)
+                        if pdfium_c.FPDFImageObj_GetImageMetadata(obj, page, meta)
+                        else -1
+                    )
+                    sha = b""
+                    raw_len = 0
+                    is_jpeg = False
+                    if collect_image_hashes and image_size_limit <= ratio < 0.80:
+                        try:
+                            raw_data = bytes(obj.get_data(decode_simple=False))
+                            raw_len = len(raw_data)
+                            sha = hashlib.sha256(raw_data).digest()
+                            filts = obj.get_filters()
+                            is_jpeg = filts == ["DCTDecode"] and raw_data.startswith(
+                                b"\xff\xd8"
+                            )
+                        except Exception:
+                            pass
+                    raw_imgs.append(
+                        (left, b, r, t, ratio, bpp, sha, raw_len, is_jpeg, cur_idx)
+                    )
+                except Exception:
+                    pass
+            elif ot == pdfium_c.FPDF_PAGEOBJ_PATH:
+                try:
+                    left, b, r, t = obj.get_bounds()
+                    w, h = abs(r - left), abs(t - b)
+                    if w >= 20.0 and h <= 4.0:
+                        h_xs.append((left, r, (b + t) * 0.5))
+                    elif h >= 10.0 and w <= 4.0:
+                        v_ys.append((b, t, (left + r) * 0.5))
+                    elif w >= 20.0 and h >= 10.0:
+                        n_segs = pdfium_c.FPDFPath_CountSegments(obj)
+                        if n_segs >= 4:
+                            rects += max(1, n_segs // 5)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    images: list[_ImageInfo] = []
+    total_cov = 0.0
+    bpp1_unocrd_cov = 0.0
+    total_vis = len(vis_text_centers)
+
+    for left, b, r, t, ratio, bpp, sha, raw_len, is_jpeg, cur_idx in raw_imgs:
+        total_cov += ratio
+        inside_any = 0
+        inside_vis = 0
+        if ratio >= 0.05:
+            inside_any = sum(
+                1 for cx, cy in text_centers if left <= cx <= r and b <= cy <= t
+            )
+            inside_vis = sum(
+                1 for cx, cy in vis_text_centers if left <= cx <= r and b <= cy <= t
+            )
+        if bpp == 1 and ratio >= 0.05 and inside_any < 5:
+            bpp1_unocrd_cov += ratio
+        top = ph - t
+        bottom = ph - b
+        nbbox = (
+            round(left / pw, 2) if pw else 0.0,
+            round(top / ph, 2) if ph else 0.0,
+            round(r / pw, 2) if pw else 0.0,
+            round(bottom / ph, 2) if ph else 0.0,
+        )
+        images.append(
+            _ImageInfo(
+                page_index=pa.page_index,
+                x0=left,
+                top=top,
+                x1=r,
+                bottom=bottom,
+                ratio=ratio,
+                nbbox=nbbox,
+                bpp=bpp,
+                sha256=sha,
+                vis_text_overlaps=inside_vis,
+                any_text_overlaps=inside_any,
+                total_vis_text=total_vis,
+                raw_len=raw_len,
+                is_jpeg=is_jpeg,
+                obj_index=cur_idx,
+            )
+        )
+
+    invis_ratio = invis_objs / txt_objs if txt_objs > 0 else 0.0
+    distinct_v = len({round(x / 3.0) for _, _, x in v_ys})
+    distinct_h = len({round(y / 3.0) for _, _, y in h_xs})
+    has_rules = (distinct_h >= 3 and distinct_v >= 3) or rects >= 4
+
+    pa.img_coverage = min(1.0, total_cov)
+    pa.bpp1_unocrd_coverage = min(1.0, bpp1_unocrd_cov)
+    pa.invis_text_ratio = invis_ratio
+    pa.has_ruled_table_candidate = has_rules
+    pa.images = images
+    return pa
+
+
+def _score_page_scan(
+    pa: _PageAnalysis,
+    has_ocr_meta_fn: Callable[[], bool],
+) -> tuple[float, bool]:
+    """Return ``(scan_score, is_blank)`` for a single analyzed page."""
+    if pa.width * pa.height <= 0:
+        return (0.0, True)
+
+    cov = pa.img_coverage
+    text_len = pa.text_len
+
+    # 1. Un-OCR'd 1-bit CCITT scanned text columns (e.g. Piauí Diário Oficial).
+    if pa.bpp1_unocrd_coverage >= 0.25:
+        return (1.0, False)
+
+    # 2. Full-page image scan (coverage > 0.80).
+    if cov > 0.8:
+        has_invis = pa.invis_text_ratio > 0.0
+        has_ocr_meta = has_ocr_meta_fn()
+        if has_invis or has_ocr_meta:
+            return (1.0, False)
+        if text_len < 50:
+            return (1.0, False)
+        if text_len > 200:
+            return (0.9, False)
+        if pa.width > pa.height:
+            return (0.2, False)
+        return (0.8, False)
+
+    # 3. Medium/large image with tiny text (partial scan / image-body norm like DF 2395).
+    if cov >= 0.30 and text_len < 200:
+        return (0.9, False)
+    if cov >= 0.20 and text_len < 180:
+        return (0.8, False)
+    if cov > 0.1:
+        return (0.8 if text_len < 10 else 0.1, False)
+    if text_len > 10:
+        return (0.0, False)
+    return (0.0, True)
 
 
 def is_pdf_scanned(
     content: bytes,
     max_pages_to_check: int = 10,
     *,
-    _doc: pdf_oxide.PdfDocument | None = None,
-    _plain_pages: list[str] | None = None,
-    _page_images_cache: dict[int, tuple[float, list[dict[str, Any]]]] | None = None,
+    _analyses: dict[int, _PageAnalysis] | None = None,
+    _doc: pdfium.PdfDocument | None = None,
 ) -> tuple[bool, float]:
     """Determine whether a PDF is primarily a scanned/image document.
 
-    Uses ``doc.page_images(i)`` (NOT ``extract_images(i)``, which misses 1-bit
-    CCITT strip scans, and NOT ``classify_document()``, which misclassifies
-    OCR-layered scans), ``doc.extract_text(i)``, ``classify_page(i)``
-    ``invisible_text_ratio``, and ``pypdf`` ``/Producer``/``/Creator`` metadata.
+    Detects:
+    - Full-page scans (with or without invisible OCR text layers)
+    - 1-bit CCITTFaxDecode un-OCR'd scan columns (e.g. Piauí Diário Oficial)
+    - Partial-coverage scans with tiny native text (e.g. header-only + scanned body)
 
     Returns:
         ``(is_scanned, confidence)`` where *confidence* is in ``[0, 1]``.
     """
-    doc = _doc if _doc is not None else _open_pdf(content)
-    total_pages = int(doc.page_count)
-    if total_pages == 0:
-        return (False, 0.0)
-
-    if total_pages <= max_pages_to_check:
-        pages_to_check = list(range(total_pages))
+    owns_doc = _doc is None
+    if owns_doc:
+        try:
+            doc = _open_pdf(content)
+        except ValueError:
+            if _is_valid_zero_page_pdf(content):
+                return (False, 0.0)
+            raise
     else:
-        step = total_pages / max_pages_to_check
-        pages_to_check = sorted({int(i * step) for i in range(max_pages_to_check)})
+        doc = _doc
+    assert doc is not None
+    try:
+        total_pages = len(doc)
+        if total_pages == 0:
+            return (False, 0.0)
 
-    ocr_meta_checked: bool | None = None
-    page_scores: list[float] = []
+        if total_pages <= max_pages_to_check:
+            pages_to_check = list(range(total_pages))
+        else:
+            step = total_pages / max_pages_to_check
+            pages_to_check = sorted({int(i * step) for i in range(max_pages_to_check)})
 
-    for page_num in pages_to_check:
-        width, height = _page_dimensions(doc, page_num)
-        page_area = width * height
-        if page_area <= 0:
+        ocr_meta_checked: bool | None = None
+
+        def get_ocr_meta() -> bool:
+            nonlocal ocr_meta_checked
+            if ocr_meta_checked is None:
+                ocr_meta_checked = _has_ocr_metadata_doc(doc)
+            return ocr_meta_checked
+
+        page_scores: list[float] = []
+        for page_num in pages_to_check:
+            if _analyses is not None and page_num in _analyses:
+                pa = _analyses[page_num]
+            else:
+                page = doc[page_num]
+                try:
+                    pa = _analyze_page(page, page_num, collect_image_hashes=False)
+                finally:
+                    page.close()
+                if _analyses is not None:
+                    _analyses[page_num] = pa
+            score, is_blank = _score_page_scan(pa, get_ocr_meta)
+            if not is_blank:
+                page_scores.append(score)
+
+        if not page_scores:
+            return (False, 1.0)
+        avg_score = sum(page_scores) / len(page_scores)
+        scanned = avg_score > 0.5
+        confidence = avg_score if scanned else 1.0 - avg_score
+        return (scanned, round(confidence, 4))
+    finally:
+        if owns_doc:
+            doc.close()
+
+
+# ---------------------------------------------------------------------------
+# Visual line extraction (single-column safe + multi-column DOU aware)
+# ---------------------------------------------------------------------------
+@dataclass
+class _LineBox:
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    text: str
+
+
+def _extract_visual_lines(page: pdfium.PdfPage) -> list[_LineBox]:
+    """Extract lines with top-down bounding boxes via PDFium ``FPDFText``."""
+    pw, ph = page.get_size()
+    tp = page.get_textpage()
+    try:
+        n_chars = tp.count_chars()
+        if n_chars <= 0:
+            return []
+        full = tp.get_text_range(0, n_chars)
+        if len(full) != n_chars:
+            plain = _normalize_pdfium_soft_hyphens(
+                tp.get_text_bounded().replace("\r\n", "\n").replace("\r", "\n")
+            )
+            lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
+            step = ph / max(1, len(lines))
+            return [
+                _LineBox(0.0, i * step, pw, (i + 1) * step, ln)
+                for i, ln in enumerate(lines)
+            ]
+
+        raw_lines: list[_LineBox] = []
+        i = 0
+        c_left = ctypes.c_double()
+        c_right = ctypes.c_double()
+        c_bottom = ctypes.c_double()
+        c_top = ctypes.c_double()
+        get_box = pdfium_c.FPDFText_GetCharBox
+        tp_raw = tp.raw
+
+        while i < n_chars:
+            j = i
+            while j < n_chars and full[j] not in "\r\n":
+                j += 1
+            seg = full[i:j]
+            s = i
+            while s < j and full[s].isspace():
+                s += 1
+            e = j - 1
+            while e >= s and full[e].isspace():
+                e -= 1
+            if s <= e:
+                probes = (s, (s + e) // 2, e) if e - s >= 2 else (s, e)
+                x0 = pw
+                x1 = 0.0
+                b_min = ph
+                t_max = 0.0
+                got_any = False
+                for idx in probes:
+                    if full[idx].isspace() or full[idx] == "\x02":
+                        continue
+                    if get_box(tp_raw, idx, c_left, c_right, c_bottom, c_top):
+                        lx, rx = c_left.value, c_right.value
+                        by, ty = c_bottom.value, c_top.value
+                        if rx >= lx and ty >= by:
+                            if lx < x0:
+                                x0 = lx
+                            if rx > x1:
+                                x1 = rx
+                            if by < b_min:
+                                b_min = by
+                            if ty > t_max:
+                                t_max = ty
+                            got_any = True
+                if got_any:
+                    txt = seg.strip()
+                    if txt:
+                        raw_lines.append(
+                            _LineBox(
+                                x0=x0,
+                                top=ph - t_max,
+                                x1=x1,
+                                bottom=ph - b_min,
+                                text=txt,
+                            )
+                        )
+            if j < n_chars:
+                if full[j] == "\r" and j + 1 < n_chars and full[j + 1] == "\n":
+                    i = j + 2
+                else:
+                    i = j + 1
+            else:
+                break
+        return raw_lines
+    finally:
+        tp.close()
+
+
+def _detect_vertical_columns(
+    lines: list[_LineBox], pw: float, ph: float
+) -> list[float]:
+    """Detect genuine multi-column gutters (e.g., 2–3 column Diário Oficial).
+
+    Never triggers on single-column legislation with right-aligned ementas or
+    indented paragraphs: requires >= 8 left lines and >= 8 right lines whose
+    Y-spans overlap by >= 35% of page height with <= 2 crossing lines.
+    """
+    if len(lines) < 16 or pw <= 0 or ph <= 0:
+        return []
+    body = [
+        ln for ln in lines if (ln.x1 - ln.x0) >= 25.0 and (ln.x1 - ln.x0) < pw * 0.60
+    ]
+    if len(body) < 16:
+        return []
+
+    step = pw / 40.0
+    best_cuts: list[tuple[float, float]] = []
+    for k in range(9, 32):
+        x = k * step
+        left = [ln for ln in body if ln.x1 <= x + 2.0]
+        right = [ln for ln in body if ln.x0 >= x - 2.0]
+        if len(left) < 8 or len(right) < 8:
+            continue
+        ly0, ly1 = min(ln.top for ln in left), max(ln.bottom for ln in left)
+        ry0, ry1 = min(ln.top for ln in right), max(ln.bottom for ln in right)
+        ov0, ov1 = max(ly0, ry0), min(ly1, ry1)
+        overlap = (ov1 - ov0) / ph
+        if overlap < 0.35:
+            continue
+        crossing = sum(
+            1
+            for ln in lines
+            if ln.top >= ov0 - 4.0
+            and ln.bottom <= ov1 + 4.0
+            and ln.x0 < x - 4.0
+            and ln.x1 > x + 4.0
+        )
+        if crossing <= 2:
+            best_cuts.append((x, overlap))
+
+    if not best_cuts:
+        return []
+
+    clusters: list[list[float]] = []
+    for x, _ in best_cuts:
+        if not clusters or x - clusters[-1][-1] > step * 1.5:
+            clusters.append([x])
+        else:
+            clusters[-1].append(x)
+    return [sum(cl) / len(cl) for cl in clusters][:3]
+
+
+def _merge_same_baseline(lines: list[_LineBox]) -> list[_LineBox]:
+    """Sort top-to-bottom and merge fragments sitting on the same visual baseline."""
+    if not lines:
+        return []
+    ordered = sorted(lines, key=lambda ln: (ln.top, ln.x0))
+    merged: list[_LineBox] = [ordered[0]]
+    for ln in ordered[1:]:
+        prev = merged[-1]
+        prev_h = max(6.0, prev.bottom - prev.top)
+        ln_h = max(6.0, ln.bottom - ln.top)
+        tol = min(prev_h, ln_h) * 0.45
+        prev_mid = (prev.top + prev.bottom) * 0.5
+        ln_mid = (ln.top + ln.bottom) * 0.5
+        if abs(ln_mid - prev_mid) <= tol:
+            if ln.x0 < prev.x0:
+                left, right = ln, prev
+            else:
+                left, right = prev, ln
+            gap = right.x0 - left.x1
+            sep = (
+                ""
+                if (gap <= 1.0 or right.text.startswith((",", ".", ";", ":", ")", "]")))
+                else " "
+            )
+            merged[-1] = _LineBox(
+                x0=min(prev.x0, ln.x0),
+                top=min(prev.top, ln.top),
+                x1=max(prev.x1, ln.x1),
+                bottom=max(prev.bottom, ln.bottom),
+                text=f"{left.text}{sep}{right.text}",
+            )
+        else:
+            merged.append(ln)
+    return merged
+
+
+def _sort_and_merge_lines(
+    lines: list[_LineBox], pw: float, ph: float
+) -> list[_LineBox]:
+    """Order lines in visual reading order (single-column top-down, or true multi-column)."""
+    if not lines:
+        return []
+
+    cuts = _detect_vertical_columns(lines, pw, ph)
+    if cuts:
+        top_band = ph * 0.12
+        bot_band = ph * 0.88
+        headers: list[_LineBox] = []
+        footers: list[_LineBox] = []
+        cols: list[list[_LineBox]] = [[] for _ in range(len(cuts) + 1)]
+        for ln in lines:
+            crosses_any = any(ln.x0 < c - 4.0 and ln.x1 > c + 4.0 for c in cuts)
+            if crosses_any and ln.top <= top_band:
+                headers.append(ln)
+            elif crosses_any and ln.bottom >= bot_band:
+                footers.append(ln)
+            else:
+                cx = (ln.x0 + ln.x1) * 0.5
+                col_idx = 0
+                for c in cuts:
+                    if cx >= c:
+                        col_idx += 1
+                cols[col_idx].append(ln)
+        ordered: list[_LineBox] = []
+        ordered.extend(_merge_same_baseline(headers))
+        for col in cols:
+            ordered.extend(_merge_same_baseline(col))
+        ordered.extend(_merge_same_baseline(footers))
+        return ordered
+
+    return _merge_same_baseline(lines)
+
+
+def _join_lines_to_paragraphs(lines: list[_LineBox]) -> str:
+    """Rejoin soft-wrapped prose lines while preserving legal structure and tabular rows."""
+    if not lines:
+        return ""
+    heights = sorted(max(6.0, ln.bottom - ln.top) for ln in lines)
+    med_h = heights[len(heights) // 2]
+    widths = sorted(ln.x1 - ln.x0 for ln in lines)
+    p85_w = widths[int(len(widths) * 0.85)] if widths else 400.0
+
+    paragraphs: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            joined = buf[0]
+            for nxt in buf[1:]:
+                if joined.endswith("\x02"):
+                    joined = joined[:-1] + nxt
+                else:
+                    joined = f"{joined} {nxt}"
+            joined = joined.replace("\x02", "-")
+            joined = re.sub(r" {2,}", " ", joined).strip()
+            if joined:
+                paragraphs.append(joined)
+            buf.clear()
+
+    prev: _LineBox | None = None
+    for ln in lines:
+        txt = ln.text.strip()
+        if not txt:
+            continue
+        if prev is None:
+            buf.append(txt)
+            prev = ln
             continue
 
-        images = doc.page_images(page_num)
-        if _page_images_cache is not None:
-            _page_images_cache[page_num] = (page_area, images)
+        v_gap = ln.top - prev.bottom
+        prev_w = prev.x1 - prev.x0
+        prev_txt = prev.text.strip()
+        starts_legal = bool(_LEGAL_LINE_START_RE.match(txt))
+        prev_ends_sentence = prev_txt.endswith((".", ":", ";", "!", "?"))
+        prev_short = prev_w < p85_w * 0.72
+        big_gap = v_gap > med_h * 0.85
+        prev_ends_money = bool(re.search(r"\d,\d{2}$", prev_txt))
+        is_all_caps = txt.isupper() and len(txt) >= 4
+        prev_all_caps = prev_txt.isupper() and len(prev_txt) >= 4
+        indent_jump = (ln.x0 - prev.x0) > 15.0 and prev_ends_sentence
 
-        total_img_area = sum(
-            max(0.0, float(img["width"])) * max(0.0, float(img["height"]))
-            for img in images
+        if (
+            big_gap
+            or starts_legal
+            or indent_jump
+            or prev_ends_money
+            or (prev_ends_sentence and prev_short)
+            or (is_all_caps != prev_all_caps and (prev_short or len(txt) < 70))
+        ):
+            flush()
+        buf.append(txt)
+        prev = ln
+
+    flush()
+    return "\n\n".join(paragraphs)
+
+
+# ---------------------------------------------------------------------------
+# Ruled-table extraction (lazy pdfplumber on candidate pages ONLY)
+# ---------------------------------------------------------------------------
+@dataclass
+class _TableBlock:
+    x0: float
+    top: float
+    x1: float
+    bottom: float
+    markdown: str
+
+
+def _format_gfm_table(rows: list[list[str | None]]) -> str | None:
+    """Format a validated pdfplumber cell matrix into clean GFM Markdown."""
+    if not rows or len(rows) < 2:
+        return None
+    ncols = max(len(r) for r in rows)
+    if ncols < 2:
+        return None
+
+    clean_rows: list[list[str]] = []
+    non_empty_cells = 0
+    for r in rows:
+        cells = []
+        for c in r:
+            s = " ".join((c or "").replace("\r", " ").replace("\n", " ").split())
+            s = s.replace("|", "\\|")
+            if s:
+                non_empty_cells += 1
+            cells.append(s)
+        while len(cells) < ncols:
+            cells.append("")
+        if any(cells):
+            clean_rows.append(cells)
+
+    if len(clean_rows) < 2 or non_empty_cells < 3:
+        return None
+
+    keep_cols = [c for c in range(ncols) if any(r[c] for r in clean_rows)]
+    if len(keep_cols) < 2:
+        return None
+    clean_rows = [[r[c] for c in keep_cols] for r in clean_rows]
+
+    joined_all = " ".join(cell for r in clean_rows for cell in r).upper()
+    if len(clean_rows) <= 2 and "FIM DO DOCUMENTO" in joined_all:
+        return None
+
+    header = clean_rows[0]
+    sep = ["---"] * len(header)
+    md_lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(sep) + " |",
+    ]
+    for r in clean_rows[1:]:
+        md_lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(md_lines)
+
+
+def _extract_tables_for_pages(
+    data: bytes, page_indices_0based: list[int]
+) -> dict[int, list[_TableBlock]]:
+    """Run ``pdfplumber`` ONLY on candidate pages that passed the PDFium ruled-line gate.
+
+    Lazy-imports ``pdfplumber`` so text-only PDF workers never load ``pdfminer``
+    or ``cryptography``. Processes in 15-page chunks and flushes caches per page
+    to keep peak RSS flat on 170-page budget laws.
+    """
+    if not page_indices_0based:
+        return {}
+    import pdfplumber
+
+    result: dict[int, list[_TableBlock]] = {}
+    chunk_size = 15
+    try:
+        for offset in range(0, len(page_indices_0based), chunk_size):
+            chunk_one_based = [
+                p + 1 for p in page_indices_0based[offset : offset + chunk_size]
+            ]
+            with pdfplumber.open(io.BytesIO(data), pages=chunk_one_based) as pdf:
+                for p in pdf.pages:
+                    idx0 = p.page_number - 1
+                    try:
+                        blocks: list[_TableBlock] = []
+                        for tbl in p.find_tables():
+                            rows = tbl.extract()
+                            md = _format_gfm_table(rows)
+                            if md:
+                                x0, top, x1, bottom = tbl.bbox
+                                blocks.append(_TableBlock(x0, top, x1, bottom, md))
+                        if blocks:
+                            result[idx0] = blocks
+                    finally:
+                        p.flush_cache()
+                        p.close()
+                pdf.flush_cache()
+    except Exception:
+        logger.debug(
+            "pdfplumber table extraction failed; falling back to text only",
+            exc_info=True,
         )
-        coverage = min(1.0, total_img_area / page_area)
-        text = (
-            _plain_pages[page_num]
-            if _plain_pages is not None and page_num < len(_plain_pages)
-            else doc.extract_text(page_num)
-        ).strip()
-        text_length = len(text)
-
-        score = 0.5
-        is_blank = False
-        if coverage > 0.8:
-            try:
-                cp = json.loads(doc.classify_page(page_num))
-                signals = cp.get("signals") or {}
-            except Exception:
-                signals = {}
-            has_invisible_text = float(signals.get("invisible_text_ratio", 0.0)) > 0.0
-            has_ocr_metadata = signals.get("producer_prior") == "scanner"
-            if not has_ocr_metadata:
-                if ocr_meta_checked is None:
-                    ocr_meta_checked = _has_ocr_metadata_pypdf(content)
-                has_ocr_metadata = ocr_meta_checked
-
-            if has_invisible_text or has_ocr_metadata:
-                score = 1.0
-            elif text_length < 50:
-                score = 1.0
-            elif text_length > 200:
-                score = 0.9
-            elif width > height:
-                score = 0.2
-            else:
-                score = 0.8
-        elif coverage > 0.1:
-            score = 0.8 if text_length < 50 else 0.1
-        elif text_length > 10:
-            score = 0.0
-        else:
-            is_blank = True
-
-        if not is_blank:
-            page_scores.append(score)
-
-    if not page_scores:
-        return (False, 1.0)
-    avg_score = sum(page_scores) / len(page_scores)
-    scanned = avg_score > 0.5
-    confidence = avg_score if scanned else 1.0 - avg_score
-    return (scanned, round(confidence, 4))
+    return result
 
 
-def _page_has_qualifying_image(
-    doc: pdf_oxide.PdfDocument,
-    page_index: int,
+# ---------------------------------------------------------------------------
+# Smart embedded image filtering & in-place base64 encoding
+# ---------------------------------------------------------------------------
+def _select_substantive_images(
+    analyses: list[_PageAnalysis],
     image_size_limit: float,
-    cache: dict[int, tuple[float, list[dict[str, Any]]]],
-) -> bool:
-    """Return True if *page_index* has a non-decorative, non-full-scan image."""
-    cached = cache.get(page_index)
-    if cached is not None:
-        page_area, images = cached
-    else:
-        width, height = _page_dimensions(doc, page_index)
-        page_area = width * height
-        images = doc.page_images(page_index) if page_area > 0 else []
-    if page_area <= 0 or not images:
-        return False
-    for img in images:
-        ratio = (
-            max(0.0, float(img["width"])) * max(0.0, float(img["height"])) / page_area
-        )
-        if image_size_limit <= ratio < 0.8:
-            return True
-    return False
+) -> dict[int, set[int]]:
+    """Return ``{page_index: {obj_index, ...}}`` for non-watermark substantive images."""
+    n_pages = len(analyses)
+    sha_pages: dict[bytes, set[int]] = {}
+    bbox_pages: dict[tuple[float, float, float, float], set[int]] = {}
+
+    for pa in analyses:
+        for im in pa.images:
+            if im.sha256:
+                sha_pages.setdefault(im.sha256, set()).add(pa.page_index)
+            bbox_pages.setdefault(im.nbbox, set()).add(pa.page_index)
+
+    keep: dict[int, set[int]] = {}
+    for pa in analyses:
+        for im in pa.images:
+            if not (image_size_limit <= im.ratio < 0.80):
+                continue
+            if im.raw_len and im.raw_len < 100:
+                continue
+            if n_pages >= 2:
+                if im.sha256 and len(sha_pages.get(im.sha256, ())) >= 2:
+                    continue
+                if len(bbox_pages.get(im.nbbox, ())) >= 2:
+                    continue
+            if n_pages == 1 and im.total_vis_text > 0:
+                cx = (im.nbbox[0] + im.nbbox[2]) * 0.5
+                cy = (im.nbbox[1] + im.nbbox[3]) * 0.5
+                if (
+                    0.15 <= cx <= 0.85
+                    and 0.15 <= cy <= 0.85
+                    and im.vis_text_overlaps >= 15
+                    and (im.vis_text_overlaps / im.total_vis_text) >= 0.15
+                ):
+                    continue
+            keep.setdefault(pa.page_index, set()).add(im.obj_index)
+    return keep
+
+
+def _encode_page_images(
+    page: pdfium.PdfPage,
+    pa: _PageAnalysis,
+    selected_obj_indices: set[int],
+) -> list[tuple[float, str]]:
+    """Extract and base64-encode selected substantive images with their top Y-coord."""
+    if not selected_obj_indices:
+        return []
+    info_by_idx = {im.obj_index: im for im in pa.images}
+    encoded: list[tuple[float, str]] = []
+    cur_idx = 0
+    for obj in page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE], max_depth=4):
+        idx = cur_idx
+        cur_idx += 1
+        if idx not in selected_obj_indices:
+            continue
+        im = info_by_idx.get(idx)
+        if im is None:
+            continue
+        try:
+            if im.is_jpeg:
+                raw_bytes = bytes(obj.get_data(decode_simple=False))
+                if len(raw_bytes) < 100:
+                    continue
+                b64 = base64.b64encode(raw_bytes).decode("ascii")
+                encoded.append((im.top, f"![image](data:image/jpeg;base64,{b64})"))
+            else:
+                bmp = obj.get_bitmap()
+                pil_img = bmp.to_pil()
+                buf = io.BytesIO()
+                pil_img.save(buf, format="PNG", optimize=True)
+                png_bytes = buf.getvalue()
+                if len(png_bytes) < 100:
+                    continue
+                b64 = base64.b64encode(png_bytes).decode("ascii")
+                encoded.append((im.top, f"![image](data:image/png;base64,{b64})"))
+        except Exception:
+            logger.debug(
+                "Skipping non-decodable PDF image on page %d",
+                pa.page_index,
+                exc_info=True,
+            )
+    return encoded
+
+
+# ---------------------------------------------------------------------------
+# Page assembly (Y-ordered lines + in-place tables + in-place images)
+# ---------------------------------------------------------------------------
+def _assemble_page_markdown(
+    page: pdfium.PdfPage,
+    pa: _PageAnalysis,
+    tables: list[_TableBlock],
+    images_md: list[tuple[float, str]],
+) -> str:
+    """Assemble clean reading-order Markdown for one page with in-place tables and images."""
+    raw_lines = _extract_visual_lines(page)
+    lines = _sort_and_merge_lines(raw_lines, pa.width, pa.height)
+
+    if tables:
+        filtered: list[_LineBox] = []
+        for ln in lines:
+            cx = (ln.x0 + ln.x1) * 0.5
+            cy = (ln.top + ln.bottom) * 0.5
+            in_table = any(
+                (t.x0 - 2.0) <= cx <= (t.x1 + 2.0)
+                and (t.top - 2.0) <= cy <= (t.bottom + 2.0)
+                for t in tables
+            )
+            if not in_table:
+                filtered.append(ln)
+        lines = filtered
+
+    if not tables and not images_md:
+        return _join_lines_to_paragraphs(lines)
+
+    anchors: list[tuple[float, str]] = []
+    for t in tables:
+        anchors.append((t.top, t.markdown))
+    for y_top, img_md in images_md:
+        anchors.append((y_top, img_md))
+    anchors.sort(key=lambda item: item[0])
+
+    chunks: list[str] = []
+    line_idx = 0
+    n_lines = len(lines)
+    for anchor_y, block_md in anchors:
+        seg: list[_LineBox] = []
+        while line_idx < n_lines and lines[line_idx].top < anchor_y:
+            seg.append(lines[line_idx])
+            line_idx += 1
+        if seg:
+            txt = _join_lines_to_paragraphs(seg)
+            if txt:
+                chunks.append(txt)
+        chunks.append(block_md)
+    if line_idx < n_lines:
+        txt = _join_lines_to_paragraphs(lines[line_idx:])
+        if txt:
+            chunks.append(txt)
+    return "\n\n".join(chunks)
 
 
 def _digital_pdf(
-    doc: pdf_oxide.PdfDocument,
-    page_count: int,
-    image_size_limit: float,
-    embed_images: bool,
-    page_images_cache: dict[int, tuple[float, list[dict[str, Any]]]],
+    doc: pdfium.PdfDocument,
+    analyses: list[_PageAnalysis],
+    tables_by_page: dict[int, list[_TableBlock]],
+    selected_imgs: dict[int, set[int]],
+    bad_set: set[int],
     *,
     yield_between_pages: bool = False,
-) -> str:
-    """Convert a digital PDF page-by-page with selective image embedding."""
-    pages: list[str] = []
-    for i in range(page_count):
-        include_imgs = embed_images and _page_has_qualifying_image(
-            doc, i, image_size_limit, page_images_cache
-        )
-        pages.append(
-            doc.to_markdown(
-                i,
-                detect_headings=True,
-                include_images=include_imgs,
-                embed_images=include_imgs,
+) -> list[str]:
+    """Convert non-bad PDF pages to reading-order Markdown with in-place tables and images."""
+    page_mds: list[str] = []
+    for pa in analyses:
+        if pa.page_index in bad_set:
+            page_mds.append("")
+            continue
+        page = doc[pa.page_index]
+        try:
+            imgs_md = (
+                _encode_page_images(page, pa, selected_imgs[pa.page_index])
+                if pa.page_index in selected_imgs
+                else []
             )
-        )
+            pg_md = _assemble_page_markdown(
+                page,
+                pa,
+                tables_by_page.get(pa.page_index, []),
+                imgs_md,
+            )
+        finally:
+            page.close()
+        page_mds.append(_restore_legal_line_breaks(pg_md))
         if yield_between_pages:
             time.sleep(0)
-    return _restore_legal_line_breaks("\n\n".join(pages))
+    return page_mds
+
+
+# ---------------------------------------------------------------------------
+# Main extraction pipeline (_pdf_text_layer & selective per-page OCR support)
+# ---------------------------------------------------------------------------
+@dataclass
+class _ExtractionResult:
+    """Internal result distinguishing full text, full-doc OCR, or partial per-page OCR."""
+
+    markdown: str | None
+    page_markdowns: list[str] | None = None
+    ocr_pages_0based: list[int] | None = None
+
+
+def _extract_pdf_core(
+    data: bytes,
+    image_size_limit: float = 0.1,
+    check_readable: bool = True,
+    embed_images: bool = True,
+    *,
+    yield_between_pages: bool = False,
+) -> _ExtractionResult:
+    """Single-open PDFium + selective ``pdfplumber`` extraction.
+
+    Two-stage design for maximum speed and flat RSS:
+      1. Fast text pass on all pages + object inspection ONLY on <=10 sampled
+         scan-detection pages and low-text (<50 char) pages.
+      2. For scanned PDFs with readable embedded text (e.g. 250p ABBYY), skips
+         expensive object/image/table walking completely (~10-14x faster).
+      3. For digital PDFs, walks remaining pages for ruled-table gating and
+         substantive image hashing (only for ``image_size_limit <= ratio < 0.80``).
+      4. Supports selective per-page OCR when a multi-page PDF has localized
+         missing-ToUnicode or image-only pages (e.g. RN id=56 pp.20-31, RR id=1/19).
+    """
+    try:
+        doc = _open_pdf(data)
+    except ValueError:
+        if _is_valid_zero_page_pdf(data):
+            return _ExtractionResult(markdown=None)
+        raise
+    try:
+        page_count = len(doc)
+        if page_count == 0:
+            return _ExtractionResult(markdown=None)
+
+        if page_count <= 10:
+            sample_set = set(range(page_count))
+        else:
+            step = page_count / 10.0
+            sample_set = {int(i * step) for i in range(10)}
+
+        # Stage 1: fast text extraction on ALL pages; object walk ONLY on sample_set or low-text pages.
+        analyses: list[_PageAnalysis] = []
+        inspected_objects: set[int] = set()
+        for i in range(page_count):
+            page = doc[i]
+            try:
+                do_obj = i in sample_set
+                pa = _analyze_page(
+                    page,
+                    i,
+                    inspect_objects=do_obj,
+                    collect_image_hashes=embed_images and do_obj,
+                    image_size_limit=image_size_limit,
+                )
+                if do_obj:
+                    inspected_objects.add(i)
+                elif pa.text_len < 50:
+                    _populate_page_objects(
+                        page,
+                        pa,
+                        collect_image_hashes=embed_images,
+                        image_size_limit=image_size_limit,
+                    )
+                    inspected_objects.add(i)
+                analyses.append(pa)
+            finally:
+                page.close()
+            if yield_between_pages:
+                time.sleep(0)
+
+        analyses_map = {pa.page_index: pa for pa in analyses}
+        scanned, _confidence = is_pdf_scanned(data, _analyses=analyses_map, _doc=doc)
+
+        plain_full = "\n\n".join(pa.text_raw for pa in analyses)
+        minimum = max(50, page_count * 100)
+
+        def long_enough(text: str) -> bool:
+            check = _WATERMARK_CHECK_RE.sub(
+                "", _MD_BASE64_IMAGE_RE.sub("", text)
+            ).strip()
+            return _valid_markdown(check, min_length=minimum)[0]
+
+        # Early exit for unreadable or full-scan PDFs BEFORE digital table/image work.
+        if check_readable:
+            doc_readable = readable_text(plain_full, strict_ocr_layer=scanned)
+            if not doc_readable:
+                return _ExtractionResult(markdown=None)
+
+        # Stage 2: for digital PDFs, inspect remaining pages for ruled lines & substantive image hashes.
+        if not scanned:
+            for pa in analyses:
+                if pa.page_index not in inspected_objects:
+                    page = doc[pa.page_index]
+                    try:
+                        _populate_page_objects(
+                            page,
+                            pa,
+                            collect_image_hashes=embed_images,
+                            image_size_limit=image_size_limit,
+                        )
+                    finally:
+                        page.close()
+                    inspected_objects.add(pa.page_index)
+                    if yield_between_pages:
+                        time.sleep(0)
+
+        # Per-page coverage & CMap-gibberish audit across ALL pages.
+        bad_pages: list[int] = []
+        for pa in analyses:
+            if pa.bpp1_unocrd_coverage >= 0.25:
+                bad_pages.append(pa.page_index)
+            elif _page_has_cmap_gibberish(pa.text_raw):
+                bad_pages.append(pa.page_index)
+            elif pa.text_len < 50 and pa.img_coverage >= 0.80:
+                # Ignore graphic front/back covers on large (>= 10p) digital PDFs (e.g. TO Const).
+                is_book_cover = (
+                    not scanned
+                    and page_count >= 10
+                    and pa.page_index in (0, page_count - 1)
+                )
+                if not is_book_cover:
+                    bad_pages.append(pa.page_index)
+            elif page_count == 1 and pa.img_coverage >= 0.20 and pa.text_len < 180:
+                # Single-page header-only + image-body norm (e.g. DF id=2395).
+                bad_pages.append(pa.page_index)
+
+        if check_readable:
+            # If ALL pages are bad (e.g. pure scan or PI 20 CCITT docs), send full PDF to OCR.
+            if bad_pages and len(bad_pages) == page_count:
+                return _ExtractionResult(markdown=None)
+            # If whole doc is scanned with too little text and no readable partial pages, full OCR.
+            if scanned and not bad_pages and not long_enough(plain_full):
+                return _ExtractionResult(markdown=None)
+
+        bad_set = set(bad_pages) if check_readable else set()
+        table_pages = (
+            [
+                pa.page_index
+                for pa in analyses
+                if pa.has_ruled_table_candidate and pa.page_index not in bad_set
+            ]
+            if not scanned
+            else []
+        )
+        tables_by_page = (
+            _extract_tables_for_pages(data, table_pages) if table_pages else {}
+        )
+
+        selected_imgs = (
+            _select_substantive_images(analyses, image_size_limit)
+            if (embed_images and not scanned)
+            else {}
+        )
+
+        try:
+            raw_page_mds = _digital_pdf(
+                doc,
+                analyses,
+                tables_by_page,
+                selected_imgs,
+                bad_set,
+                yield_between_pages=yield_between_pages,
+            )
+            page_mds = (
+                [raw_page_mds] if isinstance(raw_page_mds, str) else list(raw_page_mds)
+            )
+        except Exception:
+            page_mds = []
+
+        # Localized bad pages (e.g. RN id=56 pp.20-31, RR id=1/19 pp.2-3): OCR ONLY those pages!
+        if check_readable and bad_pages:
+            # Ensure we have a slot for every page before returning partial OCR instructions.
+            if len(page_mds) == page_count:
+                return _ExtractionResult(
+                    markdown=None,
+                    page_markdowns=page_mds,
+                    ocr_pages_0based=bad_pages,
+                )
+            return _ExtractionResult(markdown=None)
+
+        combined = _clean_markdown("\n\n".join(p for p in page_mds if p))
+        if long_enough(combined):
+            return _ExtractionResult(markdown=combined)
+
+        # Fallback: cleaned plain text with legal line breaks restored.
+        fallback = _clean_markdown(_restore_legal_line_breaks(plain_full))
+        return _ExtractionResult(markdown=fallback if long_enough(fallback) else None)
+    finally:
+        doc.close()
 
 
 def _pdf_text_layer(
@@ -381,55 +1539,18 @@ def _pdf_text_layer(
     *,
     yield_between_pages: bool = False,
 ) -> str | None:
-    """Extract best embedded text via single-open ``pdf_oxide``; ``None`` means OCR.
+    """Extract best embedded text via ``pypdfium2`` + selective ``pdfplumber``; ``None`` means OCR.
 
     Safe to execute in a ``spawn`` worker subprocess (no logging side effects).
     """
-    doc = _open_pdf(data)
-    page_count = int(doc.page_count)
-    if page_count == 0:
-        return None
-
-    plain_pages: list[str] = []
-    for i in range(page_count):
-        plain_pages.append(doc.extract_text(i))
-        if yield_between_pages:
-            time.sleep(0)
-    plain = "\n\n".join(plain_pages)
-    minimum = max(50, page_count * 100)
-
-    def long_enough(text: str) -> bool:
-        check = _WATERMARK_CHECK_RE.sub("", _MD_BASE64_IMAGE_RE.sub("", text)).strip()
-        return _valid_markdown(check, min_length=minimum)[0]
-
-    # Judge the plain layer: calibrated on plain text without markdown table pipes.
-    # Without OCR configured, a noisy layer still beats dropping the document.
-    if check_readable and not readable_text(plain):
-        return None
-
-    page_images_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
-    scanned, confidence = is_pdf_scanned(
+    res = _extract_pdf_core(
         data,
-        _doc=doc,
-        _plain_pages=plain_pages,
-        _page_images_cache=page_images_cache,
+        image_size_limit=image_size_limit,
+        check_readable=check_readable,
+        embed_images=embed_images,
+        yield_between_pages=yield_between_pages,
     )
-    if not scanned and confidence >= 0.7:
-        try:
-            markdown = _digital_pdf(
-                doc,
-                page_count,
-                image_size_limit,
-                embed_images,
-                page_images_cache,
-                yield_between_pages=yield_between_pages,
-            )
-        except Exception:
-            markdown = ""
-        if long_enough(markdown):
-            return _clean_markdown(markdown)
-
-    return _clean_markdown(plain) if long_enough(plain) else None
+    return res.markdown
 
 
 def slice_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> bytes:
@@ -439,10 +1560,11 @@ def slice_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> bytes:
     - 1-based page numbers, preserving requested order (including duplicates).
     - Out-of-range page numbers are silently ignored.
     - Returns original *pdf_bytes* unchanged when *pages* is empty or no page survives.
-    - Avoids ``pdf_oxide.extract_pages_to_bytes()``'s up-to-16.7x object-bloat defect.
     """
     if not pages:
         return pdf_bytes
+    import pypdf
+
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
     except Exception as exc:
@@ -469,11 +1591,31 @@ def render_pdf_batch(
     data: bytes, start: int, end: int, *, dpi: int = 150
 ) -> list[bytes]:
     """Render 0-based page slice ``[start, end)`` to PNG bytes at explicit *dpi*."""
-    doc = _open_pdf(data)
-    total = int(doc.page_count)
-    lo = max(0, start)
-    hi = min(end, total)
-    return [doc.render_page(i, dpi=dpi, format="png") for i in range(lo, hi)]
+    try:
+        doc = _open_pdf(data)
+    except ValueError:
+        if _is_valid_zero_page_pdf(data):
+            return []
+        raise
+    try:
+        total = len(doc)
+        lo = max(0, start)
+        hi = min(end, total)
+        scale = dpi / 72.0
+        pngs: list[bytes] = []
+        for i in range(lo, hi):
+            page = doc[i]
+            try:
+                bitmap = page.render(scale=scale)
+                pil_image = bitmap.to_pil()
+                buf = io.BytesIO()
+                pil_image.save(buf, format="PNG", compress_level=1)
+                pngs.append(buf.getvalue())
+            finally:
+                page.close()
+        return pngs
+    finally:
+        doc.close()
 
 
 def default_pdf_workers() -> int:
@@ -490,13 +1632,13 @@ def default_pdf_workers() -> int:
 
 
 class PdfRunner:
-    """Bounded async executor for CPU/GIL-bound ``pdf_oxide`` work.
+    """Bounded async executor for CPU/GIL-bound PDF extraction work.
 
     - ``"auto"`` (default): uses a bounded ``spawn`` ``ProcessPoolExecutor``
-      so ``pdf_oxide``'s first-page GIL-holding lazy init never stalls the
-      event loop (<10 ms max tick gap), transparently falling back to
-      ``"thread"`` mode if pool creation fails with ``PermissionError`` or
-      ``OSError`` (e.g. ``/dev/shm``-less AWS Lambda or restricted containers).
+      so PDF extraction never stalls the event loop (<10 ms max tick gap),
+      transparently falling back to ``"thread"`` mode if pool creation fails
+      with ``PermissionError`` or ``OSError`` (e.g. ``/dev/shm``-less AWS Lambda
+      or restricted containers).
     - ``"process"``: requires a ``spawn`` ``ProcessPoolExecutor`` (no fallback).
     - ``"thread"``: runs inside ``asyncio.to_thread`` serialized by a per-loop
       ``asyncio.Semaphore(1)`` (never spawns child processes).
@@ -630,14 +1772,19 @@ async def pdf_to_markdown(
     executor: PdfExecutor = "auto",
     max_workers: int | None = None,
 ) -> str:
-    """Convert PDF *data* to cleaned Markdown, falling back to *ocr* when scanned."""
+    """Convert PDF *data* to cleaned Markdown, falling back to *ocr* when scanned/unreadable.
+
+    For partially-OCR'd or partially broken-CMap PDFs (e.g. ``RN id=56`` pp. 20–31,
+    ``RR id=1``/``19`` pp. 2–3), slices and OCRs *only* the affected pages and splices
+    them back into their exact document order.
+    """
     runner = _get_runner(executor, max_workers)
     yield_pages = executor == "thread" or (
         executor == "auto"
         and (runner._process_unavailable or runner._effective_workers() <= 0)
     )
-    text = await run_pdf_task(
-        _pdf_text_layer,
+    res = await run_pdf_task(
+        _extract_pdf_core,
         data,
         image_size_limit,
         ocr is not None,
@@ -646,8 +1793,32 @@ async def pdf_to_markdown(
         max_workers=max_workers,
         yield_between_pages=yield_pages,
     )
-    if text is not None:
-        return text
-    if ocr is not None:
-        return _clean_markdown(await ocr.pdf(data))
-    raise ValueError("PDF needs OCR but no OCR model is configured")
+    if res.markdown is not None:
+        return res.markdown
+    if ocr is None:
+        raise ValueError("PDF needs OCR but no OCR model is configured")
+
+    # Selective per-page OCR for localized unreadable / image-only pages.
+    if res.page_markdowns is not None and res.ocr_pages_0based:
+        pages_md = list(res.page_markdowns)
+        runs: list[list[int]] = []
+        for idx in sorted(res.ocr_pages_0based):
+            if not runs or idx != runs[-1][-1] + 1:
+                runs.append([idx])
+            else:
+                runs[-1].append(idx)
+        for run in runs:
+            sliced = await run_pdf_task(
+                slice_pdf_pages,
+                data,
+                [p + 1 for p in run],
+                executor=executor,
+                max_workers=max_workers,
+            )
+            ocr_md = _clean_markdown(await ocr.pdf(sliced))
+            pages_md[run[0]] = ocr_md
+            for extra_p in run[1:]:
+                pages_md[extra_p] = ""
+        return _clean_markdown("\n\n".join(p for p in pages_md if p))
+
+    return _clean_markdown(await ocr.pdf(data))

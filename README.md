@@ -8,7 +8,7 @@
 High-performance, async Python library, CLI, and MCP server covering **30 official Brazilian legislation portals** — Federal legislation (Câmara dos Deputados), all **27 state jurisdictions**, CONAMA, and ICMBio.
 
 - **Pure HTTP & Zero Browser Overhead:** Zero Playwright, zero Chromium downloads — fast, headless, container-friendly scraping directly against official portals.
-- **100% Permissive MIT Core (~82 MB installed):** Pure-Rust `pdf_oxide` + `pypdf` + `html-to-markdown` + `mammoth`. Zero AGPL/GPL dependencies in core (`PyMuPDF` and `unidecode` completely removed).
+- **100% Permissive MIT Core (~115 MB installed):** `pypdfium2` + `pypdf` + selective `pdfplumber` + `pillow` + `html-to-markdown` + `mammoth`. Zero AGPL/GPL dependencies in core (`PyMuPDF` and `unidecode` completely removed).
 - **Python 3.11–3.14:** Typed (`py.typed`), lazy PEP 562 imports (~28 ms `legisbr.sources()`, ~55 ms `legisbr list` CLI startup with zero heavy imports), zero import-time `.env` or logging side effects.
 - **Stream, Search, Index & Export:** Zero-disk async streaming (`legisbr.Client`), native on-demand norm search, SQLite Schema v2 with Portuguese diacritic-insensitive FTS5, streaming ZSTD Parquet export, read-only multi-archive `ArchiveIndex`, and an optional MCP server for AI agents.
 
@@ -37,11 +37,7 @@ uvx legisbr list
 
 | Extra | `uv` (project) | `pip` / `uv pip` | Purpose |
 | --- | --- | --- | --- |
-| `ocr` | `uv add "legisbr[ocr]"` | `pip install "legisbr[ocr]"` | Scanned PDF OCR via PydanticAI (OpenAI default) |
-| `ocr-openai` | `uv add "legisbr[ocr-openai]"` | `pip install "legisbr[ocr-openai]"` | OpenAI / OpenAI-compatible OCR provider |
-| `ocr-anthropic` | `uv add "legisbr[ocr-anthropic]"` | `pip install "legisbr[ocr-anthropic]"` | Anthropic Claude OCR provider |
-| `ocr-google` | `uv add "legisbr[ocr-google]"` | `pip install "legisbr[ocr-google]"` | Google Gemini OCR provider |
-| `ocr-bedrock` | `uv add "legisbr[ocr-bedrock]"` | `pip install "legisbr[ocr-bedrock]"` | AWS Bedrock OCR provider |
+| `ocr` | `uv add "legisbr[ocr]"` | `pip install "legisbr[ocr]"` | Scanned PDF OCR via PydanticAI (OpenAI, Anthropic, Google, Bedrock, Mistral, Groq, Hugging Face) |
 | `proxy` | `uv add "legisbr[proxy]"` | `pip install "legisbr[proxy]"` | SOCKS/HTTP proxy rotation (`aiohttp-socks`, used for Paraná) |
 | `parquet` | `uv add "legisbr[parquet]"` | `pip install "legisbr[parquet]"` | Fixed-schema streaming ZSTD Parquet export (`pyarrow`) |
 | `mcp` | `uv add "legisbr[mcp]"` | `pip install "legisbr[mcp]"` | Model Context Protocol server (`mcp`) for AI agents |
@@ -249,11 +245,11 @@ For remote HTTP clients, pass `--transport streamable-http --host 127.0.0.1 --po
 
 ## Performance & Compatibility
 
-- **Rust PDF Pipeline (`pdf_oxide` + `pypdf`):** ~19.5× faster than `pymupdf4llm` on real Brazilian legislation PDFs with legal line-break restoration (`Art.`, `§`, Roman incisos). Uses a bounded `spawn` process pool (`pdf_executor="auto"`) to keep event-loop latency <50 ms, with automatic fallback to bounded `asyncio.to_thread` in restricted containers without `/dev/shm`.
+- **Permissive PDF Pipeline (`pypdfium2` + `pypdf` + selective `pdfplumber` + `pillow`):** Visual reading-order extraction, ruled-table GFM conversion (gated to ruled pages only), repeated-watermark deduplication, 1-bit CCITT & selective per-page OCR routing, and legal line-break restoration (`Art.`, `§`, Roman incisos). Uses a bounded `spawn` process pool (`pdf_executor="auto"`) to keep event-loop latency <50 ms, with automatic fallback to bounded `asyncio.to_thread` in restricted containers without `/dev/shm`.
 - **Single-Flight `ImageCache` & `<img` Fast-Path:** Skips HTML DOM parsing on text-only laws and deduplicates concurrent coat-of-arms/header fetches in memory (bounded LRU, default 16 MiB).
 - **GCRA `burst=1` Rate Limiter:** Zero-dependency lock-free slot reservation preserving strict inter-arrival spacing (critical for portals like Paraná at 0.3 rps).
 - **Storage & Memory Efficiency:** `save_raw=False` / `--no-raw` cuts archive disk usage by 80–95%; `BaseScraper` deduplicates resume keys with 16-byte `blake2b` digests and tracks latency in a deterministic O(1)-memory log-bucket histogram.
-- **Platform Support:** Linux, macOS, and Windows on **Python 3.11–3.14**. Note: `pdf_oxide` Linux wheels target `manylinux_2_28` / musl 1.2+, so AWS Lambda deployments should use **Python 3.12+ (Amazon Linux 2023)** rather than Amazon Linux 2 (Python 3.11).
+- **Platform Support:** Linux, macOS, and Windows on **Python 3.11–3.14**.
 
 ---
 
@@ -267,7 +263,7 @@ Library code never auto-loads `.env` or mutates `os.environ`. The CLI loads `Set
 | `STATE_LEGISLATION_SAVE_DIR` | Optional override root for state archives | `SAVE_DIR` |
 | `SPECIFIC_LEGISLATION_SAVE_DIR` | Optional override root for CONAMA / ICMBio | `SAVE_DIR` |
 | `LOG_DIR` | Optional directory for per-scraper CLI log files | Empty (stderr only) |
-| `LLM_MODEL` | PydanticAI model string or comma-separated fallback list (requires `legisbr[ocr-*]`) | Empty (OCR disabled) |
+| `LLM_MODEL` | PydanticAI model string or comma-separated fallback list (requires `legisbr[ocr]`) | Empty (OCR disabled) |
 | `LLM_PDF_INPUT` | Send sliced PDF batches instead of 150 DPI rendered PNG pages | `false` |
 | `LLM_BATCH_SIZE` | Pages per OCR request | `5` |
 | `LLM_CONCURRENCY` | Maximum concurrent OCR batches per scraper process | `8` |
@@ -275,7 +271,7 @@ Library code never auto-loads `.env` or mutates `os.environ`. The CLI loads `Set
 | `PROXY_FILE_PATH` | Optional newline-separated proxy list for Paraná (`legisbr[proxy]`) | Empty |
 | `PROXY_ENDPOINT` | Optional proxy-list HTTP endpoint for Paraná (`legisbr[proxy]`) | Empty |
 
-Provider credentials follow PydanticAI's standard environment variables (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `AWS_*` / `AWS_BEARER_TOKEN_BEDROCK`).
+Provider credentials follow PydanticAI's standard environment variables (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `AWS_*` / `AWS_BEARER_TOKEN_BEDROCK`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `HF_TOKEN`).
 
 ---
 

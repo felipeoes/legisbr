@@ -7,9 +7,9 @@ See [AGENTS.md](../AGENTS.md) for the authoritative repository development guide
 `legisbr` (`felipeoes/legisbr`) is an async Python library, CLI, and optional MCP server covering **30 official Brazilian legislation portals** (Federal Câmara dos Deputados, all 27 state jurisdictions, CONAMA, and ICMBio).
 
 - **Pure HTTP:** Zero Playwright or Chromium overhead.
-- **Permissive Core:** `aiohttp`, `beautifulsoup4` (`lxml`), `html-to-markdown`, `mammoth`, `pdf_oxide`, `pypdf`, `pydantic`, `tenacity` (100% permissive MIT/BSD/Apache licenses).
+- **Permissive Core:** `aiohttp`, `beautifulsoup4` (`lxml`), `html-to-markdown`, `mammoth`, `pypdfium2`, `pypdf`, `pdfplumber`, `pillow`, `pydantic`, `tenacity` (100% permissive MIT/MIT-CMU/BSD/Apache licenses).
 - **Storage & Search:** Zero-disk async streaming (`legisbr.Client`), SQLite Schema v2 archives with Portuguese diacritic-insensitive FTS5, streaming ZSTD Parquet export (`legisbr[parquet]`), read-only multi-archive `ArchiveIndex`, and an optional MCP server (`legisbr[mcp]`).
-- **Optional OCR & Proxies:** PydanticAI OCR (`legisbr[ocr-*]`) and SOCKS/HTTP proxy rotation (`legisbr[proxy]`).
+- **Optional OCR & Proxies:** PydanticAI OCR (`legisbr[ocr]`) and SOCKS/HTTP proxy rotation (`legisbr[proxy]`).
 
 ## Commands
 

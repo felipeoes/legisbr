@@ -44,11 +44,19 @@ async def test_any_failed_batch_rejects_entire_pdf(pdf_input, failed_batch):
 async def test_shared_concurrency_and_usage():
     ocr = OCR("test", batch_size=1, concurrency=2)
     active = peak = 0
+    reached_two = asyncio.Event()
 
     async def respond(messages, info):
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
+        if active >= 2:
+            reached_two.set()
+        else:
+            try:
+                await asyncio.wait_for(reached_two.wait(), timeout=2.0)
+            except TimeoutError:
+                pass
         await asyncio.sleep(0.01)
         active -= 1
         return ModelResponse(
@@ -119,8 +127,54 @@ def test_ocr_missing_pydantic_ai_raises_install_hint(monkeypatch) -> None:
     import sys
 
     monkeypatch.setitem(sys.modules, "pydantic_ai", None)
-    with pytest.raises(ImportError, match="legisbr\\[ocr\\]"):
+    with pytest.raises(
+        ImportError, match=r'uv add "legisbr\[ocr\]".*pip install "legisbr\[ocr\]"'
+    ) as exc_info:
         OCR("openai:gpt-4.1-mini")
+    assert "ocr-" not in str(exc_info.value)
+
+
+async def test_pdf_batch_rendering_is_serialized_while_llm_calls_stay_concurrent(
+    monkeypatch,
+) -> None:
+    import threading
+    import time
+
+    ocr = OCR("test", batch_size=1, concurrency=3)
+    render_lock = threading.Lock()
+    render_active = render_peak = 0
+    llm_active = llm_peak = 0
+    real_render = ocr._render_batch
+
+    def tracked_render(data: bytes, start: int, end: int):
+        nonlocal render_active, render_peak
+        with render_lock:
+            render_active += 1
+            render_peak = max(render_peak, render_active)
+        time.sleep(0.01)
+        result = real_render(data, start, end)
+        with render_lock:
+            render_active -= 1
+        return result
+
+    monkeypatch.setattr(ocr, "_render_batch", tracked_render)
+
+    async def respond(messages, info):
+        nonlocal llm_active, llm_peak
+        llm_active += 1
+        llm_peak = max(llm_peak, llm_active)
+        await asyncio.sleep(0.05)
+        llm_active -= 1
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"text_markdown": "page"})]
+        )
+
+    with ocr.agent.override(model=FunctionModel(respond)):
+        text = await ocr.pdf(pdf_bytes())
+
+    assert text == "page\n\npage\n\npage"
+    assert render_peak == 1
+    assert llm_peak >= 2
 
 
 def test_ocr_dpi_validation_and_batch_rendering() -> None:

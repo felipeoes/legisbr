@@ -36,8 +36,7 @@ __all__ = [
 usage_scope: ContextVar[str] = ContextVar("ocr_usage_scope", default="global")
 
 _INSTALL_HINT = (
-    "Install OCR support with: pip install 'legisbr[ocr]' "
-    "(or ocr-anthropic / ocr-google / ocr-bedrock)"
+    'Install OCR support with: uv add "legisbr[ocr]" (or: pip install "legisbr[ocr]")'
 )
 
 
@@ -92,6 +91,9 @@ class OCR:
         model = FallbackModel(*names) if len(names) > 1 else names[0]
         self.agent = Agent(model, instructions=prompt, output_type=OCROutput)
         self.sem = asyncio.Semaphore(concurrency)
+        # Bound local PDF batch rendering to 1 concurrent open document to prevent
+        # multi-GB RSS spikes on large scanned PDFs while keeping LLM calls concurrent.
+        self._render_sem = asyncio.Semaphore(1)
         self.batch_size = batch_size
         self.concurrency = concurrency
         self.pdf_input = pdf_input
@@ -158,12 +160,13 @@ class OCR:
 
             async def batch(start: int) -> str:
                 async with self.sem:
-                    parts = await asyncio.to_thread(
-                        self._render_batch,
-                        data,
-                        start,
-                        min(start + self.batch_size, count),
-                    )
+                    async with self._render_sem:
+                        parts = await asyncio.to_thread(
+                            self._render_batch,
+                            data,
+                            start,
+                            min(start + self.batch_size, count),
+                        )
                     try:
                         return await self._run(parts)
                     finally:

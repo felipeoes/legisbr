@@ -137,7 +137,7 @@ def test_lazy_package_startup_and_all_exports():
         "infos = legisbr.sources(); "
         "dt = (time.perf_counter() - t) * 1000; "
         "assert len(infos) == 30; "
-        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pdf_oxide', 'pypdf'); "
+        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pypdfium2', 'pdfplumber', 'PIL', 'pypdf'); "
         "loaded = [m for m in forbidden if m in sys.modules]; "
         "scrapers = [m for m in sys.modules if m.startswith('legisbr.scrapers')]; "
         "assert not loaded, f'Heavy modules loaded: {loaded}'; "

@@ -23,9 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI (Python 3.11–3.14, lowest-direct resolution, wheel/sdist & permissive license audit), OIDC PyPI Trusted Publishing release workflow, and weekly 30-source health matrix.
 
 ### Changed
-- Replaced AGPL `pymupdf`/`pymupdf4llm` with permissively licensed `pdf_oxide` + `pypdf`, and replaced GPL `unidecode` with stdlib `unicodedata`.
+- Replaced AGPL `pymupdf`/`pymupdf4llm` with permissively licensed `pypdfium2` + `pypdf` + `pdfplumber` + `pillow`, and replaced GPL `unidecode` with stdlib `unicodedata`.
 - Migrated library logging from `loguru` to stdlib `logging` with `NullHandler()` and zero import-time side effects.
-- Isolated optional integrations behind extras: `[ocr]`, `[ocr-openai]`, `[ocr-anthropic]`, `[ocr-google]`, `[ocr-bedrock]`, `[proxy]`, `[parquet]`, `[mcp]`, and `[all]`.
+- Isolated optional integrations behind extras: `[ocr]`, `[proxy]`, `[parquet]`, `[mcp]`, and `[all]`.
 
 ### Removed
 - Removed Playwright / Chromium dependency (`BrowserPool`) and `pyrate-limiter`, reducing core install footprint by >85%.

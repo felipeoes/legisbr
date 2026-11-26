@@ -1,19 +1,27 @@
-"""Unit tests for the permissive ``pdf_oxide`` + ``pypdf`` PDF engine (zero ``fitz``)."""
+"""Unit tests for the permissive ``pypdfium2`` + ``pypdf`` + ``pdfplumber`` + ``pillow`` PDF engine."""
 
 from __future__ import annotations
 
 import asyncio
-import io
 import os
 import struct
 import time
-import zlib
 from concurrent.futures.process import BrokenProcessPool
 from unittest.mock import AsyncMock
 
-import pdf_oxide
-import pypdf
+import pypdfium2 as pdfium
 import pytest
+from pdf_fixtures import (
+    make_1bit_ccitt_masthead_pdf,
+    make_1page_centered_watermark_pdf,
+    make_blank_pdf,
+    make_digital_pdf,
+    make_numbered_multipage_pdf,
+    make_partial_ocr_pdf,
+    make_ruled_table_pdf,
+    make_scanned_pdf,
+    make_watermark_and_figure_pdf,
+)
 
 from legisbr.core import pdf as pdf_mod
 from legisbr.core.pdf import (
@@ -27,102 +35,6 @@ from legisbr.core.pdf import (
     shutdown_pdf_pool,
     slice_pdf_pages,
 )
-
-
-def _minimal_png(width: int = 595, height: int = 842) -> bytes:
-    """Build a valid solid-color PNG without external imaging libraries."""
-    raw = b"".join(b"\x00" + b"\xff" * (width * 3) for _ in range(height))
-    compressed = zlib.compress(raw)
-
-    def _chunk(ctype: bytes, data: bytes) -> bytes:
-        body = ctype + data
-        return (
-            struct.pack(">I", len(data))
-            + body
-            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
-        )
-
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + _chunk(b"IHDR", ihdr)
-        + _chunk(b"IDAT", compressed)
-        + _chunk(b"IEND", b"")
-    )
-
-
-def _make_digital_pdf(
-    text: str = "Art. 1º Este é um decreto digital com texto suficiente para validação.",
-    *,
-    pages: int = 1,
-    metadata: dict[str, str] | None = None,
-) -> bytes:
-    """Create a digital PDF with selectable text using only ``pdf_oxide`` + ``pypdf``."""
-    base_bytes = pdf_oxide.Pdf.from_text(text).to_bytes()
-    if pages == 1 and not metadata:
-        return base_bytes
-    reader = pypdf.PdfReader(io.BytesIO(base_bytes))
-    writer = pypdf.PdfWriter()
-    for _ in range(pages):
-        writer.add_page(reader.pages[0])
-    if metadata:
-        writer.add_metadata(metadata)
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue()
-
-
-def _make_numbered_multipage_pdf(num_pages: int) -> bytes:
-    """Build a multi-page PDF where each page has distinct text (Page 1..N)."""
-    writer = pypdf.PdfWriter()
-    for idx in range(1, num_pages + 1):
-        page_bytes = pdf_oxide.Pdf.from_text(
-            f"Art. {idx}º Disposicao da pagina {idx} do diario oficial. " * 6
-        ).to_bytes()
-        reader = pypdf.PdfReader(io.BytesIO(page_bytes))
-        writer.add_page(reader.pages[0])
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue()
-
-
-def _make_scanned_pdf(
-    *,
-    full_bleed: bool = True,
-    metadata: dict[str, str] | None = None,
-) -> bytes:
-    """Create a scanned image-only PDF without ``fitz``."""
-    png = _minimal_png(595, 842)
-    raw = pdf_oxide.Pdf.from_image_bytes(png).to_bytes()
-    if not full_bleed and not metadata:
-        return raw
-    reader = pypdf.PdfReader(io.BytesIO(raw))
-    writer = pypdf.PdfWriter()
-    page = writer.add_page(reader.pages[0])
-    if full_bleed:
-        # Tightly crop to the placed image rectangle so coverage == 1.0 (> 0.8).
-        doc = pdf_oxide.PdfDocument.from_bytes(raw)
-        imgs = doc.page_images(0)
-        if imgs:
-            img = imgs[0]
-            x0, y0 = float(img["x"]), float(img["y"])
-            x1, y1 = x0 + float(img["width"]), y0 + float(img["height"])
-            page.mediabox.lower_left = (x0, y0)
-            page.mediabox.upper_right = (x1, y1)
-    if metadata:
-        writer.add_metadata(metadata)
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue()
-
-
-def _make_blank_pdf() -> bytes:
-    writer = pypdf.PdfWriter()
-    writer.add_blank_page(width=595, height=842)
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue()
-
 
 ZERO_PAGE_PDF = (
     b"%PDF-1.0\n"
@@ -177,6 +89,34 @@ class TestRestoreLegalLineBreaks:
         assert any(line.startswith("CAPÍTULO II") for line in lines)
         assert any(line.startswith("Art. 3º") for line in lines)
 
+    def test_splits_artigo_dot_ordinal_bold_italic_quotes_and_bold_incisos(self):
+        dense = (
+            "Decreta: Artigo 1º - Fica aberto crédito. "
+            "Art. 1.º Ficam criados cargos. § 1.º O prazo é de 10 dias. "
+            "deverá fixar. **Art. 104.** Compete ao Estado. "
+            "*Zollernia ilicifolia.* Art. 2o Esta Resolução entra em vigor. "
+            "passa a vigorar: “Art. 120 Os Auditores.” “§ 2º O prazo será de 30 dias.” "
+            "Compete: I - planejar; **II** - executar; **III -** fiscalizar; e IV - avaliar."
+        )
+        restored = _restore_legal_line_breaks(dense)
+        lines = [line.strip() for line in restored.splitlines() if line.strip()]
+        for prefix in (
+            "Artigo 1º",
+            "Art. 1.º",
+            "§ 1.º",
+            "**Art. 104.**",
+            "Art. 2o",
+            "“Art. 120",
+            "“§ 2º",
+            "I -",
+            "**II** -",
+            "**III -**",
+            "IV -",
+        ):
+            assert any(line.startswith(prefix) for line in lines), (
+                f"Missing break before {prefix!r}"
+            )
+
     def test_does_not_split_inline_legal_citations(self):
         text = (
             "Art. 4º Para os fins desta Lei, nos termos do art. 5º da Constituição "
@@ -189,25 +129,31 @@ class TestRestoreLegalLineBreaks:
 
 class TestIsPdfScanned:
     def test_digital_pdf_detected(self):
-        pdf = _make_digital_pdf("Art. 1º Ficam criadas as seguintes secretarias. " * 10)
+        pdf = make_digital_pdf("Art. 1º Ficam criadas as seguintes secretarias. " * 10)
         scanned, confidence = is_pdf_scanned(pdf)
         assert scanned is False
         assert confidence >= 0.7
 
     def test_scanned_full_page_image_detected(self):
-        pdf = _make_scanned_pdf(full_bleed=True)
+        pdf = make_scanned_pdf(full_bleed=True)
         scanned, confidence = is_pdf_scanned(pdf)
         assert scanned is True
         assert confidence == 1.0
 
     def test_scanned_partial_coverage_image_detected(self):
-        pdf = _make_scanned_pdf(full_bleed=False)
+        pdf = make_scanned_pdf(full_bleed=False)
         scanned, confidence = is_pdf_scanned(pdf)
         assert scanned is True
         assert confidence >= 0.8
 
+    def test_1bit_ccitt_masthead_scan_detected(self):
+        pdf = make_1bit_ccitt_masthead_pdf()
+        scanned, confidence = is_pdf_scanned(pdf)
+        assert scanned is True
+        assert confidence == 1.0
+
     def test_empty_blank_page_pdf(self):
-        scanned, confidence = is_pdf_scanned(_make_blank_pdf())
+        scanned, confidence = is_pdf_scanned(make_blank_pdf())
         assert scanned is False
         assert confidence == 1.0
 
@@ -231,7 +177,7 @@ class TestIsPdfScanned:
         ],
     )
     def test_ocr_metadata_keywords_detected(self, producer: str, creator: str):
-        pdf = _make_scanned_pdf(
+        pdf = make_scanned_pdf(
             full_bleed=True, metadata={"/Producer": producer, "/Creator": creator}
         )
         assert pdf_mod._has_ocr_metadata_pypdf(pdf) is True
@@ -240,25 +186,44 @@ class TestIsPdfScanned:
         assert confidence == 1.0
 
 
+class TestReadabilityCalibration:
+    def test_rejects_garbage_and_cmap_shift_while_accepting_clean_legal_text(self):
+        assert readable_text(GARBAGE_LAYER * 4) is False
+        assert readable_text(NAME_LIST * 4) is True
+        # Clean Brazilian legal tokens (currency, compounds, UTM coords, codes, botanical *)
+        legal = (
+            "Decreto-Lei nº 200/1967 R$ 15.409,95 PA-275 QPM-1 S11D E=588.581,501m "
+            "Zollernia ilicifolia* ESTADO DO ESPíRITO SANTO Art. 1º Fica instituído. "
+        ) * 4
+        assert readable_text(legal) is True
+        # Caesar-shift / missing ToUnicode C0 control characters
+        caesar = "'LiULR\x032¿FLDO\x03GR\x03'LVWULWR\x03)HGHUDO\x03" * 20
+        assert readable_text(caesar) is False
+        assert pdf_mod._page_has_cmap_gibberish(caesar) is True
+
+
 class TestSliceAndRender:
     def test_slice_pdf_pages_preserves_df_semantics(self):
-        pdf = _make_numbered_multipage_pdf(5)
+        pdf = make_numbered_multipage_pdf(5)
         assert pdf_page_count(pdf) == 5
 
         # 1-based subset in custom order, ignoring out-of-range page 99.
         sliced = slice_pdf_pages(pdf, [4, 2, 99, 1])
         assert pdf_page_count(sliced) == 3
-        doc = pdf_oxide.PdfDocument.from_bytes(sliced)
-        assert "Art. 4º" in doc.extract_text(0)
-        assert "Art. 2º" in doc.extract_text(1)
-        assert "Art. 1º" in doc.extract_text(2)
+        doc = pdfium.PdfDocument(sliced)
+        try:
+            assert "Art. 4º" in doc[0].get_textpage().get_text_bounded()
+            assert "Art. 2º" in doc[1].get_textpage().get_text_bounded()
+            assert "Art. 1º" in doc[2].get_textpage().get_text_bounded()
+        finally:
+            doc.close()
 
         # Empty or all out-of-range returns original bytes untouched.
         assert slice_pdf_pages(pdf, []) == pdf
         assert slice_pdf_pages(pdf, [0, -1, 10, 99]) == pdf
 
     def test_render_pdf_batch_returns_valid_png_at_150_dpi(self):
-        pdf = _make_scanned_pdf(full_bleed=False)
+        pdf = make_scanned_pdf(full_bleed=False)
         pngs = render_pdf_batch(pdf, 0, 1, dpi=150)
         assert len(pngs) == 1
         assert pngs[0].startswith(b"\x89PNG\r\n\x1a\n")
@@ -268,9 +233,67 @@ class TestSliceAndRender:
         assert height >= 1600
 
 
+class TestTablesWatermarksAndSelectiveOCR:
+    async def test_ruled_table_extracted_in_place_as_gfm(self):
+        pdf = make_ruled_table_pdf(
+            [
+                ["Ano", "Cilindrada", "CO (%)", "HC (ppm)"],
+                ["2003 a 2009", "<250 cc", "6,0", "2.000"],
+                ["2010 em diante", "<250 cc", "2,5", "600"],
+            ]
+        )
+        md = await pdf_to_markdown(pdf, executor="thread")
+        assert "| Ano | Cilindrada | CO (%) | HC (ppm) |" in md
+        assert "| 2003 a 2009 | <250 cc | 6,0 | 2.000 |" in md
+        assert "| 2010 em diante | <250 cc | 2,5 | 600 |" in md
+        # In-place order: intro -> table -> outro
+        assert md.find("Art. 1º") < md.find("| Ano |") < md.find("Art. 2º")
+
+    async def test_multipage_watermark_filtered_while_unique_figure_placed_in_place(
+        self,
+    ):
+        pdf = make_watermark_and_figure_pdf(pages=3, figure_page_0based=1)
+        md = await pdf_to_markdown(pdf, executor="thread", embed_images=True)
+        # 3 repeated watermarks dropped; 1 unique figure on page 2 kept!
+        imgs = pdf_mod._MD_BASE64_IMAGE_RE.findall(md)
+        assert len(imgs) == 1
+        # Image is placed in-place between Art. 2º and Art. 99º (not dumped at EOF)
+        assert (
+            md.find("Art. 2º") < md.find("data:image/png;base64,") < md.find("Art. 99º")
+        )
+
+    async def test_single_page_centered_watermark_filtered(self):
+        pdf = make_1page_centered_watermark_pdf()
+        md = await pdf_to_markdown(pdf, executor="thread", embed_images=True)
+        assert "Art. 1º" in md
+        assert pdf_mod._MD_BASE64_IMAGE_RE.findall(md) == []
+
+    async def test_1bit_ccitt_masthead_pdf_routes_to_ocr(self):
+        pdf = make_1bit_ccitt_masthead_pdf()
+        ocr = AsyncMock()
+        ocr.pdf.return_value = "Art. 1º Lei transcrita do Diário Oficial do Piauí."
+        md = await pdf_to_markdown(pdf, ocr=ocr, executor="thread")
+        ocr.pdf.assert_awaited_once_with(pdf)
+        assert "Piauí" in md
+
+    async def test_selective_per_page_ocr_splices_only_image_only_pages(self):
+        pdf = make_partial_ocr_pdf(image_only_pages=2)
+        ocr = AsyncMock()
+        ocr.pdf.return_value = (
+            "Art. 2º Disposições finais transcritas das páginas 2 e 3."
+        )
+        md = await pdf_to_markdown(pdf, ocr=ocr, executor="thread")
+        assert ocr.pdf.await_count == 1
+        sliced_sent = ocr.pdf.await_args.args[0]
+        # Only the 2 image-only pages (pp. 2-3) were sent to OCR, not page 1!
+        assert pdf_page_count(sliced_sent) == 2
+        assert "Art. 1º" in md and "Art. 2º" in md
+        assert md.find("Art. 1º") < md.find("Art. 2º")
+
+
 class TestPdfToMarkdownAndExecutors:
     async def test_digital_pdf_conversion_and_plain_fallback(self, monkeypatch):
-        pdf = _make_digital_pdf("Art. 1º " + "Texto legal para a administracao. " * 8)
+        pdf = make_digital_pdf("Art. 1º " + "Texto legal para a administracao. " * 8)
         result = await pdf_to_markdown(pdf, executor="thread")
         assert "Art." in result
 
@@ -283,7 +306,7 @@ class TestPdfToMarkdownAndExecutors:
         assert "Art." in fallback
 
     async def test_scan_requires_ocr_and_delegates_to_ocr(self):
-        pdf = _make_scanned_pdf(full_bleed=True)
+        pdf = make_scanned_pdf(full_bleed=True)
         with pytest.raises(ValueError, match="needs OCR"):
             await pdf_to_markdown(pdf, executor="thread")
 
@@ -304,13 +327,13 @@ class TestPdfToMarkdownAndExecutors:
 
         ocr = AsyncMock()
         ocr.pdf.return_value = "Art. 1º Texto reconhecido pelo modelo. " * 5
-        pdf = _make_digital_pdf(text)
+        pdf = make_digital_pdf(text)
         result = await pdf_to_markdown(pdf, ocr=ocr, executor="thread")
         assert ocr.pdf.await_count == int(ocr_called)
         assert ("reconhecido" in result) is ocr_called
 
     async def test_garbage_text_layer_kept_without_ocr(self):
-        pdf = _make_digital_pdf(GARBAGE_LAYER * 4)
+        pdf = make_digital_pdf(GARBAGE_LAYER * 4)
         result = await pdf_to_markdown(pdf, ocr=None, executor="thread")
         assert "DEPUTADO" in result
 
@@ -323,7 +346,7 @@ class TestPdfToMarkdownAndExecutors:
             raise PermissionError("SemLock disabled on /dev/shm")
 
         monkeypatch.setattr(pdf_mod, "ProcessPoolExecutor", _deny_pool)
-        pdf = _make_digital_pdf("Art. 1º " + "Texto legal estadual. " * 10)
+        pdf = make_digital_pdf("Art. 1º " + "Texto legal estadual. " * 10)
         with caplog.at_level("WARNING", logger="legisbr.core.pdf"):
             result = await runner.run(pdf_mod._pdf_text_layer, pdf, 0.1, True, True)
         assert result is not None and "Art. 1º" in result
@@ -333,7 +356,7 @@ class TestPdfToMarkdownAndExecutors:
     async def test_process_executor_event_loop_stall_under_50ms_and_crash_recovery(
         self,
     ):
-        pdf = _make_digital_pdf(
+        pdf = make_digital_pdf(
             "Art. 1º Esta lei estabelece normas gerais de teste. " * 8,
             pages=120,
         )
@@ -342,7 +365,7 @@ class TestPdfToMarkdownAndExecutors:
             # Warm up spawn worker so startup cost isn't mixed with conversion tick test.
             warm = await runner.run(
                 pdf_mod._pdf_text_layer,
-                _make_digital_pdf("Art. 1º " + "Texto de aquecimento. " * 6),
+                make_digital_pdf("Art. 1º " + "Texto de aquecimento. " * 6),
                 0.1,
                 False,
                 False,
@@ -376,7 +399,7 @@ class TestPdfToMarkdownAndExecutors:
                 await runner.run(_crash_worker)
             recovered = await runner.run(
                 pdf_mod._pdf_text_layer,
-                _make_digital_pdf("Art. 1º " + "Recuperacao apos falha. " * 6),
+                make_digital_pdf("Art. 1º " + "Recuperacao apos falha. " * 6),
                 0.1,
                 False,
                 False,
