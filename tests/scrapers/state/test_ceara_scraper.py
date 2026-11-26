@@ -325,6 +325,54 @@ class TestFetchOverHttp:
         assert "Art. 1º" in doc.text_markdown
         assert doc.raw == html and doc.raw_ext == ".html"
 
+    async def test_paginated_strips_alece_header_logo(self):
+        scraper = _make_scraper()
+        body = (
+            '<html><body><div class="card-body">'
+            '<img src="https://www.al.ce.gov.br/img/logo.jpg" alt="Logo ALECE">'
+            f"<p>{_TEXT}</p></div></body></html>"
+        ).encode()
+        scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+        doc = await scraper.fetch(
+            _ref(
+                type="Resolução",
+                document_url="https://www.al.ce.gov.br/legislativo/leis-e-normativos-internos/1205",
+            )
+        )
+        assert scraper.http.request.await_count == 1
+        assert "logo.jpg" not in doc.text_markdown
+        assert "data:image/" not in doc.text_markdown
+
+    async def test_static_strips_multiline_disclaimer_and_normalizes_summary(self):
+        scraper = _make_scraper()
+        index_html = (
+            "<html><body><table><tr><th>T</th><th>E</th></tr>"
+            '<tr><td><a href="15141.htm">LEI 15.141</a></td>'
+            "<td>AUTORIZA\n  O PODER EXECUTIVO\n  A DOAR IMÓVEIS.</td></tr>"
+            "</table></body></html>"
+        )
+        scraper.http.request = AsyncMock(return_value=make_mock_response(index_html))
+        docs = await scraper._get_laws_constitution_amendments_docs_links(
+            "https://www2.al.ce.gov.br/legislativo/e12.htm", "Lei Ordinária"
+        )
+        assert docs[0]["summary"] == "AUTORIZA O PODER EXECUTIVO A DOAR IMÓVEIS."
+
+        page_html = (
+            '<html><body><div class="Section1">'
+            f"<p>{_TEXT}</p>"
+            "<p><span>O\r\ntexto desta Lei não substitui o publicado no Diário Oficial.</span></p>"
+            "</div></body></html>"
+        ).encode()
+        scraper.http.request = AsyncMock(return_value=make_mock_response(page_html))
+        doc = await scraper.fetch(
+            _ref(
+                type="Lei Ordinária",
+                document_url="https://www2.al.ce.gov.br/legislativo/legislacao5/leis2012/15141.htm",
+                _html_link="15141.htm",
+            )
+        )
+        assert "não substitui" not in doc.text_markdown
+
     async def test_image_only_static_page_without_ocr_fails_visibly(self):
         scraper = _make_scraper(ocr=None)
         html = b'<html><body><div class="Section1"><img src="page1.png"></div></body></html>'

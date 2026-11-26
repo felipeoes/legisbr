@@ -163,7 +163,7 @@ class TestFetch:
             ("PRV-000001 09/08/2012", "Provimento"),
             ("RES-000006 03/12/2001", "Resolução"),
             ("LEI COMPLEMENTAR Nº 582, de 30 de novembro de 2012", "Lei Complementar"),
-            ("ATO DA MESA Nº 191, de 12 de abril de 2012", "ATO DA MESA"),
+            ("ATO DA MESA Nº 191, de 12 de abril de 2012", "Ato da Mesa"),
         ],
     )
     async def test_type_from_site_code(self, title, expected):
@@ -193,3 +193,39 @@ class TestFetch:
         }
         doc = await scraper.fetch(ref)
         assert doc.type == "Constituição Estadual"
+
+    async def test_populates_summary_and_situation_from_executivo_meta_tags(self):
+        scraper = _make_scraper()
+        html = (
+            '<html><head><meta name="Ementa" content="APROVA A CLASSIFICAÇÃO DA\n  DESPESA PUBLICA.">'
+            '<meta name="Vigente" content="Sim"></head>'
+            "<body><p>DECRETO Nº 1.323</p><p>Art. 1º Fica aprovada a classificação da despesa estadual.</p></body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(html)]
+        doc = await scraper.fetch(self._ref("DEC-001323 21/12/2012"))
+        assert doc.summary == "APROVA A CLASSIFICAÇÃO DA DESPESA PUBLICA."
+        assert doc.situation == "Vigente"
+
+        html_nao = html.replace('content="Sim"', 'content="Nao"')
+        scraper.http.request.side_effect = [make_mock_response(html_nao)]
+        doc_nao = await scraper.fetch(self._ref("PRV-000001 09/08/2012"))
+        assert doc_nao.situation == "Não vigente"
+
+    async def test_populates_summary_and_revocation_from_legislativo_html(self):
+        scraper = _make_scraper()
+        html = (
+            "<html><body>"
+            "<p>Consolidada e Revogada pela Lei nº 16.719/2015</p>"
+            '<p class="ementa">Institui o Dia Estadual\n do Garçom.</p>'
+            "<p>Art. 1º Fica instituído o Dia Estadual do Garçom no Estado de Santa Catarina.</p>"
+            "</body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(html)]
+        doc = await scraper.fetch(
+            self._ref(
+                "LEI Nº 15.805, de 13 de abril de 2012",
+                "https://leis.alesc.sc.gov.br/ato-normativo/legislativo/1",
+            )
+        )
+        assert doc.summary == "Institui o Dia Estadual do Garçom."
+        assert doc.situation == "Revogada"

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+from unittest.mock import AsyncMock
 
+import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -475,3 +477,128 @@ class TestCleanMarkdown:
         assert _AUTHENTICATION_WATERMARK_RE.search(
             "pagina 1 / 2 para verificar a autenticidade deste documento, acesse o endereço: https://www3.al.es.gov.br/x"
         )
+
+    def test_strip_summary_preserves_norm_title_before_summary(self):
+        summary = "ALTERA O LIMITE ENTRE OS MUNICÍPIOS DE VITÓRIA E DE SERRA."
+        text = (
+            "LEI Nº 9.972, DE 27 DE DEZEMBRO DE 2012\n\n"
+            "*Altera o limite entre os Municípios de Vitória e de Serra.*\n\n"
+            "O GOVERNADOR DO ESTADO DO ESPÍRITO SANTO\n\n"
+            "**Art. 1º** O limite fica alterado."
+        )
+        result = _clean_markdown(text, summary, doc_type="Lei Ordinária")
+        assert "LEI Nº 9.972, DE 27 DE DEZEMBRO DE 2012" in result
+        assert "Altera o limite" not in result
+        assert not result.startswith("*")
+        assert "**Art. 1º**" in result
+
+    def test_strip_summary_never_strips_ato_administrativo_or_art1(self):
+        summary = "ART. 1º SUSPENDER O EXPEDIENTE NA ASSEMBLEIA LEGISLATIVA."
+        text = (
+            "**ATO Nº 2549 DE 14 DE FEVEREIRO DE 2012.**\n\n"
+            "**Art. 1º** Suspender o expediente na Assembleia Legislativa.\n\n"
+            "**Art. 2º** Este ato entra em vigor na data de sua publicação."
+        )
+        result = _clean_markdown(text, summary, doc_type="Ato Administrativo")
+        assert "ATO Nº 2549" in result
+        assert "Art. 1º" in result
+        assert "Art. 2º" in result
+
+    @pytest.mark.parametrize(
+        "disclaimer",
+        [
+            "~~Este texto não substitui\no original public~~ado no Diário Oficial do Estado de 06/12/2012.",
+            "(Este texto não substitui o publicado no D.P.L de 20.12.2012)",
+            "**(Este Ato não substitui o publicado no D.O.E. 17/05/2012)**",
+            "Esta publicação não\nsubstitui a publicação do D.P.L de 26/10/2012.",
+            "**Este texto não substitui o\npublicado no DIO de 09/03/2012.**",
+            "Este texto não substitui o pu*b*licado no DIO de **16/10/2012.**",
+        ],
+    )
+    def test_broadened_disclaimer_variants_stripped_completely(self, disclaimer):
+        text = f"LEI Nº 1\n\nArt. 1º Conteúdo da norma estadual.\n\n{disclaimer}"
+        result = _clean_markdown(text)
+        assert result == "LEI Nº 1\n\nArt. 1º Conteúdo da norma estadual."
+
+
+class TestFetchHtmlAndPdf:
+    @pytest.mark.asyncio
+    async def test_fetch_uppercase_pdf_uses_download_path(self):
+        scraper = _make_scraper()
+        scraper.download = AsyncMock(
+            return_value=(
+                "**ATO Nº 1/2012**\n\nArt. 1º Suspender expediente estadual no dia indicado.",
+                b"%PDF-1.4",
+                ".pdf",
+            )
+        )
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "title": "Ato Administrativo 1/2012",
+                "norm_type": "Ato Administrativo",
+                "situation": "Em Vigor",
+                "summary": "ART. 1º SUSPENDER EXPEDIENTE ESTADUAL NO DIA INDICADO.",
+                "doc_link": "/Arquivo/Documents/legislacao/image/AtMe1.PDF",
+            }
+        )
+        assert doc is not None
+        scraper.download.assert_awaited_once()
+        assert doc.raw == b"%PDF-1.4"
+        assert "Art. 1º" in doc.text_markdown
+
+    @pytest.mark.asyncio
+    async def test_fetch_html_preserves_raw_bytes_passes_base_url_strips_crest_and_keeps_annex(
+        self,
+    ):
+        scraper = _make_scraper()
+        raw_html = (
+            b"<html><body>"
+            b'<p><img src="brasao.png" width="82" height="99"/></p>'
+            b"<p><b>LEI N\xc2\xba 9.972, DE 27 DE DEZEMBRO DE 2012</b></p>"
+            b"<p><i>Altera o limite entre os Munic\xc3\xadpios de Vit\xc3\xb3ria e de Serra.</i></p>"
+            b"<p>O GOVERNADOR DO ESTADO DO ESP\xc3\x8dRITO SANTO</p>"
+            b"<p><b>Art. 1\xc2\xba</b> O limite entre os Munic\xc3\xadpios fica alterado conforme mapa abaixo.</p>"
+            b'<p><img src="LEI99722012_arquivos/image002.jpg" width="719" height="496"/></p>'
+            b"<p>Este texto n\xc3\xa3o substitui o publicado no DIO de 28/12/2012.</p>"
+            b"</body></html>"
+        )
+        doc_url = "https://www3.al.es.gov.br/Arquivo/Documents/legislacao/html/LEI99722012.html"
+        captured_base_urls: list[str | None] = []
+        captured_html: list[str] = []
+        orig_md = scraper.markdown
+
+        async def spy_markdown(*, html: str, base_url: str | None = None) -> str:
+            captured_base_urls.append(base_url)
+            captured_html.append(html)
+            return await orig_md(html=html, base_url=base_url)
+
+        async def fake_request(url: str, **_kw):
+            if url == doc_url:
+                return make_mock_response(raw_html)
+            # Fake JPEG bytes for the resolved annex image
+            return make_mock_response(
+                b"\xff\xd8\xff\xe0" + b"\x00" * 150, content_type="image/jpeg"
+            )
+
+        scraper.http.request = AsyncMock(side_effect=fake_request)
+        scraper.markdown = spy_markdown  # type: ignore[method-assign]
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "title": "Lei Ordinária n° 9.972/2012",
+                "norm_type": "Lei Ordinária",
+                "situation": "Em Vigor",
+                "summary": "ALTERA O LIMITE ENTRE OS MUNICÍPIOS DE VITÓRIA E DE SERRA.",
+                "doc_link": "/Arquivo/Documents/legislacao/html/LEI99722012.html",
+            }
+        )
+        assert doc is not None
+        assert doc.raw == raw_html
+        assert captured_base_urls == [doc_url]
+        assert "brasao.png" not in captured_html[0]
+        assert "LEI99722012_arquivos/image002.jpg" in captured_html[0]
+        assert "LEI Nº 9.972, DE 27 DE DEZEMBRO DE 2012" in doc.text_markdown
+        assert "Altera o limite entre" not in doc.text_markdown
+        assert "não substitui" not in doc.text_markdown
+        assert "data:image/jpeg;base64," in doc.text_markdown

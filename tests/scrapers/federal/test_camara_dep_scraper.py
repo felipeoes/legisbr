@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from bs4 import BeautifulSoup
-from conftest import make_scraper
+from unittest.mock import AsyncMock
 
+import pytest
+from bs4 import BeautifulSoup
+from conftest import make_mock_response, make_scraper
+
+from legisbr.core.sink import NullSink
 from legisbr.scrapers.federal.camara import TYPES, CamaraDepScraper
 
 TEST_YEAR = 2020
@@ -162,3 +166,183 @@ class TestParseListingPageDocuments:
         assert len(docs) == 2
         assert docs[0]["title"] == "Lei nº 1"
         assert docs[1]["title"] == "Lei nº 2"
+
+
+class TestFacetsAndDeterministicListing:
+    def test_extract_type_facets_parses_refine_busca_links(self):
+        soup = BeautifulSoup(
+            """
+            <html><body>
+              <aside class="refine-busca">
+                <a href="https://www.camara.leg.br/legislacao/busca?tipo=Decreto Legislativo&ano=2012">
+                  Decreto Legislativo 590 filtros encontrados
+                </a>
+                <a href="https://www.camara.leg.br/legislacao/busca?tipo=Lei Ordinária&ano=2012">
+                  Lei Ordinária 193 filtros encontrados
+                </a>
+                <a href="https://www.camara.leg.br/legislacao/busca?tipo=&ano=2012">Todos 783</a>
+              </aside>
+            </body></html>
+            """,
+            "lxml",
+        )
+        facets = CamaraDepScraper._extract_type_facets(soup)
+        assert facets == [
+            ("Decreto+Legislativo", 590),
+            ("Lei+Ordin%C3%A1ria", 193),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_documents_uses_export_for_small_year(self):
+        scraper = build_unit_scraper()
+        listing_html = """
+        <html><body>
+          <div class="busca-info__resultado busca-info__resultado--informado">Foram encontrados 25</div>
+        </body></html>
+        """
+        export_items = "".join(
+            f'<li><a href="https://www2.camara.leg.br/legin/fed/lei/2012/lei-{i}.html">Lei nº {i}</a>'
+            f"<p>Ementa: Ementa {i}.</p><p>Situação: Vigente</p></li>"
+            for i in range(1, 26)
+        )
+        export_html = f'<html><body><div id="impressaoPDF"><ul>{export_items}</ul></div></body></html>'
+
+        async def fake_request(url: str, **_kw):
+            if "busca/exportar?" in url:
+                return make_mock_response(export_html)
+            return make_mock_response(listing_html)
+
+        scraper.http.request = AsyncMock(side_effect=fake_request)
+        refs = [r async for r in scraper.list_documents(2012)]
+        assert len(refs) == 25
+        assert scraper._result.errors == 0
+        assert any(
+            "busca/exportar?" in call.args[0]
+            for call in scraper.http.request.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_documents_partitions_by_facets_and_bisects_large_type(self):
+        scraper = build_unit_scraper()
+        year_html = """
+        <html><body>
+          <div class="busca-info__resultado busca-info__resultado--informado">Foram encontrados 305</div>
+          <aside class="refine-busca">
+            <a href="https://www.camara.leg.br/legislacao/busca?tipo=Decreto Legislativo&ano=2012">
+              Decreto Legislativo 302 filtros encontrados
+            </a>
+            <a href="https://www.camara.leg.br/legislacao/busca?tipo=Lei Ordinária&ano=2012">
+              Lei Ordinária 3 filtros encontrados
+            </a>
+          </aside>
+        </body></html>
+        """
+
+        def _make_export(prefix: str, start: int, count: int) -> str:
+            lis = "".join(
+                f'<li><a href="https://www2.camara.leg.br/legin/fed/{prefix}/2012/{prefix}-{i}.html">'
+                f"Norma {prefix} {i}</a><p>Ementa: E {i}.</p></li>"
+                for i in range(start, start + count)
+            )
+            return (
+                f'<html><body><div id="impressaoPDF"><ul>{lis}</ul></div></body></html>'
+            )
+
+        async def fake_request(url: str, **_kw):
+            if "tipo=&" in url or url.endswith("tipo="):
+                return make_mock_response(year_html)
+            if "tipo=Lei+Ordin%C3%A1ria" in url:
+                return make_mock_response(_make_export("lei", 1, 3))
+            if "dataInicio=01/01/2012&dataFim=31/12/2012" in url:
+                return make_mock_response(
+                    '<div class="busca-info__resultado busca-info__resultado--informado">302</div>'
+                )
+            if "dataInicio=01/01/2012&dataFim=01/07/2012" in url:
+                if "exportar" in url:
+                    return make_mock_response(_make_export("decleg", 1, 150))
+                return make_mock_response(
+                    '<div class="busca-info__resultado busca-info__resultado--informado">150</div>'
+                )
+            if "dataInicio=02/07/2012&dataFim=31/12/2012" in url:
+                if "exportar" in url:
+                    return make_mock_response(_make_export("decleg", 151, 152))
+                return make_mock_response(
+                    '<div class="busca-info__resultado busca-info__resultado--informado">152</div>'
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        scraper.http.request = AsyncMock(side_effect=fake_request)
+        refs = [r async for r in scraper.list_documents(2012)]
+        assert len(refs) == 305
+        assert len({r["document_url"] for r in refs}) == 305
+        assert scraper._result.errors == 0
+
+    @pytest.mark.asyncio
+    async def test_list_documents_records_error_when_unique_count_short(self):
+        scraper = make_scraper(CamaraDepScraper, store=NullSink())
+        listing_html = """
+        <html><body>
+          <div class="busca-info__resultado busca-info__resultado--informado">Foram encontrados 5</div>
+          <ul>
+            <li class="busca-resultados__item">
+              <h3 class="busca-resultados__cabecalho">
+                <a href="https://www2.camara.leg.br/legin/fed/lei/2012/lei-1.html">Lei nº 1</a>
+              </h3>
+            </li>
+          </ul>
+        </body></html>
+        """
+        scraper.http.request = AsyncMock(return_value=make_mock_response(listing_html))
+        refs = [r async for r in scraper.list_documents(2012)]
+        assert len(refs) == 1
+        assert scraper._result.errors == 1
+
+
+class TestFetchFormattingAndEmenta:
+    @pytest.mark.asyncio
+    async def test_fetch_separates_dir_amended_articles_and_drops_nested_ementa(self):
+        scraper = build_unit_scraper()
+        summary = "Altera dispositivos do Regulamento dos Serviços de Radiodifusão."
+        doc_html = f"""
+        <html><body>
+          <div id="content">
+            <h1>Decreto nº 7.670, de 16 de Janeiro de 2012</h1>
+            <p class="ementa"><p>{summary}</p></p>
+            <div class="texto">
+              <p>A PRESIDENTA DA REPÚBLICA decreta:</p>
+              <p>Art. 1º O regulamento passa a vigorar com as seguintes alterações:</p>
+              <dir>"Art. 28. Texto do artigo vinte e oito." (NR)</dir><dir>"Art. 29. Texto do artigo vinte e nove." (NR)</dir>
+            </div>
+          </div>
+        </body></html>
+        """
+        text_url = "https://www2.camara.leg.br/legin/fed/decret/2012/decreto-7670-publicacaooriginal.html"
+        scraper.http.request = AsyncMock(return_value=make_mock_response(doc_html))
+        scraper._get_document_text_link = AsyncMock(
+            return_value={
+                "title": "Decreto nº 7.670, de 16 de Janeiro de 2012",
+                "_norm_type": "Decreto",
+                "summary": summary,
+                "situation": "Não consta revogação expressa",
+                "metadata_url": "https://www2.camara.leg.br/legin/fed/decret/2012/decreto-7670-norma.html",
+                "document_url": text_url,
+            }
+        )
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Decreto",
+                "title": "Decreto nº 7.670, de 16 de Janeiro de 2012",
+                "summary": summary,
+                "situation": "Não consta revogação expressa",
+                "metadata_url": "https://www2.camara.leg.br/legin/fed/decret/2012/decreto-7670-norma.html",
+            }
+        )
+        assert doc is not None
+        assert summary not in doc.text_markdown
+        assert '(NR)"Art. 29' not in doc.text_markdown
+        assert '"Art. 28.' in doc.text_markdown
+        assert '"Art. 29.' in doc.text_markdown
+        # Verify Art. 28 and Art. 29 are on separate lines.
+        for line in doc.text_markdown.splitlines():
+            assert not ("Art. 28." in line and "Art. 29." in line)

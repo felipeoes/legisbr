@@ -4,7 +4,7 @@ Many Brazilian state legislatures use SAPL with identical REST API structures.
 This base class provides the shared logic for:
   - Paginated norm search via ``/api/norma/normajuridica/``
   - Subject (assunto) fetching via ``/api/norma/assuntonorma/``
-  - PDF processing with pdf_oxide → OCR fallback
+  - PDF processing with pypdfium2 + selective pdfplumber → OCR fallback
 """
 
 from __future__ import annotations
@@ -30,8 +30,15 @@ from legisbr.core.scraper import (
 )
 
 
+_OCR_MERGED_NO_RE = re.compile(
+    r"\b(lei|decreto|resolu[çc][aã]o|emenda)\s*n([º°o0])\b", re.IGNORECASE
+)
+_MD_LINE_PREFIX_RE = re.compile(r"^(?:[#*>]\s*)+")
+
+
 def normalize_title_text(text: str) -> str:
     """Normalize a title-ish line for loose comparisons."""
+    text = _OCR_MERGED_NO_RE.sub(r"\1 n\2", text)
     return re.sub("\\s+", " ", re.sub("[^\\w\\s]", " ", text.casefold())).strip()
 
 
@@ -71,7 +78,7 @@ class SAPLBaseScraper(BaseScraper):
         "referencia: caso responda este documento",
     )
     _SAPL_TITLE_RE = re.compile(
-        "^(CONSTITUIÇÃO ESTADUAL|DECRETO LEGISLATIVO|DECRETO|EMENDA CONSTITUCIONAL|LEI COMPLEMENTAR|LEI DELEGADA|LEI|RESOLU[ÇC][AÃ]O)\\b",
+        r"^(?:[#*>]\s*)*(CONSTITUIÇÃO ESTADUAL|DECRETO LEGISLATIVO|DECRETO|EMENDA CONSTITUCIONAL|EMENDA [ÀA] CONSTITUIÇÃO|LEI COMPLEMENTAR|LEI DELEGADA|LEI|RESOLU[ÇC][AÃ]O)(?:\b|(?=n[º°o0]))",
         re.IGNORECASE,
     )
     # Line starts that open a document appended after the law; site-specific (see Piauí).
@@ -148,12 +155,14 @@ class SAPLBaseScraper(BaseScraper):
             return False
         if self._SAPL_TITLE_RE.match(compact):
             return True
+        stripped_lower = _MD_LINE_PREFIX_RE.sub("", lower).strip()
+        stripped_upper = _MD_LINE_PREFIX_RE.sub("", compact).strip().upper()
         return bool(
             re.match(
                 "^(art\\.|§|\\$|par[aá]grafo|cap[ií]tulo|t[ií]tulo|se[çc][aã]o|anexo\\b|(?:[ivxlcdm]+|\\d+)\\s*-)",
-                lower,
+                stripped_lower,
             )
-            or compact.upper().startswith("PALÁCIO")
+            or stripped_upper.startswith("PALÁCIO")
         )
 
     def _is_footer_block_line(self, compact: str, lower: str) -> bool:
@@ -256,45 +265,117 @@ class SAPLBaseScraper(BaseScraper):
         Matches ``Art.``, ``Capítulo``, ``Título``, ``Seção``, ``Anexo``, or
         ``PALÁCIO`` patterns.  Returns ``None`` when nothing matches.
         """
-        return next(
-            (
-                idx
-                for idx, compact in enumerate(compact_lines)
-                if re.match(
-                    "^(art\\.|cap[ií]tulo|t[ií]tulo|se[çc][aã]o|anexo\\b)",
-                    compact.lower(),
-                )
-                or compact.upper().startswith("PALÁCIO")
-            ),
-            None,
+        for idx, compact in enumerate(compact_lines):
+            stripped = _MD_LINE_PREFIX_RE.sub("", compact).strip()
+            if re.match(
+                "^(art\\.|cap[ií]tulo|t[ií]tulo|se[çc][aã]o|anexo\\b)",
+                stripped.lower(),
+            ) or stripped.upper().startswith("PALÁCIO"):
+                return idx
+        return None
+
+    @staticmethod
+    def _is_false_title_candidate(compact: str) -> bool:
+        """Reject promulgating-clause tails (``Lei:``) and mid-sentence prose citations."""
+        stripped = _MD_LINE_PREFIX_RE.sub("", compact).strip().strip("*_").strip()
+        if not stripped:
+            return True
+        if stripped.endswith(":"):
+            return True
+        lowered = stripped.lower()
+        if re.search(r",\s*(?:que|e\s+n[ao]|nos\s+termos)\b", lowered):
+            return True
+        if re.search(r"\bfoi\s+\w+", lowered):
+            return True
+        return False
+
+    @staticmethod
+    def _extract_expected_norm_number(expected_title: str) -> str | None:
+        """Return the primary norm number (digits only) from *expected_title* if present."""
+        match = re.search(
+            r"(?:n[º°o°.]*\s*)?(\d{1,3}(?:\.\d{3})+|\d{1,5})(?:\s*/|\s*,|\s+de\b|$)",
+            expected_title,
+            re.IGNORECASE,
         )
+        if not match:
+            return None
+        digits = re.sub(r"\D", "", match.group(1)).lstrip("0")
+        return digits or "0"
+
+    @classmethod
+    def _conflicts_with_expected_number(
+        cls, compact: str, expected_number: str | None
+    ) -> bool:
+        """Return True if *compact* names a different norm number than *expected_number*."""
+        if not expected_number:
+            return False
+        numbers = [
+            re.sub(r"\D", "", m).lstrip("0") or "0"
+            for m in re.findall(r"\b\d{1,3}(?:\.\d{3})+|\b\d{1,4}\b", compact)
+        ]
+        # Ignore 4-digit years (18xx-20xx) unless expected_number itself is that year.
+        non_year = [
+            n
+            for n in numbers
+            if not (
+                len(n) == 4 and n[:2] in {"18", "19", "20"} and n != expected_number
+            )
+        ]
+        if not non_year:
+            return False
+        return expected_number not in non_year
 
     def _select_best_title_candidate(
-        self, compact_lines: list[str], title_candidates: list[int]
+        self,
+        compact_lines: list[str],
+        title_candidates: list[int],
+        expected_title: str | None = None,
     ) -> int:
         """Pick the best SAPL-title candidate, preferring numbered ones before the first article.
 
         Candidates appearing after the first norm-body line are deprioritised.
-        Among the remaining candidates, numbered ones (containing digits) are
-        preferred over unnumbered ones.
+        When *expected_title* carries a norm number, candidates naming a
+        different norm number (mid-body cross-references) are ignored so the
+        document top is preserved.
         """
         first_norm = self._find_first_norm_content_index(compact_lines)
         if first_norm is not None:
             before = [idx for idx in title_candidates if idx <= first_norm]
             title_candidates = before or title_candidates
+        expected_number = (
+            self._extract_expected_norm_number(expected_title)
+            if expected_title
+            else None
+        )
+        if expected_number is not None:
+            compatible = [
+                idx
+                for idx in title_candidates
+                if not self._conflicts_with_expected_number(
+                    compact_lines[idx], expected_number
+                )
+            ]
+            if not compatible:
+                return 0
+            title_candidates = compatible
         numbered = [
             idx
             for idx in title_candidates
             if re.search("\\b\\d{1,4}\\b", compact_lines[idx])
         ]
-        return numbered[-1] if numbered else title_candidates[-1]
+        if numbered:
+            return numbered[-1]
+        if expected_number is not None:
+            return 0
+        return title_candidates[-1]
 
     def _collect_title_candidates(self, compact_lines: list[str]) -> list[int]:
-        """Return indices of lines matching ``_SAPL_TITLE_RE``."""
+        """Return indices of lines matching ``_SAPL_TITLE_RE`` (excluding false tails)."""
         return [
             idx
             for idx, compact in enumerate(compact_lines)
             if self._SAPL_TITLE_RE.match(compact)
+            and not self._is_false_title_candidate(compact)
         ]
 
     def _header_boundary(self, lines: list[str]) -> int:
@@ -326,13 +407,24 @@ class SAPLBaseScraper(BaseScraper):
             if exact is not None:
                 return exact
             if title_candidates:
-                fuzzy = self._find_fuzzy_title_match(
-                    lines, expected_title, title_candidates
-                )
-                if fuzzy is not None:
-                    return fuzzy
+                expected_number = self._extract_expected_norm_number(expected_title)
+                compatible = [
+                    idx
+                    for idx in title_candidates
+                    if not self._conflicts_with_expected_number(
+                        compact_lines[idx], expected_number
+                    )
+                ]
+                if compatible:
+                    fuzzy = self._find_fuzzy_title_match(
+                        lines, expected_title, compatible
+                    )
+                    if fuzzy is not None:
+                        return fuzzy
         if title_candidates:
-            return self._select_best_title_candidate(compact_lines, title_candidates)
+            return self._select_best_title_candidate(
+                compact_lines, title_candidates, expected_title=expected_title
+            )
         return 0
 
     def _filter_footer_blocks(

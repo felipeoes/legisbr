@@ -168,7 +168,7 @@ class DFSinjScraper(BaseScraper):
         "Nossa equipe resolverá o problema",
     )
     _TEXT_HEADER_RE = re.compile(
-        "^(?:Sistema Integrado de Normas Jurídicas do Distrito Federal\\s*[\\-–\xad]?\\s*SINJ-DF|Legislação correlata\\s*-\\s*[^\\n]+)\\s*",
+        r"^(?:[ \t*_~#]*(?:Sistema Integrado de Normas Jurídicas do Distrito Federal\s*[\-–\xad]?\s*SINJ-DF|Legislação\s+correlata\s*[-–—]\s*[^\n]+)[ \t*_~#]*(?:\n+|$))+",
         re.IGNORECASE,
     )
     _DISCLAIMER_RE = re.compile(
@@ -287,7 +287,15 @@ class DFSinjScraper(BaseScraper):
         for pattern in self._iter_title_patterns(doc_info):
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if match and (max_start is None or match.start() <= max_start):
-                return text[match.start() :]
+                start = match.start()
+                line_start = text.rfind("\n", 0, start) + 1
+                prefix = text[line_start:start]
+                if prefix and re.fullmatch(r"[\s#>*_~]+", prefix):
+                    start = line_start
+                else:
+                    while start > line_start and text[start - 1] in "*_~":
+                        start -= 1
+                return text[start:]
         return text
 
     @staticmethod
@@ -322,10 +330,11 @@ class DFSinjScraper(BaseScraper):
 
     def _clean_extracted_text(self, text: str, doc_info: dict) -> str:
         cleaned = self._normalize_linebreaks(text)
-        cleaned = self._trim_to_title(cleaned, doc_info)
         cleaned = self._strip_html_tags(cleaned)
+        cleaned = self._TEXT_HEADER_RE.sub("", cleaned).strip()
+        cleaned = self._trim_to_title(cleaned, doc_info)
+        cleaned = self._TEXT_HEADER_RE.sub("", cleaned).strip()
         cleaned = self._strip_summary_text(cleaned, doc_info.get("summary", ""))
-        cleaned = self._TEXT_HEADER_RE.sub("", cleaned, count=1).strip()
         disclaimer_match = self._DISCLAIMER_RE.search(cleaned)
         if disclaimer_match:
             cleaned = cleaned[: disclaimer_match.start()].rstrip()
@@ -425,7 +434,13 @@ class DFSinjScraper(BaseScraper):
         abs_end = first_nl + orig_end
         return (text[:abs_start].rstrip() + "\n" + text[abs_end:].lstrip()).strip()
 
-    async def _extract_html_markdown(self, soup: BeautifulSoup, doc_info: dict) -> str:
+    async def _extract_html_markdown(
+        self,
+        soup: BeautifulSoup,
+        doc_info: dict,
+        *,
+        base_url: str | None = None,
+    ) -> str:
         """Extract markdown from a pre-parsed BeautifulSoup object.
 
         When ``div_texto`` contains block-level tags (``<p>``, ``<h1>``…),
@@ -436,6 +451,7 @@ class DFSinjScraper(BaseScraper):
         norm_text_tag = soup.find("div", id="div_texto")
         if not norm_text_tag:
             return ""
+        resolved_base_url = base_url or doc_info.get("document_url") or self.base_url
         self._remove_summary_element(norm_text_tag, doc_info.get("summary", ""))
         has_block_tags = norm_text_tag.find(self._BLOCK_TAGS) is not None
         if has_block_tags:
@@ -450,7 +466,9 @@ class DFSinjScraper(BaseScraper):
                 remove_script_tags=True,
             )
             html_string = wrap_html(str(cleaned_tag))
-            text_markdown = await self.markdown(html=html_string)
+            text_markdown = await self.markdown(
+                html=html_string, base_url=resolved_base_url
+            )
             text_markdown = self._clean_extracted_text(text_markdown, doc_info)
             if valid_markdown(text_markdown)[0]:
                 return text_markdown
@@ -476,7 +494,9 @@ class DFSinjScraper(BaseScraper):
                 remove_script_tags=True,
             )
             html_string = wrap_html(str(cleaned_tag))
-            text_markdown = await self.markdown(html=html_string)
+            text_markdown = await self.markdown(
+                html=html_string, base_url=resolved_base_url
+            )
             text_markdown = self._clean_extracted_text(text_markdown, doc_info)
             if valid_markdown(text_markdown)[0]:
                 return text_markdown
@@ -696,7 +716,9 @@ class DFSinjScraper(BaseScraper):
         body, _resp = (result.content, result)
         soup = BeautifulSoup(body, "lxml")
         self._check_maintenance(soup)
-        text_markdown = await self._extract_html_markdown(soup, doc)
+        text_markdown = await self._extract_html_markdown(
+            soup, doc, base_url=download_url
+        )
         usable, _ = self._check_markdown(text_markdown)
         if not usable:
             return _ATTEMPT_FAILED
@@ -726,8 +748,9 @@ class DFSinjScraper(BaseScraper):
             if not is_pdf(body, ""):
                 return _ATTEMPT_FAILED
             text_markdown = await bytes_to_markdown(
-                body, "", self.base_url, self.http, self.ocr
+                body, "", text_url, self.http, self.ocr
             )
+            text_markdown = self._clean_extracted_text(text_markdown, doc)
             usable, _ = self._check_markdown(text_markdown)
             if not usable:
                 return _ATTEMPT_FAILED
@@ -738,7 +761,7 @@ class DFSinjScraper(BaseScraper):
             return Document(**doc)
         soup = BeautifulSoup(body, "lxml")
         self._check_maintenance(soup)
-        text_markdown = await self._extract_html_markdown(soup, doc)
+        text_markdown = await self._extract_html_markdown(soup, doc, base_url=text_url)
         usable, _ = self._check_markdown(text_markdown)
         if not usable:
             return _ATTEMPT_FAILED
@@ -758,8 +781,9 @@ class DFSinjScraper(BaseScraper):
     ) -> dict | None:
         """Attempts 3b+4 (PDF): direct PDF conversion then diary fallback."""
         text_markdown = await bytes_to_markdown(
-            body, "", self.base_url, self.http, self.ocr
+            body, "", fallback_url, self.http, self.ocr
         )
+        text_markdown = self._clean_extracted_text(text_markdown, doc)
         usable, reason = self._check_markdown(text_markdown)
         if usable:
             doc["text_markdown"] = text_markdown
@@ -788,7 +812,9 @@ class DFSinjScraper(BaseScraper):
         """Attempts 3–5 (HTML): HTML extraction, diary PDF, generic markdown."""
         soup = BeautifulSoup(body, "lxml")
         self._check_maintenance(soup)
-        text_markdown = await self._extract_html_markdown(soup, doc)
+        text_markdown = await self._extract_html_markdown(
+            soup, doc, base_url=fallback_url
+        )
         usable, reason = self._check_markdown(text_markdown)
         if usable:
             doc["text_markdown"] = text_markdown
@@ -805,7 +831,7 @@ class DFSinjScraper(BaseScraper):
             doc["raw_ext"] = content_ext
             return Document(**doc)
         text_markdown = await bytes_to_markdown(
-            body, "", self.base_url, self.http, self.ocr
+            body, "", fallback_url, self.http, self.ocr
         )
         usable, reason = self._check_markdown(text_markdown)
         if not usable:

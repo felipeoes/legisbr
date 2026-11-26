@@ -109,6 +109,35 @@ class RJAlerjScraper(BaseScraper):
             )
         return (html_links, page_years)
 
+    _FOOTER_SECTION_LABELS = frozenset(
+        {
+            "ficha técnica",
+            "ficha tecnica",
+            "texto da revogação :",
+            "texto da revogação:",
+            "texto da revogação",
+            "texto da revogacao",
+            "redação texto anterior",
+            "redacao texto anterior",
+            "texto da regulamentação",
+            "texto da regulamentacao",
+            "leis relacionadas ao assunto desta lei",
+            "atalho para outros documentos",
+        }
+    )
+
+    @staticmethod
+    def _is_site_footer_stop_node(node: Any) -> bool:
+        if isinstance(node, Tag):
+            classes = {c.lower() for c in (node.get("class") or [])}
+            if "inferior" in classes or node.get("id") == "rodape":
+                return True
+            if node.name == "div":
+                text = node.get_text(" ", strip=True).lower()
+                if text.startswith("clique aqui caso você tenha dificuldade"):
+                    return True
+        return False
+
     def _extract_norm_content_root(self, soup: BeautifulSoup) -> BeautifulSoup | None:
         page_content = soup.find("div", class_="pagina_central")
         div_conteudo = soup.find("div", id="divConteudo")
@@ -119,12 +148,28 @@ class RJAlerjScraper(BaseScraper):
                 if getattr(child, "name", None) is None and (not str(child).strip()):
                     continue
                 container.append(copy.copy(child))
-            for sibling in div_conteudo.next_siblings:
-                if getattr(sibling, "name", None) is None and (
-                    not str(sibling).strip()
-                ):
-                    continue
-                container.append(copy.copy(sibling))
+            # Stray Domino </div> tags spill norm content out of div.pagina_central
+            # into ancestor wrappers (conteudo_total, controle, interna, body).
+            current: Tag | None = div_conteudo
+            while current is not None and current.name not in {
+                "body",
+                "html",
+                "[document]",
+            }:
+                stopped = False
+                for sibling in current.next_siblings:
+                    if getattr(sibling, "name", None) is None and (
+                        not str(sibling).strip()
+                    ):
+                        continue
+                    if self._is_site_footer_stop_node(sibling):
+                        stopped = True
+                        break
+                    container.append(copy.copy(sibling))
+                if stopped:
+                    break
+                parent = current.parent
+                current = parent if isinstance(parent, Tag) else None
             if container.get_text(" ", strip=True):
                 return container
         return div_conteudo or soup.body
@@ -253,7 +298,14 @@ class RJAlerjScraper(BaseScraper):
         def matches(tag_text: str, normalized_tag_text: str) -> bool:
             if normalized_summary not in normalized_tag_text:
                 return False
-            if "art." in tag_text.lower() or "o governador" in tag_text.lower():
+            is_dedicated_ementa = (
+                len(normalized_tag_text) <= len(normalized_summary) * 1.25
+                and len(tag_text) < 600
+                and not re.match(r"^art\.\s*\d", tag_text.strip(), re.IGNORECASE)
+            )
+            if not is_dedicated_ementa and (
+                "art." in tag_text.lower() or "o governador" in tag_text.lower()
+            ):
                 return False
             return True
 
@@ -273,7 +325,10 @@ class RJAlerjScraper(BaseScraper):
         normalized_year = self._normalize_rj_text(year)
 
         def matches(tag_text: str, normalized_tag_text: str) -> bool:
-            if "datadapromulgacao" not in normalized_tag_text:
+            if (
+                "datadapromulgacao" not in normalized_tag_text
+                and "datadalei" not in normalized_tag_text
+            ):
                 return False
             if normalized_number and normalized_number not in normalized_tag_text:
                 return False
@@ -288,6 +343,94 @@ class RJAlerjScraper(BaseScraper):
         )
         if best_tag:
             best_tag.decompose()
+
+    def _detect_situation(self, soup: BeautifulSoup) -> str:
+        """Detect revocation or unconstitutionality status from Domino tables or CSS."""
+        status = soup.select_one("[class*=situacao], [id*=situacao], [class*=status]")
+        if status:
+            status_text = status.get_text(" ", strip=True)
+            if re.search(r"\binconstitucional\b", status_text, re.IGNORECASE):
+                return "Declarada inconstitucional"
+            if re.search(r"\bRevogad[ao]\b", status_text, re.IGNORECASE):
+                return "Revogada"
+        detected: str | None = None
+        for table in soup.find_all("table"):
+            table_text = " ".join(table.get_text(" ", strip=True).split())
+            if not table_text or len(table_text) > 2000:
+                continue
+            for tr in table.find_all("tr"):
+                cells = [
+                    " ".join(cell.get_text(" ", strip=True).split())
+                    for cell in tr.find_all(["td", "th"], recursive=False)
+                ]
+                if not cells:
+                    continue
+                for idx, cell_text in enumerate(cells):
+                    norm_label = self._normalize_rj_text(cell_text)
+                    if norm_label not in {"situacao", "tipoderevogacao"}:
+                        continue
+                    if idx + 1 >= len(cells):
+                        continue
+                    val_norm = self._normalize_rj_text(cells[idx + 1])
+                    if not val_norm or val_norm in {"emvigor", "naoconsta"}:
+                        continue
+                    if "inconstitucional" in val_norm:
+                        return "Declarada inconstitucional"
+                    if any(
+                        token in val_norm
+                        for token in ("revogad", "revogac", "expressa", "tacita")
+                    ):
+                        detected = "Revogada"
+        return detected or DEFAULT_VALID_SITUATION
+
+    def _is_footer_metadata_table(self, table: Tag) -> bool:
+        """Return True if *table* is a Domino Ficha Técnica / Situação / Revogação footer table."""
+        text = " ".join(table.get_text(" ", strip=True).split())
+        if not text or len(text) > 1500:
+            return False
+        lowered = text.lower()
+        if "art." in lowered or "o governador" in lowered:
+            return False
+        norm = self._normalize_rj_text(text)
+        if "tipoderevogacao" in norm:
+            return True
+        if ("projeto" in norm or "proposta" in norm) and (
+            "autoria" in norm or "datadepublicacao" in norm
+        ):
+            return True
+        if norm.startswith("autoria") and len(text) < 400:
+            return True
+        if norm.startswith("situacao") and (
+            len(text) < 200
+            or "tipodeacao" in norm
+            or "numerodaacao" in norm
+            or "liminardeferida" in norm
+        ):
+            return True
+        return False
+
+    def _strip_domino_footer_sections(self, content_root: BeautifulSoup | Tag) -> None:
+        """Truncate Domino footer metadata starting at _Section2, Ficha Técnica, or footer tables."""
+        cutoff_tag: Tag | None = None
+        for tag in content_root.find_all(True):
+            if tag.decomposed:
+                continue
+            if tag.name == "a" and tag.get("name") == "_Section2":
+                cutoff_tag = tag
+                break
+            if tag.name == "table" and self._is_footer_metadata_table(tag):
+                cutoff_tag = tag
+                break
+            if tag.name in {"b", "strong", "font", "div", "p"}:
+                label = " ".join(tag.get_text(" ", strip=True).split()).lower()
+                if label in self._FOOTER_SECTION_LABELS:
+                    cutoff_tag = tag
+                    break
+        if cutoff_tag is not None:
+            for following in list(cutoff_tag.find_all_next()):
+                if not following.decomposed:
+                    following.decompose()
+            cutoff_tag.decompose()
 
     @staticmethod
     def _clean_extracted_markdown(text_markdown: str) -> str:
@@ -330,21 +473,11 @@ class RJAlerjScraper(BaseScraper):
         # The ASP wrapper renders the Domino page server-side; some take >2 minutes.
         response = await self.http.request(doc_html_link, timeout=300)
         soup = response.soup()
-        status = soup.select_one("[class*=situacao], [id*=situacao], [class*=status]")
-        situation = (
-            "Revogada"
-            if status
-            and re.search("\\bRevogad[ao]\\b", status.get_text(), re.IGNORECASE)
-            else DEFAULT_VALID_SITUATION
-        )
+        situation = self._detect_situation(soup)
         content_root = self._extract_norm_content_root(soup)
         if not content_root:
             raise ValueError("Page body is empty")
-        section2_tag = content_root.find("a", attrs={"name": "_Section2"})
-        if section2_tag:
-            for tag in section2_tag.find_all_next():
-                tag.decompose()
-            section2_tag.decompose()
+        self._strip_domino_footer_sections(content_root)
         self._clean_norm_content_root(content_root)
         self._trim_to_norm_start(content_root)
         self._remove_header_metadata_element(content_root, doc_info)

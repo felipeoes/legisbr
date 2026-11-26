@@ -54,7 +54,11 @@ class AcreLegisScraper(BaseScraper):
             a = tr.find("a")
             title = a.text.strip()
             html_link = a["href"]
-            summary = tr.find("td").find_next("td").text.strip()
+            raw_summary = tr.find("td").find_next("td").text
+            raw_summary = re.sub(
+                r"^\s*Ementa\s*(?::\s*|\r?\n\s*)", "", raw_summary, flags=re.IGNORECASE
+            )
+            summary = " ".join(raw_summary.split())
             m = self.year_regex.search(title.split(",")[-1])
             year = m.group() if m else None
             html_links.append(
@@ -85,6 +89,10 @@ class AcreLegisScraper(BaseScraper):
             first_td = first_table.find("td")
             if first_td and (not first_td.get_text(strip=True)):
                 first_table.decompose()
+        for bq in list(html_tag.find_all("blockquote")):
+            style = str(bq.get("style") or "").lower()
+            if "clear" in style:
+                bq.unwrap()
         clean_norm_soup(html_tag, unwrap_links=True, remove_disclaimers=True)
         return str(html_tag)
 

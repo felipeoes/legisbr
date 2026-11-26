@@ -39,13 +39,15 @@ def _make_scraper(**kwargs) -> RoraimaAlerScraper:
 
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
-    EXPECTED_COUNT = 10
+    EXPECTED_COUNT = 12
     REQUIRED_KEYS = {
         "Lei Ordinária",
         "Lei Complementar",
         "Constituição Estadual",
         "Emenda à Constituição",
         "Decreto Legislativo",
+        "Resolução",
+        "Resolução Legislativa",
     }
 
 
@@ -155,3 +157,23 @@ def _make_api_item(
         "tipo": tipo,
         **kwargs,
     }
+
+
+def test_footer_patterns_strip_roraima_header_and_ocr_glued_footer():
+    scraper = _make_scraper()
+    text = (
+        '"Amazônia: Patrimônio dos Brasileiros"\n'
+        "LEI Nº 864, DE 2 DE AGOSTO DE 2012.\n"
+        "Art. 1º Fica instituído o programa estadual.\n"
+        "Palácio Senador Hélio Campos\n"
+        "Praça do CentroCívicos/n° — CEP 69301-380\n"
+        "Art. 2º Esta lei entra em vigor na data de sua publicação."
+    )
+    cleaned = scraper._clean_sapl_pdf_markdown(
+        text, "Lei Ordinária nº 864, de 02 de agosto de 2012"
+    )
+    assert "Amazônia: Patrimônio dos Brasileiros" not in cleaned
+    assert "Palácio Senador Hélio Campos" not in cleaned
+    assert "CentroCívico" not in cleaned
+    assert "Art. 1º Fica instituído" in cleaned
+    assert "Art. 2º Esta lei entra em vigor" in cleaned

@@ -40,6 +40,27 @@ _TYPE_ID_TO_SUFFIX = {v["id"]: v["url_suffix"] for v in TYPES.values()}
 _NON_ALPHA_RE = re.compile("[^a-zA-ZÀ-ÿ]")
 _SPECIAL_RE = re.compile("[^a-zA-ZÀ-ÿ0-9\\s]")
 _SPACE_RE = re.compile("\\s+")
+_C1_RE = re.compile(r"[\x80-\x9f]")
+_EPIGRAFE_RE = re.compile(
+    r"\b(?:LEI|DECRETO|EMENDA|PORTARIA|RESOLU[ÇC][ÃA]O|CONSTITUI[ÇC][ÃA]O)\b",
+    re.IGNORECASE,
+)
+_HEADER_CHROME_RE = re.compile(
+    r"GOVERNO\s+DO\s+ESTADO\s+DE\s+GOI[AÁ]S"
+    r"|Secretaria\s+de\s+Estado\s+da\s+Casa\s+Civil"
+    r"|Gabinete\s+Civil\s+da\s+Governadoria"
+    r"|Superintend[eê]ncia\s+de\s+Legisla[çc][aã]o\.?",
+    re.IGNORECASE,
+)
+_WINZIP_TEXT_RE = re.compile(r"^\s*download\s+dos?\s+anexos?\s*$", re.IGNORECASE)
+
+
+def _decode_cp1252_c1(text: str) -> str:
+    """Decode raw CP1252 C1 control bytes (`0x80`–`0x9F`) left by Latin-1 decoding."""
+    return _C1_RE.sub(
+        lambda m: bytes([ord(m.group())]).decode("cp1252", errors="ignore"),
+        text,
+    )
 
 
 class LegislaGoias(BaseScraper):
@@ -126,6 +147,118 @@ class LegislaGoias(BaseScraper):
             baixar_div.decompose()
         return pdf_link
 
+    @staticmethod
+    def _direct_rows(table: Tag) -> list[Tag]:
+        """Return direct `<tr>` children of *table* (looking through direct `<tbody>`)."""
+        rows: list[Tag] = []
+        for child in table.children:
+            if not isinstance(child, Tag):
+                continue
+            if child.name == "tr":
+                rows.append(child)
+            elif child.name in ("tbody", "thead", "tfoot"):
+                rows.extend(
+                    tr
+                    for tr in child.children
+                    if isinstance(tr, Tag) and tr.name == "tr"
+                )
+        return rows
+
+    @classmethod
+    def _is_layout_table(cls, table: Tag) -> bool:
+        """Identify Goiás's 1-row outer layout wrapper tables without touching annex tables."""
+        rows = cls._direct_rows(table)
+        if len(rows) != 1:
+            return False
+        cells = [
+            c for c in rows[0].children if isinstance(c, Tag) and c.name in ("td", "th")
+        ]
+        if not cells:
+            return True
+        if len(cells) == 1:
+            return True
+        if len(cells) == 2:
+            empties = [
+                not cell.get_text(strip=True) and not cell.find("img") for cell in cells
+            ]
+            return any(empties)
+        return False
+
+    @classmethod
+    def _unwrap_layout_tables(cls, root: Tag) -> None:
+        """Unwrap Goiás's 1-row layout wrapper tables while preserving real data tables."""
+        for table in list(root.find_all("table")):
+            if table.decomposed or not cls._is_layout_table(table):
+                continue
+            rows = cls._direct_rows(table)
+            for tr in rows:
+                for cell in list(tr.children):
+                    if not isinstance(cell, Tag) or cell.name not in ("td", "th"):
+                        continue
+                    if not cell.get_text(strip=True) and not cell.find("img"):
+                        cell.decompose()
+                    else:
+                        cell.name = "div"
+                tr.unwrap()
+            for child in list(table.children):
+                if isinstance(child, Tag) and child.name in ("tbody", "thead", "tfoot"):
+                    child.unwrap()
+            table.unwrap()
+
+    @classmethod
+    def _strip_header_table(cls, root: Tag) -> None:
+        """Remove Goiás's letterhead table while preserving any norm epígrafe inside it."""
+        header_table = root.find("table")
+        if not isinstance(header_table, Tag):
+            return
+        header_text = " ".join(header_table.get_text(" ", strip=True).split())
+        if "GOVERNO DO ESTADO DE GOIÁS" not in header_text.upper():
+            return
+        if len(header_text) > 400:
+            return
+        if not _EPIGRAFE_RE.search(header_text):
+            header_table.decompose()
+            return
+        # Preserve the norm epígrafe (e.g. Lei 17.928/2012) while removing letterhead chrome.
+        for img in list(header_table.find_all("img")):
+            img.decompose()
+        for el in list(header_table.find_all(["strong", "b", "font", "span", "p"])):
+            if el.decomposed:
+                continue
+            txt = " ".join(el.get_text(" ", strip=True).split())
+            if txt and not _EPIGRAFE_RE.search(txt) and _HEADER_CHROME_RE.search(txt):
+                el.decompose()
+        for s in list(header_table.find_all(string=_HEADER_CHROME_RE)):
+            cleaned = _HEADER_CHROME_RE.sub("", str(s)).strip()
+            if cleaned:
+                s.replace_with(cleaned)
+            else:
+                s.extract()
+
+    @staticmethod
+    def _strip_chrome_images_and_winzip(root: Tag) -> None:
+        """Remove decorative Goiás crest icons and WinZip annex download chrome."""
+        for img in list(root.find_all("img")):
+            if img.decomposed:
+                continue
+            src = (img.get("src") or "").lower()
+            if "winzip.jpg" in src or "brasao_goias" in src:
+                parent = img.parent
+                img.decompose()
+                if (
+                    isinstance(parent, Tag)
+                    and parent.name == "a"
+                    and not parent.get_text(strip=True)
+                    and not parent.find("img")
+                ):
+                    parent.decompose()
+        for el in list(root.find_all(["a", "p", "div", "span", "strong", "b", "font"])):
+            if el.decomposed:
+                continue
+            txt = " ".join(el.get_text(" ", strip=True).split())
+            if _WINZIP_TEXT_RE.match(txt) and not el.find("img"):
+                el.decompose()
+
     def _prepare_inline_html(self, html_content: str) -> tuple[str, str, bool]:
         """Clean inline HTML and return ``(clean_html, pdf_link, redirect)``."""
         raw_html = self._ensure_html_document(html_content)
@@ -146,13 +279,9 @@ class LegislaGoias(BaseScraper):
             tag.decompose()
         for tag in root.find_all(class_=re.compile("ficha-tecnica", re.IGNORECASE)):
             tag.decompose()
-        header_table = root.find("table")
-        if (
-            header_table
-            and "GOVERNO DO ESTADO DE GOIÁS"
-            in header_table.get_text(" ", strip=True).upper()
-        ):
-            header_table.decompose()
+        self._strip_header_table(root)
+        self._strip_chrome_images_and_winzip(root)
+        self._unwrap_layout_tables(root)
         clean_norm_soup(
             root,
             unwrap_links=True,
@@ -165,6 +294,27 @@ class LegislaGoias(BaseScraper):
             remove_script_tags=True,
         )
         return (self._ensure_html_document(str(root).strip()), pdf_link, False)
+
+    def _strip_summary_from_markdown(self, md: str, summary: str) -> str:
+        """Remove a standalone ementa paragraph even when soft hyphens/punctuation spacing differ."""
+        if not summary:
+            return md
+        stripped = remove_summary_from_markdown(md, summary)
+        if stripped != md:
+            return stripped
+        norm_summary = self._normalize_for_compare(summary.replace("\xad", ""))
+        if not norm_summary:
+            return md
+        paragraphs = md.split("\n\n")
+        filtered = [
+            p
+            for p in paragraphs
+            if self._normalize_for_compare(re.sub(r"[*_`]+", "", p).replace("\xad", ""))
+            != norm_summary
+        ]
+        if len(filtered) != len(paragraphs):
+            return "\n\n".join(filtered)
+        return md
 
     def _should_use_pdf_fallback(
         self, text_markdown: str, summary: str, *, has_pdf_link: bool
@@ -193,7 +343,7 @@ class LegislaGoias(BaseScraper):
             "situation": situation,
             "date": doc_detail.get("data_legislacao", ""),
             "title": f"{title_type} {doc_detail.get('numero', '')} de {doc_detail.get('ano', doc.get('ano', ''))}".strip(),
-            "summary": (doc_detail.get("ementa") or "").strip(),
+            "summary": _decode_cp1252_c1((doc_detail.get("ementa") or "").strip()),
         }
 
     async def _process_pdf_link(
@@ -259,14 +409,16 @@ class LegislaGoias(BaseScraper):
                 raise ValueError(
                     "Document redirects via 'Clique no link abaixo' (content not inline)"
                 )
-            text_markdown = self._clean_markdown(await self.markdown(html=clean_html))
+            text_markdown = self._clean_markdown(
+                await self.markdown(html=clean_html, base_url=doc_info["document_url"])
+            )
             html_valid, html_reason = valid_markdown(text_markdown)
             if html_valid and (
                 not self._should_use_pdf_fallback(
                     text_markdown, doc_info["summary"], has_pdf_link=bool(pdf_link)
                 )
             ):
-                doc_info["text_markdown"] = remove_summary_from_markdown(
+                doc_info["text_markdown"] = self._strip_summary_from_markdown(
                     text_markdown, doc_info["summary"]
                 )
                 doc_info["raw"] = self._ensure_html_document(

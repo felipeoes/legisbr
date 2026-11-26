@@ -234,3 +234,28 @@ async def test_fetch_builds_document_from_http_body():
     scraper.http.request.assert_awaited_once_with(url)
     assert "Art. 1º Texto da lei." in doc.text_markdown
     assert doc.raw == body and doc.raw_ext == ".html"
+
+
+@pytest.mark.asyncio
+async def test_strips_ementa_prefix_and_unwraps_clear_both_blockquote():
+    scraper = _make_scraper()
+    rows = [
+        (
+            "Lei nº 2.679, de 27/12/2012",
+            "/detalhar/1",
+            "Ementa \n                                        Altera   dispositivos\n  da Lei nº 1.137.",
+        )
+    ]
+    soup = BeautifulSoup(_listing_html("lei_ordinarias", rows), "lxml")
+    docs = await scraper._get_docs_links(soup, "lei_ordinarias")
+    assert docs[0]["summary"] == "Altera dispositivos da Lei nº 1.137."
+
+    detail = BeautifulSoup(
+        '<html><body><div id="body-law">'
+        '<blockquote style="clear: both; margin-top: 10px;"><strong>LEI Nº 2.679, DE 27 DE DEZEMBRO DE 2012</strong></blockquote>'
+        "<p>Art. 1º Conteúdo da lei.</p></div></body></html>",
+        "lxml",
+    )
+    cleaned = scraper._clean_acre_html(detail)
+    assert "<blockquote" not in cleaned
+    assert "LEI Nº 2.679, DE 27 DE DEZEMBRO DE 2012" in cleaned

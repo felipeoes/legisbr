@@ -280,3 +280,96 @@ class TestFetch:
         )
         assert scraper.http.request.call_count == 1
         assert "Hide details" not in doc.text_markdown
+
+    async def test_collects_spilled_content_outside_pagina_central_before_footer(self):
+        scraper = _make_scraper()
+        body = (
+            '<html><body><div class="interna"><div class="controle">'
+            '<div class="conteudo_total"><div class="pagina_central">'
+            '<div id="divConteudo">'
+            "<p>LEI Nº 6370, DE 20 DE DEZEMBRO DE 2012</p>"
+            "<p>Art. 1º Primeira parte da lei estadual.</p>"
+            "</div></div>"
+            "<p>Art. 2º Parte que vazou para conteudo_total.</p></div>"
+            "<p>TABELA 17 - Parte que vazou para controle.</p></div>"
+            "<p>Art. 3º Parte final que vazou para interna.</p></div>"
+            '<a name="_Section2"></a><b>Ficha Técnica</b>'
+            "<table><tr><td>Projeto de Lei nº</td><td>1852/2012</td></tr>"
+            "<tr><td>Autoria</td><td>PODER EXECUTIVO</td></tr>"
+            "<tr><td>Data de publicação</td><td>21/12/2012</td></tr></table>"
+            '<div class="inferior interna">TOPO PALÁCIO TIRADENTES</div>'
+            "</body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(body)]
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Lei Ordinária",
+                "title": "Lei Ordinária 6370/2012",
+                "date": "2012",
+                "summary": "",
+                "situation": "Não consta revogação expressa",
+                "_html_link": "https://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=53&url=x",
+                "document_url": "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/def",
+            }
+        )
+        assert "Art. 1º Primeira parte" in doc.text_markdown
+        assert "Art. 2º Parte que vazou" in doc.text_markdown
+        assert "TABELA 17" in doc.text_markdown
+        assert "Art. 3º Parte final" in doc.text_markdown
+        assert "Ficha Técnica" not in doc.text_markdown
+        assert "TOPO PALÁCIO TIRADENTES" not in doc.text_markdown
+
+    async def test_strips_header_footer_metadata_ementa_with_art_and_detects_status(
+        self,
+    ):
+        scraper = _make_scraper()
+        body = (
+            '<html><body><div class="pagina_central"><div id="divConteudo">'
+            "<table><tr><td>Lei nº</td><td>6332 / 2012</td><td>Data da Lei</td><td>11/10/2012</td></tr></table>"
+            "<p>LEI Nº 6332, DE 11 DE OUTUBRO DE 2012</p>"
+            "<table><tr><td>ACRESCENTA §7º AO ART. 128 DA LEI ESTADUAL E DÁ OUTRAS PROVIDÊNCIAS.</td></tr></table>"
+            "<p>Art. 1º Fica acrescido o parágrafo sétimo ao artigo cento e vinte e oito da lei estadual.</p>"
+            "<table><tr><td>Projeto de Lei nº</td><td>3230/2010</td></tr>"
+            "<tr><td>Autoria</td><td>DEPUTADO TESTE</td></tr>"
+            "<tr><td>Data de publicação</td><td>15/10/2012</td></tr></table>"
+            "<table><tr><td>Situação</td><td>Declarado Inconstitucional</td></tr></table>"
+            "</div></div></body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(body)]
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Lei Ordinária",
+                "title": "Lei Ordinária 6332/2012",
+                "date": "2012",
+                "summary": "ACRESCENTA §7º AO ART. 128 DA LEI ESTADUAL E DÁ OUTRAS PROVIDÊNCIAS.",
+                "situation": "Não consta revogação expressa",
+                "_html_link": "https://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=53&url=x",
+                "document_url": "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/6332",
+            }
+        )
+        assert doc.situation == "Declarada inconstitucional"
+        assert "Data da Lei" not in doc.text_markdown
+        assert "ACRESCENTA §7º AO ART. 128" not in doc.text_markdown
+        assert "Projeto de Lei" not in doc.text_markdown
+        assert "Declarado Inconstitucional" not in doc.text_markdown
+        assert "Art. 1º Fica acrescido" in doc.text_markdown
+
+    def test_detect_situation_from_tipo_de_revogacao_and_situacao_tables(self):
+        scraper = _make_scraper()
+        s_rev = BeautifulSoup(
+            "<table><tr><td>Tipo de Revogação:</td><td>Expressa</td></tr></table>",
+            "lxml",
+        )
+        assert scraper._detect_situation(s_rev) == "Revogada"
+        s_tac = BeautifulSoup(
+            "<table><tr><td>Situação</td><td>Revogação Tácita</td></tr></table>",
+            "lxml",
+        )
+        assert scraper._detect_situation(s_tac) == "Revogada"
+        s_vig = BeautifulSoup(
+            "<table><tr><td>Tipo de Revogação:</td><td>Em Vigor</td></tr></table>",
+            "lxml",
+        )
+        assert scraper._detect_situation(s_vig) == "Não consta revogação expressa"

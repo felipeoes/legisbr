@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
-from urllib.parse import quote_plus, urljoin, urlparse
+from datetime import date, timedelta
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from legisbr.core.convert import (
     calc_pages,
     clean_norm_soup,
     infer_type_from_title,
+    remove_summary_element,
+    remove_summary_from_markdown,
     strip_html_chrome,
 )
 from legisbr.core.document import DocRef, Document, clean_title
@@ -249,8 +253,12 @@ class CamaraDepScraper(BaseScraper):
         number: str = "",
         text: str = "",
         situation: str = "",
+        data_inicio: str = "",
+        data_fim: str = "",
+        ordering: str | None = None,
+        export: bool = False,
     ) -> str:
-        """Format search URL for a given year, norm type, and optional search filters."""
+        """Format search or export URL for a given year, norm type, and optional filters."""
         params = {
             "abrangencia": self.coverage,
             "geral": quote_plus(text) if text else "",
@@ -258,14 +266,46 @@ class CamaraDepScraper(BaseScraper):
             "situacao": quote_plus(situation) if situation else "",
             "origem": "",
             "numero": quote_plus(number) if number else "",
-            "ordenacao": self.ordering,
+            "ordenacao": ordering if ordering is not None else self.ordering,
             "tipo": norm_type_id,
         }
+        if data_inicio or data_fim:
+            params["dataInicio"] = data_inicio
+            params["dataFim"] = data_fim
+        endpoint = "busca/exportar?" if export else "busca?"
         return (
             self.base_url
-            + "busca?"
+            + endpoint
             + "&".join((f"{key}={value}" for key, value in params.items()))
         )
+
+    @staticmethod
+    def _extract_type_facets(soup: BeautifulSoup) -> list[tuple[str, int]]:
+        """Extract non-zero `(encoded_tipo, count)` facets from `aside.refine-busca`."""
+        aside = soup.find("aside", class_="refine-busca")
+        if not isinstance(aside, Tag):
+            return []
+        facets: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for link in aside.find_all("a", href=True):
+            href = link.get("href")
+            if not isinstance(href, str) or "tipo=" not in href:
+                continue
+            tipos = parse_qs(urlparse(href).query).get("tipo")
+            if not tipos or not tipos[0].strip():
+                continue
+            tipo_val = tipos[0].strip()
+            if tipo_val in seen:
+                continue
+            match = re.search(r"(\d[\d.]*)\s+filtro", link.get_text(" ", strip=True))
+            if not match:
+                continue
+            count = int(match.group(1).replace(".", ""))
+            if count <= 0:
+                continue
+            seen.add(tipo_val)
+            facets.append((quote_plus(tipo_val), count))
+        return facets
 
     @staticmethod
     def _extract_total_results(soup: BeautifulSoup) -> int | None:
@@ -476,8 +516,14 @@ class CamaraDepScraper(BaseScraper):
                 return await self.fetch_pdf({**doc, "year": year, "type": doc_type})
             html_text = resp_or_failed.text
             soup = BeautifulSoup(html_text, "lxml")
+            texto_div = soup.find("div", class_="texto")
+            used_texto_div = isinstance(texto_div, Tag) and bool(
+                texto_div.get_text(strip=True)
+            )
             content_div = (
-                soup.find("div", id="content")
+                texto_div
+                if used_texto_div
+                else soup.find("div", id="content")
                 or soup.find("div", class_="textoNorma")
                 or soup
             )
@@ -490,24 +536,46 @@ class CamaraDepScraper(BaseScraper):
                     {"class_": "publicacoesTI"},
                 ],
             )
+            # Legacy Câmara HTML indents quoted amended articles inside <dir> tags,
+            # which html-to-markdown strips inline without block breaks; promote to <div>.
+            for dir_tag in content_div.find_all("dir"):
+                dir_tag.name = "div"
             clean_norm_soup(content_div)
             for h1 in content_div.find_all("h1"):
                 h1.decompose()
             ementa_nodes = content_div.find_all("p", class_="ementa")
             html_with_ementa = str(content_div)
             for ementa in ementa_nodes:
+                # lxml auto-closes invalid `<p class="ementa"><p>...</p></p>` into an
+                # empty `<p class="ementa">` followed by a sibling `<p>` holding the ementa.
+                if not ementa.get_text(strip=True):
+                    nxt = ementa.find_next_sibling()
+                    if isinstance(nxt, Tag) and nxt.name == "p":
+                        nxt_text = " ".join(nxt.get_text(" ", strip=True).split())
+                        if not summary or (
+                            " ".join(summary.split()).casefold() in nxt_text.casefold()
+                            and "art." not in nxt_text.casefold()
+                        ):
+                            nxt.decompose()
                 ementa.decompose()
+            if summary and not used_texto_div:
+                remove_summary_element(content_div, summary)
             html_string = str(content_div)
-            text_markdown = await self.markdown(html=html_string)
+            text_markdown = await self.markdown(
+                html=html_string, base_url=document_text_link
+            )
             if not text_markdown or not text_markdown.strip():
                 if ementa_nodes:
-                    fallback_markdown = await self.markdown(html=html_with_ementa)
+                    fallback_markdown = await self.markdown(
+                        html=html_with_ementa, base_url=document_text_link
+                    )
                     if fallback_markdown and fallback_markdown.strip():
                         text_markdown = fallback_markdown
-                        html_string = html_with_ementa
                 if not text_markdown or not text_markdown.strip():
                     logger.warning(f"Document text is empty after conversion: {title}")
                     raise ValueError("Document text is empty after conversion")
+            if summary:
+                text_markdown = remove_summary_from_markdown(text_markdown, summary)
             return Document(
                 year=year,
                 title=title,
@@ -564,21 +632,176 @@ class CamaraDepScraper(BaseScraper):
                 return mapped
         return self._infer_norm_type(title)
 
+    async def _paginate_url(
+        self, url: str, total: int, *, first_soup: BeautifulSoup | None = None
+    ) -> list[dict]:
+        """Collect all pages of a search URL via bounded pagination."""
+
+        async def fetch_page(page: int) -> list[dict]:
+            if page == 1 and first_soup is not None:
+                return self._parse_listing_page_documents(first_soup)
+            return await self._get_docs_links(f"{url}&pagina={page}")
+
+        return [ref async for ref in self.paginate(fetch_page, calc_pages(total, 20))]
+
+    async def _collect_slice(
+        self,
+        year: int,
+        norm_type_id: str,
+        *,
+        expected_total: int,
+        data_inicio: str = "",
+        data_fim: str = "",
+        first_soup: BeautifulSoup | None = None,
+    ) -> list[dict]:
+        """Deterministically collect all docs for a `(year, norm_type, date_range)` slice.
+
+        Câmara's paginated `/busca` lacks a deterministic secondary tiebreaker across
+        same-date acts. Slices of `<= EXPORT_MAX_DOCS` (300) are fetched atomically in
+        a single `/busca/exportar` call; larger slices are recursively bisected by date
+        range (`dataInicio`/`dataFim`) until every bucket fits inside the export cap.
+        """
+        if expected_total <= 0:
+            return []
+        if expected_total <= 20 and first_soup is not None:
+            items = self._parse_listing_page_documents(first_soup)
+            if len(items) >= expected_total:
+                return items
+        if expected_total <= EXPORT_MAX_DOCS:
+            export_url = self._format_search_url(
+                str(year),
+                norm_type_id,
+                data_inicio=data_inicio,
+                data_fim=data_fim,
+                export=True,
+            )
+            docs = self._parse_export_documents(
+                (await self.http.request(export_url)).soup()
+            )
+            if len(docs) >= expected_total:
+                return docs
+            # Fallback to pagination if export was incomplete (or mocked without export).
+            search_url = self._format_search_url(
+                str(year),
+                norm_type_id,
+                data_inicio=data_inicio,
+                data_fim=data_fim,
+            )
+            extra = await self._paginate_url(
+                search_url, expected_total, first_soup=first_soup
+            )
+            seen: dict[str, dict] = {d["metadata_url"]: d for d in docs}
+            for item in extra:
+                seen.setdefault(item["metadata_url"], item)
+            return list(seen.values())
+        return await self._collect_by_date_range(
+            year, norm_type_id, date(year, 1, 1), date(year, 12, 31)
+        )
+
+    async def _collect_by_date_range(
+        self, year: int, norm_type_id: str, start_d: date, end_d: date
+    ) -> list[dict]:
+        """Bisect `[start_d, end_d]` until each sub-range has `<= EXPORT_MAX_DOCS` docs."""
+        d1 = start_d.strftime("%d/%m/%Y")
+        d2 = end_d.strftime("%d/%m/%Y")
+        search_url = self._format_search_url(
+            str(year), norm_type_id, data_inicio=d1, data_fim=d2
+        )
+        sub_soup = (await self.http.request(search_url)).soup()
+        sub_total = self._extract_total_results(sub_soup)
+        if not sub_total:
+            return []
+        if sub_total <= EXPORT_MAX_DOCS:
+            return await self._collect_slice(
+                year,
+                norm_type_id,
+                expected_total=sub_total,
+                data_inicio=d1,
+                data_fim=d2,
+                first_soup=sub_soup,
+            )
+        if start_d >= end_d:
+            # Single-day overflow (> 300 acts on one day): merge multiple orderings.
+            merged: dict[str, dict] = {}
+            for order in ("relevancia%3ADESC", "data%3AASC"):
+                u = self._format_search_url(
+                    str(year),
+                    norm_type_id,
+                    data_inicio=d1,
+                    data_fim=d2,
+                    ordering=order,
+                )
+                for item in await self._paginate_url(u, sub_total):
+                    merged.setdefault(item["metadata_url"], item)
+                if len(merged) >= sub_total:
+                    break
+            return list(merged.values())
+        mid = start_d + timedelta(days=(end_d - start_d).days // 2)
+        left, right = await asyncio.gather(
+            self._collect_by_date_range(year, norm_type_id, start_d, mid),
+            self._collect_by_date_range(
+                year, norm_type_id, mid + timedelta(days=1), end_d
+            ),
+        )
+        return [*left, *right]
+
     async def list_documents(self, year: int) -> AsyncIterator[dict]:
         url = self._format_search_url(str(year), "")
         soup = (await self.http.request(url)).soup()
         total = self._extract_total_results(soup)
         if total is None:
             raise ValueError("Could not parse federal legislation result count")
+        if total == 0:
+            return
 
-        async def fetch_page(page: int) -> list[dict]:
-            return (
-                self._parse_listing_page_documents(soup)
-                if page == 1
-                else await self._get_docs_links(url + f"&pagina={page}")
+        if total <= EXPORT_MAX_DOCS:
+            raw_docs = await self._collect_slice(
+                year, "", expected_total=total, first_soup=soup
+            )
+        else:
+            facets = self._extract_type_facets(soup)
+            if facets:
+                sem = asyncio.Semaphore(max(1, min(self.workers, 8)))
+
+                async def _fetch_facet(tipo_encoded: str, count: int) -> list[dict]:
+                    async with sem:
+                        return await self._collect_slice(
+                            year, tipo_encoded, expected_total=count
+                        )
+
+                results = await asyncio.gather(
+                    *(_fetch_facet(tipo_id, cnt) for tipo_id, cnt in facets),
+                    return_exceptions=True,
+                )
+                raw_docs = []
+                for (tipo_id, _cnt), res in zip(facets, results, strict=True):
+                    if isinstance(res, Exception):
+                        await self.error(
+                            {"year": year, "title": f"listing tipo={tipo_id}"}, res
+                        )
+                        continue
+                    raw_docs.extend(res)
+            else:
+                raw_docs = await self._paginate_url(url, total, first_soup=soup)
+
+        unique: dict[str, dict] = {}
+        for ref in raw_docs:
+            unique.setdefault(ref["metadata_url"], ref)
+
+        if len(unique) < total:
+            exc = ValueError(
+                f"Federal legislation listing for {year} returned "
+                f"{len(unique)}/{total} unique documents"
+            )
+            await self.error(
+                {
+                    "year": year,
+                    "title": f"listing completeness ({len(unique)}/{total})",
+                },
+                exc,
             )
 
-        async for ref in self.paginate(fetch_page, calc_pages(total, 20)):
+        for ref in unique.values():
             norm_type = self._resolve_norm_type(
                 ref["title"], metadata_url=ref["metadata_url"]
             )

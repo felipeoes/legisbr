@@ -193,3 +193,48 @@ class TestCleanSaplPdfMarkdownKeepsTheLaw:
         cleaned = scraper._clean_sapl_pdf_markdown(text, "Lei nº 9.884")
         assert "Art. 39º" in cleaned and "expediente normal" in cleaned
         assert "Senhor Governador" not in cleaned
+
+    def test_markdown_formatted_heading_trims_preceding_diario_oficial_tail(self):
+        text = (
+            "§ 2º Resto de norma anterior no Diário Oficial.\n\n"
+            "## LEI Nº 6.292, DE 19 DE DEZEMBRO DE 2012\n\n"
+            f"{BODY}"
+        )
+        cleaned = _make_scraper()._clean_sapl_pdf_markdown(
+            text, "Lei nº 6.292, de 19 de dezembro de 2012"
+        )
+        assert cleaned.startswith("## LEI Nº 6.292, DE 19 DE DEZEMBRO DE 2012")
+        assert "Resto de norma anterior" not in cleaned
+
+    def test_ocr_merged_lein0_header_is_matched_and_cross_reference_is_ignored(self):
+        text = (
+            '"Amazônia: Patrimônio dos Brasileiros"\n'
+            "LEIN0 869 DE 13 DE NOVEMBRO DE 2012.\n"
+            'Altera a redação da\nLei n° 431/2004, que "Declara área turística".\n'
+            "O GOVERNADOR DO ESTADO DE RORAIMA\n"
+            "Faço saber que a Assembleia aprovou e eu sanciono a seguinte\n"
+            "Lei:\n"
+            f"{BODY}"
+        )
+        cleaned = _make_scraper()._clean_sapl_pdf_markdown(
+            text, "Lei Ordinária nº 869, de 13 de novembro de 2012"
+        )
+        assert cleaned.startswith("LEIN0 869 DE 13 DE NOVEMBRO DE 2012.")
+        assert "Lei n° 431/2004" in cleaned
+
+    def test_mid_body_promulgating_lei_colon_never_chops_header(self):
+        text = (
+            "ESTADO DA PARAÍBA\n"
+            "LEI N°\n"
+            "9.755\n"
+            "Dispõe sobre utilidade pública.\n"
+            "Faço saber que a Assembleia decreta e eu sanciono a seguinte\n"
+            "Lei:\n"
+            f"{BODY}"
+        )
+        cleaned = _make_scraper()._clean_sapl_pdf_markdown(
+            text, "Lei Ordinária nº 9.755, de 08 de junho de 2012"
+        )
+        assert not cleaned.startswith("Lei:")
+        assert "Dispõe sobre utilidade pública." in cleaned
+        assert "Art. 1º" in cleaned

@@ -146,3 +146,28 @@ class TestBuildUrl:
     def test_no_pagina_param_for_page_1(self):
         scraper = _make_scraper()
         assert "pagina" not in scraper._build_url(1)
+
+
+class TestDisclaimerLineRegex:
+    def test_strips_bold_wrapped_disclaimer_without_leaving_orphan_asterisks(self):
+        from legisbr.scrapers.states.al import _DISCLAIMER_LINE_RE
+
+        text = (
+            "Art. 1º Fica instituído o programa.\n\n"
+            "Governador\n\n"
+            "**Este texto não substitui o publicado no DOE do dia 01.01.2012.**"
+        )
+        cleaned = _DISCLAIMER_LINE_RE.sub("", text).strip()
+        assert cleaned == "Art. 1º Fica instituído o programa.\n\nGovernador"
+        assert "**" not in cleaned
+
+    def test_strips_plain_and_italic_disclaimers(self):
+        from legisbr.scrapers.states.al import _DISCLAIMER_LINE_RE
+
+        for line in (
+            "Este texto não substitui o publicado no DOE.",
+            "*Esta texto nao substitui o publicado no DOE.*",
+            "*** Este texto não substitui o publicado no DOE.***",
+        ):
+            cleaned = _DISCLAIMER_LINE_RE.sub("", f"Governador\n\n{line}").strip()
+            assert cleaned == "Governador"

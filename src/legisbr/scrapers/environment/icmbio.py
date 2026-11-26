@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
-from legisbr.core.convert import clean_norm_soup
+from legisbr.core.convert import clean_norm_soup, valid_markdown
 from legisbr.core.document import Document
 from legisbr.core.scraper import BaseScraper
 
@@ -37,6 +37,23 @@ TYPES = {
 _IN_TITLE_RE = re.compile("^in(?:\\s+[a-zà-ÿ/.-]+)*\\s+\\d+", re.IGNORECASE)
 _PORTARIA_TITLE_RE = re.compile("^portari[ae]\\w*", re.IGNORECASE)
 _RE_EDITION_PREFIX = re.compile("^do\\d+[a-z]?-\\d{4}-\\d{2}-\\d{2}-")
+_RE_DOU_VERIFICACAO = re.compile(
+    r"(?:\b\d{1,4}\s+)?Este\s+documento\s+pode\s+ser\s+verificado\s+no\s+endere[çc]o\s+eletr[oô]nico"
+    r"\s+(?:\d{1,4}\s+)?https?://(?:www\.)?in\.gov\.br/autenticidade\.html\s*,?\s*pelo\s+c[oó]digo\s+\d+",
+    re.IGNORECASE,
+)
+_RE_DOU_ICP_BRASIL = re.compile(
+    r"(?:(?<=^)|(?<=\s))(?:\d{1,4}\s+)?Documento\s+assinado\s+digitalmente\s+conforme\s+MP\s+n[º°o.]?\s*2\.200-2\s+de\s+24/08/2001\s*,?\s*que\s+institui\s+a\s+Infraestrutura\s+de\s+Chaves\s+P[uú]blicas\s+Brasileira\s*[-–]\s*ICP-Brasil\.?",
+    re.IGNORECASE,
+)
+_RE_DOU_ISSN_HEADER = re.compile(
+    r"ISSN\s+\d{4}-\d{4}(?:\s+N[º°o.]?\s*\d+\s*,\s*[a-zçãéíóú-]+-feira\s*,\s*\d{1,2}\s+de\s+[a-zçãéíóú]+\s+de\s+\d{4})?",
+    re.IGNORECASE,
+)
+_RE_DOU_SECAO = re.compile(
+    r"(?m)^(?:#{1,6}\s+)?Se[çc][aã]o\s+[123](?:\s+(?=(?:\*\*)?(?:PORTARIA|INSTRU[ÇC][ÃA]O|RESOLU[ÇC][ÃA]O|DECRETO|DESPACHO|EXTRATO|EDITAL|ATO)\b)|\s*$)",
+    re.IGNORECASE,
+)
 VALID_SITUATIONS = ["em vigência", "em vigência com alteração", "não consta"]
 INVALID_SITUATIONS = ["revogado", "vencido", "sem efeito"]
 SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
@@ -288,6 +305,20 @@ class ICMBioScraper(BaseScraper):
             "publication_info": row.get("instrumento", ""),
         }
 
+    @staticmethod
+    def _clean_dou_pdf_markdown(text: str) -> str:
+        """Strip DOU running headers, authenticity footers, and ICP-Brasil boilerplate."""
+        cleaned = _RE_DOU_VERIFICACAO.sub(" ", text)
+        cleaned = _RE_DOU_ICP_BRASIL.sub("\n\n", cleaned)
+        cleaned = _RE_DOU_ISSN_HEADER.sub(" ", cleaned)
+        cleaned = _RE_DOU_SECAO.sub("", cleaned)
+        # Ensure pipe tables never remain glued to preceding non-table text after footer removal.
+        cleaned = re.sub(r"(?m)^([^|\n]+\S)(\|[^\n]+\|)$", r"\1\n\n\2", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r" *\n *", "\n", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
     async def fetch(self, doc_info: dict) -> Document:
         """Fetch the DOU act over HTTP and convert to markdown."""
         url = doc_info["document_url"]
@@ -303,6 +334,10 @@ class ICMBioScraper(BaseScraper):
             markdown, raw, ext = await self.download(url)
             if ext != ".pdf":
                 raise ValueError(f"DOU PDF viewer returned {ext}, not a PDF")
+            markdown = self._clean_dou_pdf_markdown(markdown)
+            valid, reason = valid_markdown(markdown)
+            if not valid:
+                raise ValueError(f"Invalid markdown: {reason}")
             return Document(
                 **{**doc_info, "document_url": url},
                 text_markdown=markdown,

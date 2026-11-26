@@ -227,3 +227,33 @@ async def test_fetch_stores_selected_text_page_as_html():
     assert "Texto da lei pernambucana" in doc.text_markdown
     assert doc.text_version == "TEXTOATUALIZADO" and doc.subject == "MEIO AMBIENTE."
     assert doc.raw == body and doc.raw_ext == ".html"
+
+
+async def test_fetch_combines_all_word_sections_without_truncating_annexes():
+    scraper = _make_scraper()
+    body = (
+        '<html><body><div id="divTexto">'
+        "<title>Ignored</title><style>p { color: red; }</style>"
+        '<div class="WordSection1"><p>Art. 1º Caput da lei principal com texto suficiente para validação.</p></div>'
+        '<div class="WordSection2"><p>ANEXO I - Tabela de valores do IPVA.</p></div>'
+        '<div class="WordSection3"><p>ANEXO II - Metas fiscais complementares.</p></div>'
+        "</div></body></html>"
+    ).encode("utf-8")
+    text_url = "https://legis.alepe.pe.gov.br/texto.aspx?id=541&tipo=TEXTOATUALIZADO"
+    scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+    doc = await scraper.fetch(
+        {
+            "year": 2012,
+            "type": "Decreto do Executivo",
+            "title": "Decreto nº 38.979",
+            "summary": "",
+            "situation": "Não consta revogação expressa",
+            "document_url": text_url,
+            "additional_data_url": "",
+            "_candidate_document_urls": [text_url],
+        }
+    )
+    assert "Art. 1º Caput da lei principal" in doc.text_markdown
+    assert "ANEXO I - Tabela de valores do IPVA." in doc.text_markdown
+    assert "ANEXO II - Metas fiscais complementares." in doc.text_markdown
+    assert "color: red" not in doc.text_markdown

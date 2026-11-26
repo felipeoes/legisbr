@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
@@ -7,7 +8,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
-from legisbr.core.convert import wrap_html
+from legisbr.core.convert import clean_norm_soup, wrap_html
 from legisbr.core.document import Document
 from legisbr.core.scraper import (
     DEFAULT_INVALID_SITUATION,
@@ -40,6 +41,18 @@ _SUMMARY_NORMALIZE_RE = re.compile("[^\\w]", re.UNICODE)
 _RE_REVOKED_NOTE = re.compile(
     "\\bRevogad[ao]\\b\\s+(?:pela|pelo|por)\\b", re.IGNORECASE
 )
+_GLUED_NUMERO_RE = re.compile(r"(?<=[A-Za-zÀ-ÿ])(n[º°])", re.IGNORECASE)
+_DISCLAIMER_RE = re.compile(
+    r"ESTE\s+TEXTO\s+N[AÃ]O\s+SUBSTITUI\s+O\s+ORIGINAL", re.IGNORECASE
+)
+_STATE_BANNER_RE = re.compile(
+    r"^ESTADO\s+DE\s+MATO\s+GROSSO\s+DO\s+SUL$", re.IGNORECASE
+)
+_TOOLBAR_TOKENS = ("sair", "editar", "excluir", "novo anexo")
+_NON_IMAGE_ATTACH_RE = re.compile(
+    r"\.(?:docx?|xlsx?|pdf|rtf|zip|rar|odt|ods|txt)(?:$|[?#])", re.IGNORECASE
+)
+_ORDINAL_ONLY_RE = re.compile(r"^[ºª°]+$")
 
 
 class MSAlemsScraper(BaseScraper):
@@ -244,7 +257,7 @@ class MSAlemsScraper(BaseScraper):
             unid = entry.get("unid")
             if not unid:
                 continue
-            title = self._entry_text(entry, "wnumero")
+            title = self._normalize_title(self._entry_text(entry, "wnumero"))
             summary = self._entry_text(entry, _SUMMARY_FIELD_NAMES)
             if not title:
                 continue
@@ -252,6 +265,155 @@ class MSAlemsScraper(BaseScraper):
                 {"title": title, "summary": summary, "_html_link": self._doc_url(unid)}
             )
         return docs
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        """Insert missing space before glued `nº` / `n°` (e.g. `MSnº` -> `MS nº`)."""
+        return _GLUED_NUMERO_RE.sub(r" \1", title).strip()
+
+    @staticmethod
+    def _direct_rows(table: Tag) -> list[Tag]:
+        rows: list[Tag] = []
+        for child in table.children:
+            if not isinstance(child, Tag):
+                continue
+            if child.name == "tr":
+                rows.append(child)
+            elif child.name in ("tbody", "thead", "tfoot"):
+                rows.extend(
+                    tr
+                    for tr in child.children
+                    if isinstance(tr, Tag) and tr.name == "tr"
+                )
+        return rows
+
+    @classmethod
+    def _is_domino_toolbar(cls, table: Tag) -> bool:
+        """Identify Domino's 1-row top action toolbar (`Sair Editar Excluir Novo Anexo`)."""
+        rows = cls._direct_rows(table)
+        if len(rows) != 1:
+            return False
+        text = " ".join(table.get_text(" ", strip=True).split()).casefold()
+        if len(text) > 120:
+            return False
+        if text == "nav actions":
+            return True
+        if sum(1 for tok in _TOOLBAR_TOKENS if tok in text) >= 2:
+            return True
+        for a in table.find_all("a"):
+            href = str(a.get("href") or "")
+            onclick = str(a.get("onclick") or "")
+            if "$V5ACTIONS" in onclick or "?EditDocument" in href:
+                return True
+        return False
+
+    @classmethod
+    def _strip_domino_chrome(cls, body: Tag) -> None:
+        """Remove Domino toolbar, disclaimer banner, header chrome, UI icons, and `$FILE` icon wrappers."""
+        for table in list(body.find_all("table")):
+            if table.decomposed:
+                continue
+            if cls._is_domino_toolbar(table):
+                table.decompose()
+                continue
+            txt = " ".join(table.get_text(" ", strip=True).split())
+            if _STATE_BANNER_RE.match(txt):
+                table.decompose()
+
+        for hr in list(body.find_all("hr")):
+            if hr.decomposed:
+                continue
+            # Only remove the top Domino separator before the disclaimer/body.
+            prev_text = "".join(
+                s.strip() for s in hr.find_all_previous(string=True) if s.strip()
+            )
+            if len(prev_text) < 50:
+                hr.decompose()
+
+        for tag in list(body.find_all(["b", "i", "font", "p", "div", "span"])):
+            if tag.decomposed:
+                continue
+            txt = " ".join(tag.get_text(" ", strip=True).split())
+            if len(txt) < 300 and _DISCLAIMER_RE.search(txt):
+                # Prefer removing the outermost inline wrapper carrying only the disclaimer.
+                target = tag
+                while (
+                    isinstance(target.parent, Tag)
+                    and target.parent.name in ("b", "i", "strong", "em", "font", "span")
+                    and len(" ".join(target.parent.get_text(" ", strip=True).split()))
+                    < 300
+                ):
+                    target = target.parent
+                target.decompose()
+
+        for a in list(body.find_all("a", href=True)):
+            if a.decomposed:
+                continue
+            href = str(a.get("href") or "")
+            if "$FILE" in href:
+                for img in list(a.find_all("img")):
+                    src = str(img.get("src") or "").lower()
+                    if "/icons/" in src or _NON_IMAGE_ATTACH_RE.search(href):
+                        img.decompose()
+                for br in list(a.find_all("br")):
+                    br.decompose()
+                if a.get_text(strip=True):
+                    a.unwrap()
+                else:
+                    a.decompose()
+
+        for img in list(body.find_all("img")):
+            if img.decomposed:
+                continue
+            src = str(img.get("src") or "").lower()
+            if src.startswith("/icons/") or "/icons/" in src:
+                img.decompose()
+
+    @classmethod
+    def _unwrap_layout_tables(cls, body: Tag) -> None:
+        """Unwrap Domino's 1-row `border="0"` layout wrapper tables while preserving real data tables."""
+        for table in list(body.find_all("table")):
+            if table.decomposed:
+                continue
+            rows = cls._direct_rows(table)
+            if len(rows) != 1:
+                continue
+            border = str(table.get("border") or "").strip()
+            cells = [
+                c
+                for c in rows[0].children
+                if isinstance(c, Tag) and c.name in ("td", "th")
+            ]
+            is_layout = (
+                border == "0"
+                or len(cells) <= 1
+                or (
+                    len(cells) == 2
+                    and any(
+                        not c.get_text(strip=True) and not c.find("img") for c in cells
+                    )
+                )
+            )
+            if not is_layout:
+                continue
+            for tr in rows:
+                for cell in list(tr.children):
+                    if not isinstance(cell, Tag) or cell.name not in ("td", "th"):
+                        continue
+                    if not cell.get_text(strip=True) and not cell.find("img"):
+                        cell.decompose()
+                    else:
+                        cell.name = "div"
+                tr.unwrap()
+            for child in list(table.children):
+                if isinstance(child, Tag) and child.name in ("tbody", "thead", "tfoot"):
+                    child.unwrap()
+            table.unwrap()
+
+        # Domino uses nested `<ul>` without `<li>` solely for left indentation around headers.
+        for ul in list(body.find_all("ul")):
+            if not ul.decomposed and ul.find("li") is None:
+                ul.unwrap()
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Fetch and convert an individual Domino document page to markdown."""
@@ -269,10 +431,26 @@ class MSAlemsScraper(BaseScraper):
         self._remove_summary_element(body, doc_info.get("summary", ""))
         for tag in body.find_all(["script", "applet"]):
             tag.decompose()
-        for table in body.find_all("table", border="1"):
-            table.decompose()
+        self._strip_domino_chrome(body)
+        self._unwrap_layout_tables(body)
+        clean_norm_soup(
+            body,
+            remove_disclaimers=True,
+            unwrap_links=True,
+            remove_images=False,
+            remove_empty_tags=True,
+            unwrap_fonts=True,
+            strip_styles=True,
+            remove_style_tags=True,
+            remove_script_tags=True,
+        )
+        for s_tag in list(body.find_all("s")):
+            if not s_tag.decomposed and _ORDINAL_ONLY_RE.match(
+                s_tag.get_text(strip=True)
+            ):
+                s_tag.unwrap()
         html_string = wrap_html(body.decode_contents())
-        text_markdown = await self.markdown(html=html_string)
+        text_markdown = await self.markdown(html=html_string, base_url=url)
         return Document(
             **{
                 **doc_info,

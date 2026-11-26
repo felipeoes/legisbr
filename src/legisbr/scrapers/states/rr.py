@@ -12,6 +12,8 @@ TYPES = {
     "Lei Delegada": 7,
     "Lei Ordinária": 2,
     "Questões de Ordem": 13,
+    "Resolução": 4,
+    "Resolução Legislativa": 8,
 }
 
 
@@ -33,4 +35,10 @@ class RoraimaAlerScraper(SAPLBaseScraper):
         "ale-rr na internet",
         "praça do centro cívico",
         "praca do centro civico",
+        "centrocívico",
+        "centrocivico",
+        "palácio senador hélio campos",
+        "palacio senador helio campos",
+        "amazônia: patrimônio dos brasileiros",
+        "amazonia: patrimonio dos brasileiros",
     )

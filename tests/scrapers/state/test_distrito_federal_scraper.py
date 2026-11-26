@@ -251,6 +251,113 @@ class TestHelpers:
         soup = BeautifulSoup(_make_maintenance_body(), "lxml")
         assert scraper._is_maintenance_soup(soup) is True
 
+    def test_trim_to_title_preserves_opening_bold_markers(self):
+        scraper = _make_scraper()
+        raw = (
+            "Sistema Integrado de Normas Jurídicas do Distrito Federal – SINJ-DF\n\n"
+            "**PORTARIA Nº 207, DE 14 DE DEZEMBRO DE 2012.**\n\n"
+            "Art. 1º Conteúdo da portaria."
+        )
+        cleaned = scraper._clean_extracted_text(
+            raw, {"type": "Portaria", "number": "207"}
+        )
+        assert cleaned.startswith("**PORTARIA Nº 207, DE 14 DE DEZEMBRO DE 2012.**")
+        assert cleaned.count("**") % 2 == 0
+
+    def test_clean_extracted_text_strips_many_legislacao_correlata_before_trim(self):
+        scraper = _make_scraper()
+        correlatas = "\n\n".join(
+            f"Legislação Correlata - Lei {5200 + i} de 16/12/2013" for i in range(25)
+        )
+        raw = (
+            f"{correlatas}\n\n"
+            "LEI Nº 5.011, DE 28 DE DEZEMBRO DE 2012\n\n"
+            "Art. 1º Conteúdo verdadeiro da Lei 5.011."
+        )
+        cleaned = scraper._clean_extracted_text(raw, {"type": "Lei", "number": "5011"})
+        assert cleaned.startswith("LEI Nº 5.011, DE 28 DE DEZEMBRO DE 2012")
+        assert "Legislação Correlata" not in cleaned
+        assert "Lei 5200" not in cleaned
+
+    async def test_extract_html_markdown_passes_fetched_url_as_base_url(self):
+        from unittest.mock import AsyncMock
+
+        from bs4 import BeautifulSoup
+
+        scraper = _make_scraper()
+        scraper.markdown = AsyncMock(
+            return_value="PORTARIA Nº 191, DE 26 DE NOVEMBRO DE 2012.\n\nArt. 1º Texto suficiente para passar na validação de markdown do SINJ-DF."
+        )
+        soup = BeautifulSoup(
+            '<div id="div_texto"><p>PORTARIA Nº 191, DE 26 DE NOVEMBRO DE 2012.</p>'
+            '<p><img src="img001.gif">Art. 1º Texto suficiente.</p></div>',
+            "lxml",
+        )
+        download_url = "https://www.sinj.df.gov.br/sinj/Norma/72881/f618b106.html"
+        await scraper._extract_html_markdown(
+            soup,
+            {"type": "Portaria", "number": "191", "document_url": download_url},
+            base_url=download_url,
+        )
+        assert scraper.markdown.await_args.kwargs["base_url"] == download_url
+
+    async def test_direct_pdf_paths_clean_sinj_header_and_disclaimer(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from conftest import make_mock_response
+
+        from legisbr.scrapers.states import df as df_mod
+
+        raw_pdf_md = (
+            "Sistema Integrado de Normas Jurídicas do Distrito Federal – SINJ-DF\n\n"
+            "**PORTARIA Nº 1, DE 2 DE JANEIRO DE 2012**\n\n"
+            "Art. 1º Fixa prazos de vencimento do IPVA com texto suficiente para validação.\n\n"
+            "Este texto não substitui o publicado no DODF nº 2."
+        )
+        monkeypatch.setattr(
+            df_mod, "bytes_to_markdown", AsyncMock(return_value=raw_pdf_md)
+        )
+        scraper = _make_scraper()
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response(
+                b"%PDF-1.5 fake", content_type="application/pdf"
+            )
+        )
+        doc_info = {
+            "year": 2012,
+            "type": "Portaria",
+            "number": "1",
+            "title": "Portaria 1 de 02/01/2012",
+            "summary": "",
+            "situation": "Sem Revogação Expressa",
+            "document_url": "https://www.sinj.df.gov.br/sinj/Norma/70283/arquivo",
+        }
+        doc1 = await scraper._try_text_endpoint(
+            dict(doc_info),
+            "https://www.sinj.df.gov.br/sinj/TextoArquivoNorma.aspx?id_file=abc",
+            doc_info["document_url"],
+            True,
+            "abc",
+        )
+        assert "SINJ-DF" not in doc1.text_markdown
+        assert "não substitui" not in doc1.text_markdown
+        assert doc1.text_markdown.startswith(
+            "**PORTARIA Nº 1, DE 2 DE JANEIRO DE 2012**"
+        )
+
+        doc2 = await scraper._try_raw_pdf_path(
+            dict(doc_info),
+            b"%PDF-1.5 fake",
+            "norma.pdf",
+            "application/pdf",
+            doc_info["document_url"],
+        )
+        assert "SINJ-DF" not in doc2.text_markdown
+        assert "não substitui" not in doc2.text_markdown
+        assert doc2.text_markdown.startswith(
+            "**PORTARIA Nº 1, DE 2 DE JANEIRO DE 2012**"
+        )
+
 
 class TestGetDocsLinks:
     def test_infer_norm_type_uses_title_prefix(self):

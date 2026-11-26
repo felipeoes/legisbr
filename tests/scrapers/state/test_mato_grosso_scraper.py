@@ -336,3 +336,53 @@ class TestFetch:
         assert doc.situation == "Vigente"
         assert doc.raw == compilado and doc.raw_ext == ".html"
         assert scraper.http.request.await_count == 2
+
+    async def test_strips_misspelled_spam_rodape_duplicate_ementa_and_normalizes_extra(
+        self,
+    ):
+        scraper = _make_scraper()
+        compilado = (
+            '<html><body><turbo-frame id="norma">'
+            '<div class="back-container-dispositivo"><p>RESOLUÇÃO Nº 5.458, DE 2018.</p></div>'
+            '<div class="back-container-dispositivo"><p>Concede o Título de Cidadão Mato-grossense.</p></div>'
+            '<div class="back-container-dispositivo"><p>Art. 1º Fica concedido o Título de Cidadão Mato-grossense ao cidadão homenageado.</p></div>'
+            "<p>Este texto não substitui o publicado no Diário Oficial.</p>"
+            '<spam id="rodape-norma-juridica">Este texto não substitui o publicado no Diário Oficial.</spam>'
+            "</turbo-frame></body></html>"
+        ).encode()
+        ficha = (
+            "<html><body><ul>"
+            "<li><strong>Autor:</strong>\n    Deputado\n    Fulano  </li>"
+            "<li><strong>Publicação:</strong>\n   Promulgação de lei:\n   DOEAL/MT\n   de 04/06/2018</li>"
+            "<li><strong>Assunto:</strong>\n   Homenagem\n   Cívica</li>"
+            "<li><strong>Tags:</strong>\n   Título,\n   Cidadão</li>"
+            "<li><strong>Situação:</strong> Vigente</li>"
+            "</ul></body></html>"
+        )
+
+        async def request(url, **_):
+            body = compilado if "/compilado?" in url else ficha
+            return make_mock_response(body)
+
+        scraper.http.request = AsyncMock(side_effect=request)
+        norm = (
+            "/norma-juridica/urn:lex:br;mato.grosso:estadual:resolucao:2018-05-30;5458"
+        )
+        doc = await scraper.fetch(
+            {
+                "year": 2018,
+                "type": "Resolução",
+                "title": "Resolução - 5458/2018",
+                "summary": "Concede o Título de Cidadão Mato-grossense.",
+                "situation": "Não consta revogação expressa",
+                "norm_link": norm,
+                "document_url": f"https://www.al.mt.gov.br{norm}",
+            }
+        )
+        assert "não substitui" not in doc.text_markdown
+        assert "Concede o Título de Cidadão Mato-grossense." not in doc.text_markdown
+        assert "Art. 1º Fica concedido" in doc.text_markdown
+        assert doc.author == "Deputado Fulano"
+        assert doc.publication == "Promulgação de lei: DOEAL/MT de 04/06/2018"
+        assert doc.subject == "Homenagem Cívica"
+        assert doc.tags == "Título, Cidadão"

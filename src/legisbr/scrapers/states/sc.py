@@ -14,14 +14,23 @@ import re
 from collections.abc import AsyncIterator
 from urllib.parse import urljoin
 
+from bs4 import BeautifulSoup
+
 from legisbr.core.convert import strip_html_chrome
 from legisbr.core.document import Document
-from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
+from legisbr.core.scraper import (
+    DEFAULT_INVALID_SITUATION,
+    DEFAULT_VALID_SITUATION,
+    BaseScraper,
+)
 
 _RE_TYPE_FROM_TITLE = re.compile(
-    "^(LEI COMPLEMENTAR|LEI|DECRETO LEGISLATIVO|DECRETO-LEI|DECRETO|EMENDA CONSTITUCIONAL|RESOLUÇÃO|PORTARIA|INSTRUÇÃO NORMATIVA)",
+    "^(ATO DA MESA|LEI COMPLEMENTAR|LEI|DECRETO LEGISLATIVO|DECRETO-LEI|DECRETO|EMENDA CONSTITUCIONAL|RESOLUÇÃO|PORTARIA|INSTRUÇÃO NORMATIVA)",
     re.IGNORECASE,
 )
+_LOWERCASE_TYPE_WORDS = frozenset({"da", "de", "do", "das", "dos", "e"})
+_RE_HEADER_REVOKED = re.compile(r"\brevogad[ao]\s+pel[ao]\b", re.IGNORECASE)
+_RE_BODY_START = re.compile(r"^(?:art\.?\s*1|artigo\s+1)\b", re.IGNORECASE)
 # Executive titles are "<CODE>-<number> <date>" (INT-000001); names confirmed from the
 # pages' TipoNorma meta ("Instrução Normativa - INT"). Never store the code as the type.
 _RE_CODE_TITLE = re.compile("^([A-Z]{2,4})-\\d+")
@@ -54,28 +63,82 @@ class SantaCatarinaScraper(BaseScraper):
         return f"{self.base_url}/{norm_type_id}?ano={year}"
 
     @staticmethod
-    def _infer_type(title: str) -> str:
+    def _title_case_type(raw: str) -> str:
+        words = raw.split()
+        return " ".join(
+            word.lower()
+            if idx > 0 and word.lower() in _LOWERCASE_TYPE_WORDS
+            else word.title()
+            for idx, word in enumerate(words)
+        )
+
+    @classmethod
+    def _infer_type(cls, title: str) -> str:
         if code := _RE_CODE_TITLE.match(title):
             if code[1] not in _EXEC_CODES:
                 raise ValueError(f"Unknown SC act code {code[1]!r} in {title!r}")
             return _EXEC_CODES[code[1]]
         m = _RE_TYPE_FROM_TITLE.match(title)
         if m:
-            return m.group(1).title()
+            return cls._title_case_type(m.group(1))
         prefix_match = re.match(
             "(.+?)(?:\\s+(?:n[º°o]|n\\.|número)\\s*\\d|\\s+\\d)", title, re.IGNORECASE
         )
-        return prefix_match.group(1).strip() if prefix_match else title
+        raw_type = prefix_match.group(1).strip() if prefix_match else title
+        return cls._title_case_type(raw_type) if raw_type.isupper() else raw_type
+
+    @staticmethod
+    def _find_meta_content(soup: BeautifulSoup, name: str) -> str:
+        target = name.casefold()
+        for meta in soup.find_all("meta"):
+            meta_name = str(meta.get("name") or "").strip().casefold()
+            if meta_name == target:
+                return " ".join(str(meta.get("content") or "").split())
+        return ""
+
+    @classmethod
+    def _extract_summary(cls, soup: BeautifulSoup) -> str:
+        meta_ementa = cls._find_meta_content(soup, "Ementa")
+        if meta_ementa:
+            return meta_ementa
+        ementa_p = soup.find("p", class_=re.compile(r"\bementa\b", re.IGNORECASE))
+        if ementa_p:
+            return " ".join(ementa_p.get_text(" ", strip=True).split())
+        return ""
+
+    @classmethod
+    def _extract_situation(cls, soup: BeautifulSoup) -> str:
+        vigente = cls._find_meta_content(soup, "Vigente").casefold()
+        if vigente == "sim":
+            return "Vigente"
+        if vigente in {"nao", "não"}:
+            return "Não vigente"
+        for el in soup.find_all(["p", "div", "span", "td"], limit=40):
+            if el.find(["p", "div"]):
+                continue
+            text = " ".join(el.get_text(" ", strip=True).split())
+            if not text:
+                continue
+            if _RE_BODY_START.match(text):
+                break
+            if len(text) < 250 and _RE_HEADER_REVOKED.search(text):
+                if not re.search(r"\bfica(?:m)?\s+revogad", text, re.IGNORECASE):
+                    return DEFAULT_INVALID_SITUATION
+        return "Não consta"
 
     async def fetch(self, doc_info: dict) -> Document:
         """Fetch the server-rendered document HTML and convert to markdown."""
+        doc_info = dict(doc_info)
         if not doc_info.get("constitution"):
             doc_info["type"] = self._infer_type(" ".join(doc_info["title"].split()))
         document_url = doc_info["document_url"]
         response = await self.http.request(document_url)
         soup = response.soup()
+        summary = self._extract_summary(soup)
+        if summary and not doc_info.get("summary"):
+            doc_info["summary"] = summary
+        doc_info["situation"] = self._extract_situation(soup)
         strip_html_chrome(soup)
-        doc_info["situation"] = "Não consta"
         return await self.fetch_html(
             doc_info, str(soup), document_url, response.content, ".html"
         )

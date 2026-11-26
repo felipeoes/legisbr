@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
+import pytest
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -216,3 +219,101 @@ class TestNormalizeTableMarkdown:
         assert "Beta" in result
         assert "Gamma" in result
         assert "|" not in result
+
+
+def _make_redesigned_listing_html(
+    *,
+    count_banner: str = "138 resultados Mostrando 1–20",
+    articles_html: str | None = None,
+    nav_html: str = (
+        '<nav aria-label="Paginação" class="paginacao">'
+        '<p class="paginacao-info">Mostrando 1–20 de 138 · página 1 de 7</p>'
+        '<ul class="pagination">'
+        '<li class="page-item"><a class="page-link" href="?pagPaginaAtual=2#dados">2</a></li>'
+        '<li class="page-item"><a class="page-link" href="?pagPaginaAtual=7#dados">7</a></li>'
+        "</ul></nav>"
+    ),
+) -> bytes:
+    if articles_html is None:
+        articles_html = (
+            '<article class="resultado">'
+            '<p class="resultado-meta"><span class="resultado-categoria">Legislação Estadual</span>'
+            '<time datetime="2012-12-21">21 dez 2012</time></p>'
+            '<h2 class="h5 resultado-titulo"><a class="stretched-link" href="/arquivo/31849">'
+            "Lei nº 2699 de 2012 (ordinária)</a></h2>"
+            '<p class="resultado-ementa">Altera a Lei 2.538/2011.</p>'
+            '<p class="resultado-acoes"><a href="/arquivo/31849">Abrir PDF</a></p>'
+            "</article>"
+        )
+    banner = f'<p class="busca-contagem">{count_banner}</p>' if count_banner else ""
+    return f"<html><body>{banner}{articles_html}{nav_html}</body></html>".encode()
+
+
+class TestRedesignedPortalParsing:
+    def test_extracts_article_resultado_cards(self):
+        scraper = _make_scraper()
+        docs = scraper._extract_docs_from_soup(_make_redesigned_listing_html())
+        assert len(docs) == 1
+        assert docs[0] == {
+            "title": "Lei nº 2699 de 2012 (ordinária)",
+            "summary": "Altera a Lei 2.538/2011.",
+            "date": "2012-12-21",
+            "situation": "Não consta",
+            "_pdf_link": "https://www.al.to.leg.br/arquivo/31849",
+        }
+
+    def test_extracts_total_count_from_busca_contagem(self):
+        soup = BeautifulSoup(_make_redesigned_listing_html(), "lxml")
+        assert TocantinsScraper._extract_total_count(soup) == 138
+
+    def test_parse_total_pages_from_redesigned_nav_without_contagem(self):
+        scraper = _make_scraper()
+        html = _make_redesigned_listing_html(count_banner="")
+        soup = BeautifulSoup(html, "lxml")
+        assert scraper._parse_total_pages(soup, first_page_size=20) == 7
+
+    def test_explicit_empty_results_returns_zero_pages(self):
+        scraper = _make_scraper()
+        html = b'<html><body><div class="busca-vazio">Nenhum resultado encontrado</div></body></html>'
+        soup = BeautifulSoup(html, "lxml")
+        assert scraper._parse_total_pages(soup, first_page_size=0) == 0
+
+    def test_raises_when_count_positive_but_zero_items_parsed(self):
+        scraper = _make_scraper()
+        html = _make_redesigned_listing_html(articles_html="")
+        soup = BeautifulSoup(html, "lxml")
+        with pytest.raises(ValueError, match="reported 138 results but parsed 0 items"):
+            scraper._parse_total_pages(soup, first_page_size=0)
+
+    def test_raises_on_unrecognized_nonempty_html_without_empty_marker(self):
+        scraper = _make_scraper()
+        html = b"<html><body><main><div class='new-redesign'>Unexpected markup</div></main></body></html>"
+        soup = BeautifulSoup(html, "lxml")
+        with pytest.raises(ValueError, match="0 parsed items"):
+            scraper._parse_total_pages(soup, first_page_size=0)
+
+    @pytest.mark.asyncio
+    async def test_fetch_forwards_pdf_executor_and_workers(self):
+        scraper = _make_scraper(pdf_executor="thread", pdf_workers=3)
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response(b"%PDF-1.5 fake")
+        )
+        valid_text = "LEI Nº 2.699, DE 21 DE DEZEMBRO DE 2012.\n\n" + (
+            "Art. 1º Fica alterada a norma estadual. " * 5
+        )
+        with patch(
+            "legisbr.scrapers.states.to.bytes_to_markdown",
+            new=AsyncMock(return_value=valid_text),
+        ) as mock_b2m:
+            doc = await scraper.fetch(
+                {
+                    "year": 2012,
+                    "type": "Lei Ordinária",
+                    "title": "Lei nº 2699 de 2012",
+                    "situation": "Não consta",
+                    "_pdf_link": "https://www.al.to.leg.br/arquivo/31849",
+                }
+            )
+        assert doc is not None
+        assert mock_b2m.await_args.kwargs["pdf_executor"] == "thread"
+        assert mock_b2m.await_args.kwargs["pdf_workers"] == 3

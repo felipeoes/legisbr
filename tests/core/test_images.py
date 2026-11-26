@@ -143,3 +143,50 @@ def test_image_cache_validates_positive_limits():
         ImageCache(max_entries=0)
     with pytest.raises(ValueError):
         ImageCache(max_bytes=0)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"<!DOCTYPE html><html><body>404 Not Found</body></html>" + b"x" * 200,
+        b"  \n<html><head><title>Login</title></head></html>" + b"x" * 200,
+        b'{"error": "not found"}' + b" " * 200,
+    ],
+    ids=["doctype-html", "html-tag", "json-error"],
+)
+async def test_non_image_payload_is_never_encoded_as_data_uri(payload):
+    cache = ImageCache()
+    fetch = AsyncMock(return_value=payload)
+    html = '<p><img src="/fake.gif">Art. 1º Texto.</p>'
+
+    result = await inline_images_in_html(
+        html, "https://example.org", fetch, cache=cache
+    )
+
+    assert "data:image/" not in result
+    assert len(cache) == 0
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_mime"),
+    [
+        (_PNG_HEADER + b"A" * 200, "image/png"),
+        (b"\xff\xd8\xff\xe0" + b"J" * 200, "image/jpeg"),
+        (b"GIF89a" + b"G" * 200, "image/gif"),
+        (b"RIFF\x00\x00\x00\x00WEBP" + b"W" * 200, "image/webp"),
+        (b"BM" + b"B" * 200, "image/bmp"),
+        (b"II*\x00" + b"T" * 200, "image/tiff"),
+        (b"MM\x00*" + b"T" * 200, "image/tiff"),
+        (
+            b'<svg xmlns="http://www.w3.org/2000/svg">' + b" " * 150 + b"</svg>",
+            "image/svg+xml",
+        ),
+    ],
+)
+async def test_magic_bytes_override_misleading_url_extension(payload, expected_mime):
+    fetch = AsyncMock(return_value=payload)
+    html = '<p><img src="/asset.gif"></p>'
+
+    result = await inline_images_in_html(html, "https://example.org", fetch)
+
+    assert f"data:{expected_mime};base64," in result

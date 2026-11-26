@@ -100,6 +100,17 @@ class SaoPauloAlespScraper(BaseScraper):
         return data
 
     @staticmethod
+    def _clean_summary(raw: object) -> str:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        if "<" in text and ">" in text:
+            from bs4 import BeautifulSoup
+
+            text = BeautifulSoup(text, "lxml").get_text()
+        return " ".join(text.split())
+
+    @staticmethod
     def _row_to_ref(
         row: dict[str, Any], *, year: int | None, situation: str
     ) -> dict[str, Any]:
@@ -117,7 +128,7 @@ class SaoPauloAlespScraper(BaseScraper):
             "year": resolved_year,
             "type": row["tipo"],
             "title": row["nomeNorma"],
-            "summary": (row.get("dsEmenta") or "").strip(),
+            "summary": SaoPauloAlespScraper._clean_summary(row.get("dsEmenta")),
             "situation": situation,
             "number": row.get("nuNorma"),
             "date": row.get("data"),
@@ -230,10 +241,11 @@ class SaoPauloAlespScraper(BaseScraper):
             soup = response.soup()
             for link in soup.find_all("a"):
                 href = link.get("href", "").rstrip("/")
-                if (
-                    href in _HOME_LINKS
-                    or link.get_text(strip=True) == "Ficha informativa"
-                ):
+                link_text = link.get_text(strip=True).casefold()
+                if href in _HOME_LINKS or link_text in {
+                    "ficha informativa",
+                    "texto compilado",
+                }:
                     link.decompose()
             markdown = await self.markdown(html=str(soup), base_url=url)
             raw, ext = response.content, ".html"

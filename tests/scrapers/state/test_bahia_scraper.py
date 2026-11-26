@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
@@ -250,3 +251,128 @@ class TestFetch:
         assert doc.summary not in doc.text_markdown
         assert doc.raw_ext == ".html"
         assert "_html_link" not in doc.model_dump()
+
+    @pytest.mark.asyncio
+    async def test_preserves_data_tables_and_unwraps_emptycellstyle_layout_table(self):
+        scraper = _make_scraper()
+        body_html = """
+        <p>Art. 1º Ficam estabelecidas as alíquotas conforme tabela abaixo:</p>
+        <table>
+          <tr><th>Código</th><th>Descrição</th><th>Alíquota</th></tr>
+          <tr><td>01</td><td>Produto A</td><td>12%</td></tr>
+          <tr><td>02</td><td>Produto B</td><td>18%</td></tr>
+        </table>
+        <table>
+          <tr><td><p class="EMPTYCELLSTYLE">&nbsp;</p><p>Art. 2º Texto em tabela de layout antiga.</p></td></tr>
+        </table>
+        """
+        raw = _make_doc_soup(body_html=body_html)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(raw))
+        doc = await scraper.fetch(
+            {
+                "title": "LEI Nº 12.609 DE 2012",
+                "type": "Lei Ordinária",
+                "year": 2012,
+                "situation": "Não consta revogação expressa",
+                "_html_link": "/documentos/lei-12609",
+            }
+        )
+        assert doc is not None
+        assert re.search(r"\|\s*01\s*\|\s*Produto A\s*\|\s*12%\s*\|", doc.text_markdown)
+        assert re.search(r"\|\s*02\s*\|\s*Produto B\s*\|\s*18%\s*\|", doc.text_markdown)
+        assert "Art. 2º Texto em tabela de layout antiga." in doc.text_markdown
+
+    @pytest.mark.asyncio
+    async def test_strip_revogado_preserves_article_numbers_and_avoids_partial_false_positives(
+        self,
+    ):
+        scraper = _make_scraper()
+        body_html = """
+        <div class="epigrafe">DECRETO Nº 14.024 DE 06 DE JUNHO DE 2012</div>
+        <div class="artpar">Art. 1º - Regulamenta a política estadual de meio ambiente.</div>
+        <p><b>&lt;Revogado&gt; Art. 179</b> - A Câmara de Compensação Ambiental...</p>
+        <p><span class="REVOGADO"><b><span>&lt;REVOGADO&gt;</span></b></span> § 3º - O deferimento do pedido...</p>
+        <p><span>&lt;Revogado&gt; § 2º</span> - A multa será aplicada em dobro.</p>
+        <p class="Alteracao">Art. 179 revogado pelo art. 8º do Decreto nº 15.682/2014.</p>
+        """
+        raw = _make_doc_soup(body_html=body_html)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(raw))
+        doc = await scraper.fetch(
+            {
+                "title": "DECRETO Nº 14.024 DE 06 DE JUNHO DE 2012",
+                "type": "Decreto",
+                "year": 2012,
+                "situation": "Não consta revogação expressa",
+                "_html_link": "/documentos/decreto-14024",
+            }
+        )
+        assert doc is not None
+        # Partial revocation must NOT flag the whole norm as Revogado.
+        assert doc.situation == "Não consta revogação expressa"
+        # Article and paragraph numbers adjacent to <Revogado> must survive intact!
+        assert "Art. 179" in doc.text_markdown
+        assert "§ 3º" in doc.text_markdown
+        assert "§ 2º" in doc.text_markdown
+        assert "<Revogado>" not in doc.text_markdown
+        assert "<REVOGADO>" not in doc.text_markdown
+
+    @pytest.mark.asyncio
+    async def test_detects_title_revogado_gif_strips_rule_gifs_and_replaces_badges(
+        self,
+    ):
+        scraper = _make_scraper()
+        body_html = """
+        <div class="epigrafe"><img src="/sites/default/files/images/Revogado.gif" alt=""/>DECRETO Nº 13.992 DE 17 DE MAIO DE 2012</div>
+        <p><img src="/sites/default/files/arquivo_documentos/DECS2009_ABRILimage0019.gif" alt=""/></p>
+        <p><img src="/sites/default/files/images/Republica%C3%A7%C3%A3o.gif" alt=""/>Republicação no DOE.</p>
+        <p>&amp;nbs</p>
+        <div class="artpar">Art. 1º - Fica aprovado o regulamento estadual de compras.</div>
+        """
+        raw = _make_doc_soup(body_html=body_html)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(raw))
+        doc = await scraper.fetch(
+            {
+                "title": "DECRETO Nº 13.992 DE 17 DE MAIO DE 2012",
+                "type": "Decreto",
+                "year": 2012,
+                "situation": "Não consta revogação expressa",
+                "_html_link": "/documentos/decreto-13992",
+            }
+        )
+        assert doc is not None
+        assert doc.situation == "Revogado"
+        assert "[Revogado]" in doc.text_markdown
+        assert "[Republicação]" in doc.text_markdown
+        assert "DECS2009_ABRILimage0019.gif" not in doc.text_markdown
+        assert "Revogado.gif" not in doc.text_markdown
+        assert "&nbs" not in doc.text_markdown
+
+    @pytest.mark.asyncio
+    async def test_unwraps_broken_unclosed_anchor_and_nested_edn_link(self):
+        scraper = _make_scraper()
+        body_html = """
+        <div class="artpar">Art. 5º - Regra anterior <a href="#_edn1">[i]</a>.</div>
+        <a href="broken">
+          <div class="capitulo">CAPÍTULO III</div>
+          <div class="artpar">Art. 6º - Compete ao titular do órgão.</div>
+          <div class="artpar">Art. 7º - Fica instituído o comitê gestor.</div>
+        </a>
+        """
+        raw = _make_doc_soup(body_html=body_html)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(raw))
+        doc = await scraper.fetch(
+            {
+                "title": "DECRETO Nº 13.869 DE 02 DE ABRIL DE 2012",
+                "type": "Decreto",
+                "year": 2012,
+                "situation": "Não consta revogação expressa",
+                "_html_link": "/documentos/decreto-13869",
+            }
+        )
+        assert doc is not None
+        assert "[[i]](#_edn1)" not in doc.text_markdown
+        assert any(
+            "Art. 6º" in ln and "Art. 7º" not in ln
+            for ln in doc.text_markdown.splitlines()
+        )
+        assert "Art. 7º" in doc.text_markdown

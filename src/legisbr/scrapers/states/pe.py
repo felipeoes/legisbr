@@ -38,6 +38,7 @@ TYPES = {
 SITUATIONS: dict[str, str] = {}
 _SEARCH_PATH = "/Paginas/pesquisaAvancada.aspx"
 _TEXT_VERSION_PRIORITY = ("TEXTOATUALIZADO", "TEXTOORIGINAL", "TEXTOANOTADO", "")
+_WORD_SECTION_CLASS_RE = re.compile(r"^WordSection\d*$")
 _TYPE_ALIASES = {
     "ato administrativo normativo": "Ato Administrativo Normativo",
     "ato administrativo parlamentar": "Ato Administrativo Parlamentar",
@@ -353,6 +354,32 @@ class PernambucoAlepeScraper(BaseScraper):
             data["summary"] = summary
         return data
 
+    @staticmethod
+    def _extract_content_container(soup: BeautifulSoup) -> Tag | None:
+        """Extract all WordSection divs (preferring ``#divTexto``) to avoid annex truncation."""
+        div_texto = soup.find("div", id="divTexto")
+        search_root: BeautifulSoup | Tag = (
+            div_texto if isinstance(div_texto, Tag) else soup
+        )
+        sections = [
+            tag
+            for tag in search_root.find_all("div", class_=_WORD_SECTION_CLASS_RE)
+            if isinstance(tag, Tag)
+        ]
+        if len(sections) == 1:
+            return sections[0]
+        if len(sections) > 1:
+            wrapper = BeautifulSoup("<div></div>", "lxml").div
+            assert wrapper is not None
+            for section in sections:
+                wrapper.append(section.extract())
+            return wrapper
+        if isinstance(div_texto, Tag):
+            for tag in div_texto.find_all(["style", "title", "meta"]):
+                tag.decompose()
+            return div_texto
+        return None
+
     async def fetch(self, doc_info: dict) -> Document | None:
         year = doc_info["year"]
         title = doc_info.get("title", "")
@@ -378,9 +405,11 @@ class PernambucoAlepeScraper(BaseScraper):
                 last_failure_reason = f"No document at {candidate_url}"
                 continue
             soup = fetch_result.soup()
-            content_div = soup.find("div", class_="WordSection1")
+            content_div = self._extract_content_container(soup)
             if not isinstance(content_div, Tag):
-                last_failure_reason = "Could not find WordSection1 in document page"
+                last_failure_reason = (
+                    "Could not find WordSection or divTexto in document page"
+                )
                 continue
             clean_norm_soup(
                 content_div,
@@ -388,6 +417,8 @@ class PernambucoAlepeScraper(BaseScraper):
                 unwrap_links=True,
                 remove_empty_tags=True,
                 strip_styles=True,
+                remove_style_tags=True,
+                remove_script_tags=True,
             )
             full_html = wrap_html(str(content_div))
             candidate_markdown = await self.markdown(html=full_html)

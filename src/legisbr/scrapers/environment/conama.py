@@ -68,7 +68,7 @@ class ConamaScraper(BaseScraper):
         "Imprensa Nacional",
     ]
     _PUBLICATION_DOU_RE = re.compile(
-        "^(?:(?:o\\s+)?publicad[oa]\\s+n[oa]\\s+)?(?:(?:publica[cç][aã]o\\s+)?d\\s*\\.?\\s*o\\s*\\.?\\s*u\\s*\\.?(?:\\s+n[ºo°]\\s*\\d+)?),?\\s*de\\s*(?:\\d{1,2}/\\d{1,2}/\\d{2,4}|\\d{1,2}\\s+de\\s+[\\wçãéêíóôõú]+\\s+de\\s+\\d{4})(?:,\\s*se[cç][aã]o\\s*\\d+)?(?:,\\s*p[áa]g(?:s|inas)?\\.?\\s*[0-9-]+)?$",
+        r"^(?:(?:o\s+)?publicad[oa]\s+n[oa]\s+)?(?:(?:publica[cç][aã]o\s+)?d\s*\.?\s*o\s*\.?\s*u\s*\.?(?:\s+n[ºo°]\s*\d+)?),?\s*de\s*(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}/\d{4}|\d{1,2}\s+de\s+[\wçãéêíóôõú]+(?:\s+de)?\s+\d{4})(?:,\s*se[cç][aã]o\s*\d+)?(?:,\s*p[áa]g(?:s|inas)?\.?\s*[0-9-]+)?$",
         re.IGNORECASE,
     )
     _IMPRENSA_NACIONAL_NOTICE_RE = re.compile(
@@ -76,7 +76,7 @@ class ConamaScraper(BaseScraper):
         re.IGNORECASE,
     )
     _BOLETIM_SERVICO_RE = re.compile(
-        "^(?:(?:o\\s+)?publicad[oa]\\s+n[oa]\\s+)?boletim\\s+de\\s+servi[cç]o(?:\\s*/\\s*mi|/mi)?(?:\\s+n[ºo°]\\s*\\d+)?,?\\s*de\\s*(?:\\d{1,2}/\\d{1,2}/\\d{2,4}|\\d{1,2}º?\\s+de\\s+[\\wçãéêíóôõú]+\\s+de\\s+\\d{4})(?:,\\s*do\\s+minist[ée]rio\\s+do\\s+interior)?$",
+        r"^(?:(?:o\s+)?publicad[oa]\s+n[oa]\s+)?boletim\s+de\s+servi[cç]o(?:\s*/\s*mi|/mi)?(?:\s+n[ºo°]\s*\d+)?,?\s*de\s*(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}º?\s+de\s+[\wçãéêíóôõú]+(?:\s+de)?\s+\d{4})(?:,\s*do\s+minist[ée]rio\s+do\s+interior)?(?:,\s*p[áa]g(?:s|inas)?\.?\s*[0-9-]+)?$",
         re.IGNORECASE,
     )
     _LOCAL_FILE_FOOTER_RE = re.compile(
@@ -84,11 +84,22 @@ class ConamaScraper(BaseScraper):
     )
     _PAGE_NUMBER_BLOCK_RE = re.compile("^\\d{1,6}$")
     _DISCLAIMER_PATTERNS = [
-        re.compile("Est[ea] conte.do não substitui", re.IGNORECASE),
-        re.compile("Est[ea] texto não substitui", re.IGNORECASE),
-        re.compile("Ess[ea] texto não substitui", re.IGNORECASE),
-        re.compile("\\*?Obs:?\\*?\\*?\\s*não há registro no sítio", re.IGNORECASE),
+        re.compile(
+            r"(?:Est[ea]\s+(?:conte[uú]do|texto)|Ess[ea]\s+texto)\s+n[aã]o\s+substitu(?:i|to)\s+"
+            r"(?:o\s+(?:(?:texto|original)\s+)?publicad[oa]|a\s+publica[cç][aã]o)",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\*?Obs:?\*?\*?\s*não há registro no sítio", re.IGNORECASE),
     ]
+    _PDF_DISCLAIMER_BLOCK_RE = re.compile(
+        r"(?:^|\n)[ \t]*(?:#{1,6}[ \t]*)?(?:[*_]{1,3}[ \t]*)?"
+        r"(?:(?:Est[ea]\s+(?:conte[uú]do|texto)|Ess[ea]\s+texto)\s+n[aã]o\s+substitu(?:i|to)"
+        r"[\s*_]*(?:o[\s*_]+(?:(?:texto|original)\s+)?publicad[oa]|a\s+publica[çc][aã]o)"
+        r"(?:[ \t*_]*(?:\n[ \t]*)*[ \t*_]*(?:n[oa]\s+(?:publica[çc][aã]o\s+)?(?:d\s*\.?\s*o\s*\.?\s*u\.?|di[áa]rio\s+oficial|boletim\s+de\s+servi[çc]o)[^\n]*))?"
+        r"|\*?Obs:?\*?\*?\s*n[aã]o\s+h[aá]\s+registro\s+no\s+s[ií]tio)"
+        r"[^\n]*",
+        re.IGNORECASE,
+    )
     _PDF_CLEANUP_PATTERNS: list[tuple[str, str, int]] = [
         ("\\x0c", "", 0),
         ("Ato \\d+ \\(\\d+\\)\\s+SEI \\S+ / pg\\. \\d+", "", 0),
@@ -238,8 +249,7 @@ class ConamaScraper(BaseScraper):
         "Clean SEI/PDF-specific artefacts from extracted text."
         for pattern, replacement, flags in self._PDF_CLEANUP_PATTERNS:
             text = re.sub(pattern, replacement, text, flags=flags)
-        for pat in self._DISCLAIMER_PATTERNS:
-            text = pat.sub("", text)
+        text = self._PDF_DISCLAIMER_BLOCK_RE.sub("", text)
         text = self._strip_publication_metadata_blocks(text)
         return text.strip()
 

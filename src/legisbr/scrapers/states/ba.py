@@ -1,7 +1,8 @@
 from __future__ import annotations
+
 import re
 from collections.abc import AsyncIterator
-from urllib.parse import urlencode, urljoin
+from urllib.parse import unquote, urlencode, urljoin
 
 from bs4 import BeautifulSoup, Tag
 
@@ -78,49 +79,190 @@ class BahiaLegislaScraper(BaseScraper):
     base_url = "https://www.legislabahia.ba.gov.br"
     _REVOGADO_RE = re.compile("\\brevogad[ao]\\b", re.IGNORECASE)
     _REVOGADO_MARKER_RE = re.compile("<REVOGAD[AO]>", re.IGNORECASE)
+    _DECORATIVE_RULE_IMG_RE = re.compile(r"DECS\d+.*image\d+\.gif$", re.IGNORECASE)
+    _REVOGADO_IMG_RE = re.compile(r"/revogad[ao]\.gif$", re.IGNORECASE)
+    _REPUBLICACAO_IMG_RE = re.compile(r"/republica[çc][ãa]o\.gif$", re.IGNORECASE)
+    _PROVISION_PREFIX_RE = re.compile(
+        r"^(?:Art\.?|§|Par[aá]grafo|Inciso|Al[ií]nea|Item|Anexo|Caput|Tabela|[IVXLCDM]+\s*[-–.]|[a-z]\))\b",
+        re.IGNORECASE,
+    )
+    _NORM_TITLE_RE = re.compile(
+        r"\b(?:LEI|DECRETO|PORTARIA|RESOLU[ÇC][ÃA]O|EMENDA|INSTRU[ÇC][ÃA]O|CONSTITUI[ÇC][ÃA]O)\b",
+        re.IGNORECASE,
+    )
+    _DOC_REVOKED_ALT_RE = re.compile(
+        r"^\s*Revogad[ao]\s+pel[ao]\b|\b(?:esta\s+lei|este\s+decreto|esta\s+norma|esta\s+portaria)\b.*\brevogad[ao]\b",
+        re.IGNORECASE,
+    )
+    _TRUNCATED_NBSP_RE = re.compile(r"&nbs(?![a-zA-Z0-9;])")
 
     def _normalize_type(self, raw_type: str) -> str:
         return normalize_type(raw_type, aliases=_TYPE_LABELS, known_types=self.types)
 
-    def _clean_layout_tables(self, soup: Tag) -> None:
-        """Unwrap tables used for page layout to avoid broken markdown generation.
+    @staticmethod
+    def _direct_rows(table: Tag) -> list[Tag]:
+        rows: list[Tag] = []
+        for child in table.children:
+            if not isinstance(child, Tag):
+                continue
+            if child.name == "tr":
+                rows.append(child)
+            elif child.name in ("tbody", "thead", "tfoot"):
+                rows.extend(
+                    tr
+                    for tr in child.children
+                    if isinstance(tr, Tag) and tr.name == "tr"
+                )
+        return rows
 
-        Many Bahia documents are MS Word exports where the entire text is wrapped
-        in a giant table for page layout. MarkItDown converts this to a markdown
-        table with dozens of empty columns. This method destroys the table structure
-        by turning all table tags into divs, which serializes the text into blocks.
-        """
-        for p in soup.find_all("p", class_="EMPTYCELLSTYLE"):
-            p.decompose()
-        for tag_name in ["table", "tbody", "thead", "tfoot", "tr", "th", "td"]:
-            for el in soup.find_all(tag_name):
-                el.name = "div"
+    def _clean_layout_tables(self, soup: Tag) -> None:
+        """Unwrap MS Word layout tables while preserving genuine multi-column data tables."""
+        for table in list(soup.find_all("table")):
+            if table.decomposed:
+                continue
+            has_empty_cell_style = table.find("p", class_="EMPTYCELLSTYLE") is not None
+            rows = self._direct_rows(table)
+            max_cols = max(
+                (
+                    len(
+                        [
+                            c
+                            for c in tr.children
+                            if isinstance(c, Tag) and c.name in ("td", "th")
+                        ]
+                    )
+                    for tr in rows
+                ),
+                default=0,
+            )
+            is_single_cell_wrapper = len(rows) == 1 and max_cols <= 1
+            if not has_empty_cell_style and not is_single_cell_wrapper:
+                continue
+            for p in list(table.find_all("p", class_="EMPTYCELLSTYLE")):
+                if not p.decomposed:
+                    p.decompose()
+            for tr in rows:
+                for cell in list(tr.children):
+                    if isinstance(cell, Tag) and cell.name in ("td", "th"):
+                        cell.name = "div"
+                tr.name = "div"
+            for child in list(table.children):
+                if isinstance(child, Tag) and child.name in ("tbody", "thead", "tfoot"):
+                    child.name = "div"
+            table.name = "div"
+
+    @classmethod
+    def _is_before_first_article(cls, node: Tag, root: Tag) -> bool:
+        """Return True if *node* precedes the first operative article in *root*."""
+        for prev in node.find_all_previous(["div", "p"]):
+            if prev is root or root not in prev.parents:
+                continue
+            if "artpar" in (prev.get("class") or []):
+                return False
+            txt = " ".join(prev.get_text(" ", strip=True).split())
+            if re.match(r"^(?:<REVOGAD[AO]>\s*)?Art\.?\s*\d+", txt, re.IGNORECASE):
+                return False
+        return True
+
+    @classmethod
+    def _is_doc_level_revocation_node(cls, node: Tag, root: Tag) -> bool:
+        """Return True when a revocation badge/span marks the entire norm (not a single article)."""
+        parent = node.parent if isinstance(node.parent, Tag) else None
+        if parent is not None and parent is not root:
+            # Remove the node's own text to inspect the surrounding line/container.
+            parent_text = " ".join(parent.get_text(" ", strip=True).split())
+            own_text = " ".join(node.get_text(" ", strip=True).split())
+            rest = parent_text
+            if own_text and rest.lower().startswith(own_text.lower()):
+                rest = rest[len(own_text) :].strip()
+            rest = cls._REVOGADO_MARKER_RE.sub("", rest).strip()
+            if rest and cls._PROVISION_PREFIX_RE.match(rest):
+                return False
+            if rest and cls._NORM_TITLE_RE.search(rest[:80]):
+                return cls._is_before_first_article(node, root)
+        return cls._is_before_first_article(node, root)
+
+    @classmethod
+    def _is_decorative_divider_img(cls, img: Tag) -> bool:
+        """Identify MS Word horizontal-rule divider GIFs (e.g. 498x6 DECS*image*.gif)."""
+        src = unquote(str(img.get("src") or "")).strip()
+        if cls._DECORATIVE_RULE_IMG_RE.search(src):
+            return True
+        height = img.get("height")
+        if isinstance(height, str):
+            m = re.match(r"^\s*(\d+)(?:px)?\s*$", height, re.IGNORECASE)
+            if m and int(m.group(1)) <= 10:
+                return True
+        style = str(img.get("style") or "")
+        m_style = re.search(r"height\s*:\s*(\d+)\s*px", style, re.IGNORECASE)
+        if m_style and int(m_style.group(1)) <= 10:
+            return True
+        return False
 
     def _strip_revogado(self, soup: Tag) -> bool:
-        """Remove the REVOGADO / REVOGADA marker from the document body.
+        """Clean decorative/status GIFs and `<REVOGADO>` markers and detect whole-norm revocation.
 
-        The site injects a ``<span class='REVOGADA'>`` (or ``<span class='REVOGADO'>``)
-        element containing the literal text ``<REVOGADA>`` / ``<REVOGADO>`` at the top
-        of some documents. For others, the marker appears inside a ``<p class='LEI'>``
-        without its own span wrapper.
-
-        This method also detects revogado status even when the ``<p class='Alteracao'>``
-        pattern is used (capital A) rather than ``<div class='alteracao'>``.
-
-        Returns True if the document is revogado/revogada, False otherwise.
+        Only marks the document-level situation as revoked when the revocation badge,
+        `span.revogado`, or top-level `alteracao` notice applies to the whole norm
+        (ignoring partial single-article revocations).
         """
         is_revogado = False
-        for span in soup.find_all("span", class_=self._REVOGADO_RE):
-            is_revogado = True
-            span.decompose()
+
+        # 1. Handle decorative horizontal-rule GIFs and status badge GIFs.
+        for img in list(soup.find_all("img")):
+            if img.decomposed:
+                continue
+            src = unquote(str(img.get("src") or "")).strip()
+            if self._is_decorative_divider_img(img):
+                img.decompose()
+            elif self._REVOGADO_IMG_RE.search(src):
+                if self._is_doc_level_revocation_node(img, soup):
+                    is_revogado = True
+                img.replace_with("[Revogado] ")
+            elif self._REPUBLICACAO_IMG_RE.search(src):
+                img.replace_with("[Republicação] ")
+
+        # 2. Handle `span.revogado` / `span.revogada` elements.
+        for span in list(soup.find_all("span", class_=self._REVOGADO_RE)):
+            if span.decomposed:
+                continue
+            if self._is_doc_level_revocation_node(span, soup):
+                is_revogado = True
+                span.decompose()
+            else:
+                # Partial provision revocation badge (e.g., Art. 3º): keep readable text
+                # if it wasn't just an inline `<REVOGADO>` wrapper.
+                span_txt = span.get_text(" ", strip=True)
+                if self._REVOGADO_MARKER_RE.fullmatch(span_txt):
+                    span.decompose()
+                else:
+                    span.replace_with("[Revogado] ")
+
+        # 3. Check top-level `alteracao` notices for whole-norm revocation.
         for el in soup.find_all(["p", "div"]):
             cls = " ".join(el.get("class", []))
-            if re.search("\\balteracao\\b", cls, re.IGNORECASE):
-                if self._REVOGADO_RE.search(el.get_text(strip=True)):
-                    is_revogado = True
-                    break
-        for el in soup.find_all(string=self._REVOGADO_MARKER_RE):
-            el.replace_with("")
+            if not re.search("\\balteracao\\b", cls, re.IGNORECASE):
+                continue
+            text = " ".join(el.get_text(" ", strip=True).split())
+            if not self._REVOGADO_RE.search(text):
+                continue
+            if self._PROVISION_PREFIX_RE.match(text):
+                continue
+            if self._is_before_first_article(el, soup) and (
+                self._DOC_REVOKED_ALT_RE.search(text) or len(text) < 200
+            ):
+                is_revogado = True
+                break
+
+        # 4. Strip ONLY the literal `<REVOGAD[AO]>` marker substring (never erasing
+        # adjacent article/paragraph numbers like `Art. 179` or `§ 3º`).
+        for el in list(soup.find_all(string=self._REVOGADO_MARKER_RE)):
+            cleaned = self._REVOGADO_MARKER_RE.sub("", str(el))
+            if cleaned:
+                el.replace_with(cleaned)
+            else:
+                el.extract()
+
         return is_revogado
 
     def _build_search_url(self, norm_type_id: int | None, year: int, page: int) -> str:
@@ -221,23 +363,26 @@ class BahiaLegislaScraper(BaseScraper):
         norm_text_tag = soup.find("div", class_="field--name-body")
         if not isinstance(norm_text_tag, Tag):
             raise ValueError("Could not find div.field--name-body in document page")
+        for text_node in list(norm_text_tag.find_all(string=self._TRUNCATED_NBSP_RE)):
+            cleaned_txt = self._TRUNCATED_NBSP_RE.sub(" ", str(text_node))
+            text_node.replace_with(cleaned_txt)
+        is_revogado = self._strip_revogado(norm_text_tag)
+        if is_revogado:
+            doc_info["situation"] = "Revogado"
         clean_norm_soup(
             norm_text_tag,
-            unwrap_links=False,
+            unwrap_links=True,
             strip_styles=True,
             remove_style_tags=True,
             remove_script_tags=True,
         )
         self._clean_layout_tables(norm_text_tag)
-        is_revogado = self._strip_revogado(norm_text_tag)
-        if is_revogado:
-            doc_info["situation"] = "Revogado"
         html_string = wrap_html(str(norm_text_tag))
         doc_info["norm_number"] = norm_number
         doc_info["date"] = date
         doc_info["publication_date"] = publication_date
         doc_info["summary"] = summary
-        text_markdown = await self.markdown(html=html_string)
+        text_markdown = await self.markdown(html=html_string, base_url=url)
         result = Document(
             **{
                 **doc_info,

@@ -356,3 +356,39 @@ class TestCleanPdfMarkdown:
         text = "**RESOLUÇÃO CONAMA nº 11, de 26 de setembro de 1984**\nPublicada no Boletim de Serviço/MI, de 1º de novembro de 1984"
         result = scraper._clean_pdf_markdown(text)
         assert result == text
+
+    def test_removes_substituto_typo_and_multiline_dou_or_boletim_disclaimer(self):
+        scraper = _make_scraper()
+        doc1 = (
+            "Art. 2º Entra em vigor.\n\n"
+            "**IZABELLA TEIXEIRA**\n\n"
+            "#### ESSE TEXTO NÃO SUBSTITUTO O PUBLICADO\n\n"
+            "**NO DOU N° 251, DE 31/12/2012**"
+        )
+        assert (
+            scraper._clean_pdf_markdown(doc1)
+            == "Art. 2º Entra em vigor.\n\n**IZABELLA TEIXEIRA**"
+        )
+
+        doc3 = (
+            "Art. 2º Entra em vigor.\n\n"
+            "**ESTE TEXTO NÃO SUBSTITUI** **O PUBLICADO** **NO DOU N° 192, DE 03 DE OUTUBRO 2012, SEÇÃO 1, PÁG. 83**"
+        )
+        assert scraper._clean_pdf_markdown(doc3) == "Art. 2º Entra em vigor."
+
+        doc7 = "Art. 3º Revogam-se disposições.\n\n*Este texto não substitui o publicado no DOU de 19/0112*"
+        assert scraper._clean_pdf_markdown(doc7) == "Art. 3º Revogam-se disposições."
+
+        doc18 = (
+            "Presidente do CONAMA\n\n"
+            "**ESTE TEXTO NÃO SUBSTITUI** **O PUBLICADO** **NO BOLETIM DE SERVIÇO N° 10, DE 25/10/2012, PÁG. 6**"
+        )
+        assert scraper._clean_pdf_markdown(doc18) == "Presidente do CONAMA"
+
+    def test_preserves_substantive_decree_listagem_footnote(self):
+        scraper = _make_scraper()
+        text = (
+            "Art. 5º A listagem dos resíduos.\n\n"
+            "* Este texto não substitui a listagem original publicada pelo Decreto no 4.581, de 27 de janeiro de 2003."
+        )
+        assert scraper._clean_pdf_markdown(text) == text

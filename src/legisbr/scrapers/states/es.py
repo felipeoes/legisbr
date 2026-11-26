@@ -1,12 +1,16 @@
 from __future__ import annotations
+
 import logging
 import re
 from collections.abc import AsyncIterator
 from urllib.parse import parse_qs, urljoin, urlparse
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
-from legisbr.core.convert import infer_type_by_prefix
+from legisbr.core.convert import (
+    infer_type_by_prefix,
+    remove_summary_element,
+)
 from legisbr.core.document import Document
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
@@ -44,13 +48,21 @@ _AUTH_FOOTER_RE = re.compile(
 )
 _PAGE_NUMBER_RE = re.compile("(?im)^\\s*P[áa]gina\\s+\\d+(?:\\s+de\\s+\\d+)?\\s*$")
 _DISCLAIMER_RE = re.compile(
-    "(?:(?<=\\n)|^)\\s*(?:Est[ea]|Ess[ea])\\s+texto\\s+n[aã]o\\s+substitui\\s+o\\s+publicado\\s+no\\s+(?:D\\.?\\s*P\\.?\\s*L\\.?|D\\.?\\s*O\\.?(?:\\s*E\\.?)?)\\s+de\\s+[^\\n.]+\\.?",
+    r"(?:(?<=\n)|^)[ \t]*(?:[*~_(][ \t]*)*(?:Est[ea]|Ess[ea])\s+(?:texto|ato|publica[çc][aã]o)\s+n[aã]o\s+substitui[^\n]{0,200}(?:\n(?!\n)[^\n]{1,160}){0,3}",
     re.IGNORECASE,
 )
 _WATERMARK_RE = re.compile(
     "P[ÁáAa]GINA\\s+\\d+\\s*/\\s*\\d+\\s+PARA\\s+VERIFICAR\\s+A\\s+AUTENTICIDADE\\s+DESTE\\s+DOCUMENTO.*?(?:https?://\\S+)",
     re.IGNORECASE | re.DOTALL,
 )
+_OPERATIVE_START_RE = re.compile(r"^(?:Art\.?|§|Par[aá]grafo)\b", re.IGNORECASE)
+_ENACTING_RE = re.compile(
+    r"\b(?:resolve|decreta|declara|promulga|sanciono)\s*:", re.IGNORECASE
+)
+_BRASAO_RE = re.compile(r"bras[aã]o", re.IGNORECASE)
+_VETO_NOTE_RE = re.compile(r"\s*\*\s*COM\s+VETO.*$", re.IGNORECASE)
+_MD_MARKERS_RE = re.compile(r"[*_~`]+")
+_NON_ALNUM_RE = re.compile(r"[^\w]+", re.UNICODE)
 
 
 def _collapse_blank_lines(text: str) -> str:
@@ -58,44 +70,53 @@ def _collapse_blank_lines(text: str) -> str:
     return re.sub("\\n{3,}", "\n\n", text).strip()
 
 
-def _strip_summary(text_markdown: str, summary: str) -> str:
-    """Remove the listing-page summary from the beginning of *text_markdown* if present.
+def _normalize_summary_text(text: str) -> str:
+    cleaned = _MD_MARKERS_RE.sub("", text).replace("\xad", "")
+    return _NON_ALNUM_RE.sub("", cleaned).casefold()
 
-    The summary scraped from the search-results listing is often the opening
-    sentence of the document.  Stripping it avoids storing it twice.
+
+def _strip_summary(text_markdown: str, summary: str, *, doc_type: str = "") -> str:
+    """Remove a standalone opening summary paragraph without deleting titles or articles.
+
+    Never strips summaries on `Ato Administrativo` (where the listing summary IS
+    `Art. 1º` / the operative clause) and never slices off text preceding the summary.
     """
     if not summary or not text_markdown:
         return text_markdown
-    words = summary.strip().split()
-    if not words:
+    if doc_type.strip().casefold() == "ato administrativo":
         return text_markdown
-    pattern = "\\s+".join((re.escape(w) for w in words))
-    match = re.search(pattern, text_markdown, re.IGNORECASE)
-    if not match:
+    norm_summary = _normalize_summary_text(summary)
+    norm_summary_no_veto = _normalize_summary_text(_VETO_NOTE_RE.sub("", summary))
+    if not norm_summary:
         return text_markdown
-    prefix = text_markdown[: match.start()]
-    prefix_lines = [line.strip() for line in prefix.splitlines() if line.strip()]
-    prefix_substantive = re.sub("[\\W_]+", "", prefix, flags=re.UNICODE)
-    if (
-        match.start() < 300
-        and len(prefix_lines) <= 3
-        and (len(prefix_substantive) <= 120)
-    ):
-        return text_markdown[match.end() :].lstrip()
+
+    paragraphs = text_markdown.split("\n\n")
+    offset = 0
+    seen_enacting = False
+    for idx, para in enumerate(paragraphs[:5]):
+        plain = " ".join(_MD_MARKERS_RE.sub("", para).split())
+        if _OPERATIVE_START_RE.match(plain):
+            break
+        if seen_enacting:
+            break
+        if _ENACTING_RE.search(plain):
+            seen_enacting = True
+            offset += len(para) + 2
+            continue
+        if offset >= 400:
+            break
+        norm_para = _normalize_summary_text(para)
+        if norm_para and norm_para in (norm_summary, norm_summary_no_veto):
+            del paragraphs[idx]
+            return _collapse_blank_lines("\n\n".join(paragraphs))
+        offset += len(para) + 2
     return text_markdown
 
 
-def _clean_markdown(text_markdown: str, summary: str = "") -> str:
-    """Remove ES-specific PDF/HTML artefacts and strip the listing summary.
-
-    pdf_oxide already strips page-number footers, authentication watermarks,
-    and sidebar text that older plain-text extractors used to include.
-    The only ES-specific artefacts that survive are:
-
-    * The "MANIFESTO DE ASSINATURAS" digital-signature block at the end of PDFs.
-    * Authentication footer / page-number / disclaimer lines that may appear in
-      HTML→markdown output from the ES Assembly website.
-    """
+def _clean_markdown(
+    text_markdown: str, summary: str = "", *, doc_type: str = ""
+) -> str:
+    """Remove ES-specific PDF/HTML artefacts and standalone duplicate summaries."""
     match = _MANIFESTO_RE.search(text_markdown)
     if match:
         text_markdown = text_markdown[: match.start()].strip()
@@ -104,7 +125,38 @@ def _clean_markdown(text_markdown: str, summary: str = "") -> str:
     text = _PAGE_NUMBER_RE.sub("", text)
     text = _DISCLAIMER_RE.sub("", text)
     text = _collapse_blank_lines(text)
-    return _strip_summary(text, summary)
+    return _strip_summary(text, summary, doc_type=doc_type)
+
+
+def _strip_decorative_crest_images(soup: BeautifulSoup) -> None:
+    """Decompose decorative ES portal header crests while keeping genuine annex images."""
+    body = soup.find("body") or soup
+    for img in list(body.find_all("img")):
+        if img.decomposed:
+            continue
+        src = str(img.get("src") or "").strip()
+        alt = str(img.get("alt") or "").strip()
+        if _BRASAO_RE.search(src) or _BRASAO_RE.search(alt):
+            img.decompose()
+            continue
+        width = str(img.get("width") or "").strip()
+        height = str(img.get("height") or "").strip()
+        if (
+            width.isdigit()
+            and height.isdigit()
+            and int(width) <= 120
+            and int(height) <= 120
+        ):
+            prev_text = "".join(
+                s.strip()
+                for s in img.find_all_previous(string=True)
+                if s.strip()
+                and body in s.parents
+                and (s.parent.name if isinstance(s.parent, Tag) else "")
+                not in ("style", "script", "title")
+            )
+            if len(prev_text) < 120:
+                img.decompose()
 
 
 class ESAlesScraper(BaseScraper):
@@ -121,7 +173,7 @@ class ESAlesScraper(BaseScraper):
         not Playwright.
       - "NORMA ORIGINAL" links (.pdf) — scanned PDFs at
         /Arquivo/Documents/legislacao/image/. Downloaded and converted via
-        pdf_oxide with LLM OCR fallback.
+        pypdfium2 + selective pdfplumber with LLM OCR fallback.
       - "Digital.aspx" links — document viewer URLs; the embedded PDF path is
         extracted from the ``arquivo`` query param and fetched as a regular PDF.
 
@@ -299,13 +351,14 @@ class ESAlesScraper(BaseScraper):
         )
         if inferred_type:
             doc_info["type"] = inferred_type
+        doc_type = doc_info.get("type", "")
         summary = doc_info.get("summary", "")
         url = self._resolve_doc_url(doc_link)
         if url is None:
             raise ValueError(f"Unsupported document link: {doc_link}")
-        if url.endswith(".pdf"):
+        if url.lower().endswith(".pdf"):
             text_markdown, raw, content_ext = await self.download(url)
-            cleaned = _clean_markdown(text_markdown, summary)
+            cleaned = _clean_markdown(text_markdown, summary, doc_type=doc_type)
             doc_info["text_markdown"] = cleaned
             if not doc_info["text_markdown"] or not doc_info["text_markdown"].strip():
                 raise ValueError("Markdown empty after ES-specific cleanup")
@@ -313,26 +366,37 @@ class ESAlesScraper(BaseScraper):
             doc_info["raw"] = raw
             doc_info["raw_ext"] = content_ext
             return Document(**doc_info)
-        soup = (await self.http.request(url)).soup()
+        resp = await self.http.request(url)
+        raw_bytes = resp.content
+        soup = resp.soup()
         if not soup:
             raise ValueError("Failed to fetch HTML document")
-        html_string = str(soup)
-        text_markdown = await self.markdown(html=html_string)
-        result = Document(
+        _strip_decorative_crest_images(soup)
+        if summary and doc_type.strip().casefold() != "ato administrativo":
+            clean_summary = _VETO_NOTE_RE.sub("", summary).strip()
+            remove_summary_element(soup, clean_summary or summary)
+        # Drop empty <p> wrappers left behind by crest or summary removal.
+        for tag in list(soup.find_all(["p", "div"])):
+            if (
+                isinstance(tag, Tag)
+                and not tag.decomposed
+                and not tag.get_text(strip=True)
+                and not tag.find("img")
+            ):
+                tag.decompose()
+        text_markdown = await self.markdown(html=str(soup), base_url=url)
+        cleaned = _clean_markdown(text_markdown, summary, doc_type=doc_type)
+        if not cleaned or not cleaned.strip():
+            raise ValueError("Markdown empty after ES-specific cleanup")
+        return Document(
             **{
                 **doc_info,
                 "document_url": url,
-                "text_markdown": text_markdown,
-                "raw": html_string.encode("utf-8"),
+                "text_markdown": cleaned,
+                "raw": raw_bytes,
                 "raw_ext": ".html",
             }
         )
-        if result:
-            cleaned = _clean_markdown(result.text_markdown, summary)
-            if not cleaned or not cleaned.strip():
-                raise ValueError("Markdown empty after ES-specific cleanup")
-            result.text_markdown = cleaned
-        return result
 
     async def list_documents(self, year: int) -> AsyncIterator[dict]:
         url = self._format_search_url(year)

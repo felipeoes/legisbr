@@ -43,6 +43,7 @@ SITUATIONS = {
     "Revogada": "Revogada",
     "Declarada inconstitucional": "Declarada inconstitucional",
     "Tornada sem efeito": "Tornada sem efeito",
+    "Efeitos cessados": "Efeitos cessados",
 }
 _PAGE_SIZE = 10
 _COUNT_PATTERN = re.compile(
@@ -96,15 +97,21 @@ _TITLE_SITUATION_PATTERNS = [
         "Declarada inconstitucional",
     ),
     (re.compile("\\(tornada sem efeito\\)$", re.I), "Tornada sem efeito"),
+    (re.compile("\\(efeitos cessados\\)$", re.I), "Efeitos cessados"),
 ]
 _TEXT_PAGE_ATTEMPTS = 4
 _TEXT_PAGE_RETRY_SLEEP_SECONDS = 1.0
 _PDF_OBSERVATION_PATTERN = re.compile(
-    "(?:observa(?:c|ç)(?:a|ã)o:?\\s*)?a imagem d[ao]\\s+.+?est[aá]\\s+dispon[ií]vel em:?",
+    r"(?:obs(?:erva(?:c|ç)(?:a|ã)o)?:?\s*)?a\s+imagem\s+d[ao]s?\s+.+?est[aá]\s+dispon[ií]vel\s+em:?",
     re.IGNORECASE,
 )
+_UPDATE_FOOTER_RE = re.compile(
+    r"Data\s+da\s+[uú]ltima\s+atualiza[çc][aã]o\s*:\s*\d{1,2}[º°o]?/\d{1,2}/\d{2,4}\.?",
+    re.IGNORECASE,
+)
+_ASCII_DIVIDER_RE = re.compile(r"^[=\-_]{3,}$")
 _SUBSTANTIVE_TEXT_PATTERN = re.compile(
-    "\\b(art\\.\\s*\\d+|decreta|resolve(?:m)?|delibera(?:m)?|decide(?:m)?|promulgo|promulga|sanciona|cap[ií]tulo|par[aá]grafo|belo horizonte|pal[aá]cio da inconfid[eê]ncia)\\b",
+    "\\b(art\\.\\s*\\d+[º°o]?|decreta|resolve(?:m)?|delibera(?:m)?|decide(?:m)?|promulgo|promulga|sanciona|cap[ií]tulo|par[aá]grafo|belo horizonte|pal[aá]cio da inconfid[eê]ncia)\\b",
     re.IGNORECASE,
 )
 _ALMG_SHARE_URL_PATTERN = re.compile(
@@ -316,6 +323,7 @@ class MGAlmgScraper(BaseScraper):
             "declarada inconstitucional": "Declarada inconstitucional",
             "inconstitucional": "Declarada inconstitucional",
             "tornada sem efeito": "Tornada sem efeito",
+            "efeitos cessados": "Efeitos cessados",
         }.get(normalized, situation.strip())
 
     def _infer_situation(self, title: str, soup: BeautifulSoup) -> str:
@@ -372,12 +380,20 @@ class MGAlmgScraper(BaseScraper):
         if clean_span is None:
             clean_span = span_soup
         pdf_links: list[str] = []
-        for anchor in clean_span.find_all("a", href=True):
+        for anchor in list(clean_span.find_all("a", href=True)):
+            if anchor.decomposed:
+                continue
             href = str(anchor.get("href", ""))
             if "mediaserver" not in href:
                 continue
             pdf_links.append(urljoin(document_page_url, href))
             block = anchor.find_parent(["p", "div", "li"])
+            anchor_host = block if block is not None else anchor
+            prev_block = anchor_host.find_previous_sibling(["p", "div", "li"])
+            if prev_block is not None and self._is_pdf_observation_block(
+                prev_block.get_text(" ", strip=True)
+            ):
+                prev_block.decompose()
             block_text = (
                 block.get_text(" ", strip=True)
                 if block
@@ -387,13 +403,28 @@ class MGAlmgScraper(BaseScraper):
                 block.decompose()
             else:
                 anchor.decompose()
+                if block is not None and not re.sub(
+                    r"[\s.:;,-]+", "", block.get_text(" ", strip=True)
+                ):
+                    block.decompose()
+        for footer_block in list(clean_span.find_all(["p", "div"])):
+            if footer_block.decomposed:
+                continue
+            if footer_block.find(["p", "div"]):
+                continue
+            block_text = self._clean_text(footer_block.get_text(" ", strip=True))
+            if not block_text or not _UPDATE_FOOTER_RE.search(block_text):
+                continue
+            prev_block = footer_block.find_previous_sibling(["p", "div"])
+            if prev_block is not None and _ASCII_DIVIDER_RE.fullmatch(
+                self._clean_text(prev_block.get_text(" ", strip=True))
+            ):
+                prev_block.decompose()
+            remainder = _UPDATE_FOOTER_RE.sub("", block_text).strip(" .")
+            if not remainder:
+                footer_block.decompose()
         self._strip_trailing_annex_stubs(clean_span)
-        html_string = re.sub(
-            "Data da última atualização:\\s*\\d{2}/\\d{2}/\\d{4}",
-            "",
-            str(clean_span),
-            flags=re.IGNORECASE,
-        )
+        html_string = _UPDATE_FOOTER_RE.sub("", str(clean_span))
         html_string = self._strip_malformed_share_links(html_string)
         plain_text = self._clean_text(clean_span.get_text(" ", strip=True))
         return (html_string, plain_text, pdf_links)

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, MagicMock
 
-from conftest import make_scraper
+import pytest
+from bs4 import BeautifulSoup
+from conftest import make_mock_json_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -234,3 +237,125 @@ class TestPrepareInlineHtml:
         clean_html, pdf_link, redirect = scraper._prepare_inline_html(content)
         assert "Ficam reajustados" in clean_html
         assert (pdf_link, redirect) == ("", False)
+
+    @pytest.mark.asyncio
+    async def test_unwraps_legacy_layout_table_while_preserving_annex_data_table(self):
+        scraper = _make_scraper()
+        html = """
+        <html><body>
+          <table border="0" width="100%">
+            <tr><td><img src="../../assets/brasao_goias.gif"/><strong>GOVERNO DO ESTADO DE GOIÁS</strong></td></tr>
+            <tr><td>Secretaria de Estado da Casa Civil</td></tr>
+          </table>
+          <table border="0" width="100%">
+            <tbody><tr>
+              <td width="6%">&nbsp;</td>
+              <td width="94%">
+                <p>Dispõe sobre cargos e vencimentos.</p>
+                <p>Art. 1º Ficam criados os cargos do Anexo Único.</p>
+                <p>Art. 2º Esta Lei entra em vigor na data de sua publicação.</p>
+                <table border="1">
+                  <tr><th>Cargo</th><th>Vagas</th></tr>
+                  <tr><td>Analista</td><td>10</td></tr>
+                  <tr><td>Técnico</td><td>20</td></tr>
+                </table>
+                <p><a href="/api/v1/arquivos/1"><img src="../../assets/winzip.jpg"/></a>
+                <a href="/api/v1/arquivos/2">Download do Anexo</a></p>
+              </td>
+            </tr></tbody>
+          </table>
+        </body></html>
+        """
+        clean_html, _, _ = scraper._prepare_inline_html(html)
+        soup = BeautifulSoup(clean_html, "lxml")
+        tables = soup.find_all("table")
+        assert len(tables) == 1
+        assert "Analista" in tables[0].get_text()
+        assert "winzip.jpg" not in clean_html
+        assert "Download do Anexo" not in clean_html
+        assert "brasao_goias.gif" not in clean_html
+
+        md = scraper._clean_markdown(
+            await scraper.markdown(
+                html=clean_html,
+                base_url="https://legisla.casacivil.go.gov.br/pesquisa_legislacao/1/lei-1",
+            )
+        )
+        assert not md.lstrip().startswith("|")
+        assert "Art. 1º" in md
+        assert "Art. 2º" in md
+        assert any("Art. 1º" in ln and "Art. 2º" not in ln for ln in md.splitlines())
+        assert re.search(r"\|\s*Analista\s*\|\s*10\s*\|", md)
+
+    def test_preserves_epigrafe_inside_header_table(self):
+        """Lei 17.928/2012 (id=76): epígrafe sits inside the GOVERNO DO ESTADO DE GOIÁS table."""
+        scraper = _make_scraper()
+        html = """
+        <html><body>
+          <table border="0" width="100%"><tr><td>
+            <p align="center">
+              <img src="/assets/brasao_goias.gif"/>
+              <strong>GOVERNO DO ESTADO DE GOIÁS</strong><br/>
+              <strong>Secretaria de Estado da Casa Civil</strong><br/>
+              <b>LEI Nº 17.928, DE 27 DE DEZEMBRO DE 2012.</b>
+            </p>
+          </td></tr></table>
+          <table border="0" width="100%"><tr><td width="1%">&nbsp;</td><td width="99%">
+            <p>Art. 1º Normas suplementares de licitações.</p>
+          </td></tr></table>
+        </body></html>
+        """
+        clean_html, _, _ = scraper._prepare_inline_html(html)
+        assert "LEI Nº 17.928, DE 27 DE DEZEMBRO DE 2012." in clean_html
+        assert "GOVERNO DO ESTADO DE GOIÁS" not in clean_html
+        assert "Secretaria de Estado da Casa Civil" not in clean_html
+
+    def test_build_doc_info_decodes_cp1252_c1_bytes_in_summary(self):
+        scraper = _make_scraper()
+        detail = _make_doc_detail(
+            ementa="Disp\u00f5e sobre Goi\u00e1s Previd\u00eancia \x96 GOIASPREV e \x93normas\x94."
+        )
+        info = scraper._build_doc_info(
+            {}, detail, norm_type="Lei Ordinária", situation="Vigente"
+        )
+        assert "\x96" not in info["summary"]
+        assert "\x93" not in info["summary"]
+        assert "\x94" not in info["summary"]
+        assert "– GOIASPREV" in info["summary"]
+        assert "“normas”" in info["summary"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_passes_document_url_as_base_url_and_strips_summary(self):
+        scraper = _make_scraper()
+        detail = _make_doc_detail(
+            doc_id=42,
+            numero="17.928",
+            ano=2012,
+            ementa="Disp\u00f5e sobre licita\u00e7\u00f5es \x96 regras gerais.",
+            conteudo=(
+                '<table border="0"><tr><td>&nbsp;</td><td>'
+                "<p>Dispõe sobre licita\xadções – regras gerais.</p>"
+                "<p>Art. 1º Esta Lei estabelece normas suplementares de licitações e contratos "
+                "no âmbito da administração pública estadual direta e indireta.</p>"
+                "</td></tr></table>"
+            ),
+        )
+        scraper.http.request = AsyncMock(return_value=make_mock_json_response(detail))
+        captured_base_urls: list[str | None] = []
+        orig_markdown = scraper.markdown
+
+        async def spy_markdown(*, html: str, base_url: str | None = None) -> str:
+            captured_base_urls.append(base_url)
+            return await orig_markdown(html=html, base_url=base_url)
+
+        scraper.markdown = spy_markdown  # type: ignore[method-assign]
+        doc = await scraper.fetch(
+            _make_search_result(doc_id=42, numero="17.928", ano=2012)
+        )
+        assert doc is not None
+        assert captured_base_urls == [
+            "https://legisla.casacivil.go.gov.br/pesquisa_legislacao/42/lei-17.928"
+        ]
+        assert "– regras gerais." in doc.summary
+        assert "regras gerais" not in doc.text_markdown
+        assert "Art. 1º" in doc.text_markdown

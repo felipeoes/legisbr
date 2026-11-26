@@ -111,9 +111,14 @@ async def _fetch_and_encode(
         return None
     if not data:
         return None
+    content_type = _detect_image_mime(data)
+    if content_type is None:
+        logger.debug(
+            f"Skipping non-image response for '{full_url[:80]}' ({len(data)} bytes)"
+        )
+        return None
     if len(data) < 100:  # 1x1 spacer GIFs/PNGs carry no content
         return _SPACER
-    content_type = _guess_mime(full_url, data)
     b64 = base64.b64encode(data).decode("ascii")
     return (content_type, b64)
 
@@ -239,11 +244,8 @@ def _is_fetchable_source(source: str) -> bool:
     )
 
 
-def _guess_mime(url: str, data: bytes) -> str:
-    """Best-effort MIME type from URL extension or magic bytes."""
-    mime, _ = mimetypes.guess_type(url.split("?")[0])
-    if mime:
-        return mime
+def _detect_image_mime(data: bytes) -> str | None:
+    """Detect image MIME type strictly from magic bytes, or ``None`` if not an image."""
     if data[:8].startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if data[:2] == b"\xff\xd8":
@@ -252,4 +254,22 @@ def _guess_mime(url: str, data: bytes) -> str:
         return "image/gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return "image/tiff"
+    head = data[:512].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
+        return "image/svg+xml"
+    return None
+
+
+def _guess_mime(url: str, data: bytes) -> str:
+    """Best-effort MIME type from magic bytes first, then URL extension."""
+    magic_mime = _detect_image_mime(data)
+    if magic_mime:
+        return magic_mime
+    mime, _ = mimetypes.guess_type(url.split("?")[0])
+    if mime:
+        return mime
     return "image/png"

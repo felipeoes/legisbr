@@ -304,3 +304,50 @@ async def test_source_line_breaks_do_not_glue_words():
     )
     assert "São Sebastião do Paraíso" in doc.text_markdown
     assert "doParaíso" not in doc.text_markdown
+
+
+async def test_strips_update_footer_variants_dividers_and_annex_observation_sibling():
+    scraper = _make_scraper()
+    for divider, footer in [
+        ("=================================", "Data da última atualização: 29/5/2020."),
+        (
+            "---------------------------------------------",
+            "Data da ultima atualização: 09/4/2013.",
+        ),
+        (
+            "___________________________________",
+            "Data da última atualização: 1º/2/2024.",
+        ),
+    ]:
+        span = BeautifulSoup(
+            f'<span class="textNorma">'
+            f"<p>{'Art. 1º Texto da lei mineira. ' * 10}</p>"
+            f"<p>A imagem dos Anexos deste Decreto está disponível em:</p>"
+            f'<p><a href="https://mediaserver.almg.gov.br/acervo/1.pdf">https://mediaserver.almg.gov.br/acervo/1.pdf</a>.</p>'
+            f"<p>{divider}</p>"
+            f"<p>{footer}</p>"
+            f"</span>",
+            "lxml",
+        ).find("span")
+        doc = await scraper._convert_mg_content(
+            span,
+            "https://www.almg.gov.br/legislacao-mineira/texto/DEC/46083/2012/original",
+            b"raw",
+            "Decreto nº 46.083",
+            "Decreto",
+            {"title": "Decreto nº 46.083", "type": "Decreto", "situation": "Vigente"},
+            2012,
+        )
+        assert "atualização" not in doc.text_markdown.lower()
+        assert "===" not in doc.text_markdown
+        assert "---" not in doc.text_markdown
+        assert "___" not in doc.text_markdown
+        assert "disponível em" not in doc.text_markdown
+        assert not doc.text_markdown.rstrip().endswith("\n.")
+
+
+def test_normalizes_efeitos_cessados_situation():
+    scraper = _make_scraper()
+    assert scraper._normalize_situation_value("EFEITOS CESSADOS") == "Efeitos cessados"
+    soup = _make_detail_soup(situation="EFEITOS CESSADOS")
+    assert scraper._infer_situation("Decreto nº 1/2012", soup) == "Efeitos cessados"

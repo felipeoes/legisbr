@@ -154,6 +154,20 @@ def wrap_html(content: str) -> str:
 
 
 _C1_RE = re.compile("[\x80-\x9f]")
+_LINE_THROUGH_RE = re.compile(
+    r"text-decoration(?:-[a-z]+)?\s*:\s*[^;]*\bline-through\b", re.IGNORECASE
+)
+_LINE_THROUGH_DECL_RE = re.compile(
+    r"text-decoration(?:-[a-z]+)?\s*:\s*[^;]*\bline-through\b[^;]*;?", re.IGNORECASE
+)
+_STRIKETHROUGH_HINT_RE = re.compile(r"<(?:s|del|strike)\b|line-through", re.IGNORECASE)
+_STRIKE_TAGS = frozenset({"s", "del", "strike"})
+_BLOCK_STRIKE_TAGS = frozenset(
+    {"p", "div", "li", "td", "th", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"}
+)
+_ORDINAL_ONLY_RE = re.compile(r"^[ºª°]+$")
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:])")
+_ARTICLE_START_RE = re.compile(r"^art\.\s*\d", re.IGNORECASE)
 
 
 def _from_cp1252(match: re.Match[str]) -> str:
@@ -165,7 +179,11 @@ def clean_markdown(text: str, replace: list[tuple[str, str]] | None = None) -> s
     text = clean_md_tag(text)
     # Sources that decode cp1252 as Latin-1 leave C1 controls for dashes and quotes.
     text = _C1_RE.sub(_from_cp1252, text)
+    text = text.replace("\u00a0", " ").replace("\u00ad", "")
     text = re.sub("(?<!!)\\[([^\\]]*)\\]\\([^)]*\\)", "\\1", text)
+    # Collapse adjacent strikethrough boundaries (e.g. ``<span><s>a</s></span><s>b</s>``
+    # or stripped ``[~~a~~](url)~~b~~``) so CommonMark ``~~~~`` fences never appear.
+    text = re.sub(r"(?<!~)~~~~(?!~)", "", text)
     if replace:
         for find, replacement in replace:
             text = re.sub(find, replacement, text)
@@ -240,6 +258,85 @@ def _remove_empty_elements(soup: BeautifulSoup | Tag) -> None:
             tag.decompose()
 
 
+def _strip_line_through_style(tag: Tag) -> None:
+    """Remove the ``line-through`` declaration from an element's ``style`` attribute."""
+    style = tag.get("style")
+    if not isinstance(style, str):
+        return
+    cleaned = _LINE_THROUGH_DECL_RE.sub("", style).strip()
+    if cleaned:
+        tag["style"] = cleaned
+    else:
+        del tag["style"]
+
+
+def _wrap_children_in_strike(tag: Tag) -> None:
+    """Wrap *tag*'s direct contents in an ``<s>`` element, preserving the outer block."""
+    strike = Tag(name="s")
+    for child in list(tag.contents):
+        strike.append(child.extract())
+    tag.append(strike)
+
+
+def _normalize_strikethrough_soup(soup: BeautifulSoup | Tag) -> None:
+    """Normalize CSS line-through, nested strikethroughs, and ordinal-only ``<s>`` tags."""
+    # 1. Convert CSS text-decoration: line-through elements into <s>.
+    for tag in list(soup.find_all(style=_LINE_THROUGH_RE)):
+        if tag.decomposed:
+            continue
+        _strip_line_through_style(tag)
+        if tag.name in _STRIKE_TAGS or tag.find_parent(_STRIKE_TAGS):
+            continue
+        if not tag.get_text(strip=True):
+            continue
+        if tag.name in {"span", "font"}:
+            tag.name = "s"
+        elif tag.name in _BLOCK_STRIKE_TAGS:
+            if not tag.find(_BLOCK_STRIKE_TAGS):
+                _wrap_children_in_strike(tag)
+            else:
+                for block in tag.find_all(_BLOCK_STRIKE_TAGS):
+                    if (
+                        block.find(_BLOCK_STRIKE_TAGS)
+                        or not block.get_text(strip=True)
+                        or block.find_parent(_STRIKE_TAGS)
+                    ):
+                        continue
+                    _wrap_children_in_strike(block)
+        else:
+            tag.wrap(Tag(name="s"))
+
+    # 2. Collapse nested <s>/<del>/<strike> tags so revoked norms never emit ``~~~~`` fences.
+    for tag in list(soup.find_all(_STRIKE_TAGS)):
+        if tag.decomposed:
+            continue
+        if tag.find_parent(_STRIKE_TAGS):
+            tag.unwrap()
+
+    # 3. Unwrap ordinal-only <s>º</s> / <s>ª</s> / <s>°</s> Word/Tika artifacts
+    #    and empty/whitespace-only strike tags (e.g. ``<s><span><o:p></o:p></span></s>``).
+    for tag in list(soup.find_all(_STRIKE_TAGS)):
+        if tag.decomposed:
+            continue
+        txt = tag.get_text(strip=True)
+        if _ORDINAL_ONLY_RE.fullmatch(txt) or (not txt and not tag.find("img")):
+            tag.unwrap()
+
+    # 4. Merge adjacent sibling <s>/<del>/<strike> tags so ``<s>a</s><s>b</s>``
+    #    never emits CommonMark ``~~~~`` fenced code blocks.
+    for tag in list(soup.find_all(_STRIKE_TAGS)):
+        if tag.decomposed:
+            continue
+        while True:
+            sib = tag.next_sibling
+            if isinstance(sib, Tag) and sib.name in _STRIKE_TAGS:
+                for child in list(sib.contents):
+                    tag.append(child.extract())
+                sib.decompose()
+                continue
+            break
+
+
 def _clean_attributes(soup: BeautifulSoup | Tag) -> None:
     """Strip inline ``style`` attributes from all remaining tags."""
     for tag in soup.find_all(style=True):
@@ -278,6 +375,7 @@ def clean_norm_soup(
         _clean_links(soup)
     if unwrap_fonts:
         _unwrap_font_tags(soup)
+    _normalize_strikethrough_soup(soup)
     if remove_empty_tags:
         _remove_empty_elements(soup)
     if strip_styles:
@@ -326,6 +424,10 @@ async def html_to_markdown(
     cache: ImageCache | None = None,
 ) -> str:
     html = await inline_images_in_html(html, base_url, fetch_image, cache=cache)
+    if _STRIKETHROUGH_HINT_RE.search(html):
+        soup = BeautifulSoup(html, "lxml")
+        _normalize_strikethrough_soup(soup)
+        html = str(soup)
     result = await asyncio.to_thread(
         html_to_md,
         html,
@@ -336,6 +438,7 @@ async def html_to_markdown(
             # ASP.NET/JSF/Domino pages wrap the whole law in a <form>.
             preprocessing=PreprocessingOptions(remove_forms=False),
             hidden_content="all",
+            strip_newlines=True,
         ),
     )
     return clean_markdown(result.content or "")
@@ -419,14 +522,24 @@ def remove_summary_from_markdown(md: str, summary: str) -> str:
 
 def remove_summary_element(container: BeautifulSoup | Tag, summary: str) -> None:
     """Remove the smallest summary container without deleting articles."""
-    normalized = " ".join(summary.split()).casefold()
+    normalized = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", " ".join(summary.split())).casefold()
     if not normalized:
         return
     candidates = []
     for tag in container.find_all(["p", "td", "div", "span", "font", "table"]):
-        text = " ".join(tag.get_text(" ", strip=True).split()).casefold()
-        if normalized in text and "art." not in text:
-            candidates.append((len(text), tag))
+        text = _SPACE_BEFORE_PUNCT_RE.sub(
+            r"\1", " ".join(tag.get_text(" ", strip=True).split())
+        ).casefold()
+        if normalized not in text:
+            continue
+        is_dedicated_ementa = (
+            len(text) <= len(normalized) * 1.25
+            and len(text) < 600
+            and not _ARTICLE_START_RE.match(text)
+        )
+        if "art." in text and not (is_dedicated_ementa and "art." in normalized):
+            continue
+        candidates.append((len(text), tag))
     if candidates:
         min(candidates, key=lambda item: item[0])[1].decompose()
 

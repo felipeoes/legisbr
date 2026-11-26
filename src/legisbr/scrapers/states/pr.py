@@ -10,9 +10,14 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
-from legisbr.core.convert import infer_type_from_title, valid_markdown, wrap_html
+from legisbr.core.convert import (
+    clean_norm_soup,
+    infer_type_from_title,
+    valid_markdown,
+    wrap_html,
+)
 from legisbr.core.document import DocRef, Document, clean_title
 from legisbr.core.query import (
     Query,
@@ -40,7 +45,19 @@ VALID_SITUATIONS: list[str] = []
 INVALID_SITUATIONS: list[str] = []
 SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
 _RE_LIST_ITEMS = re.compile("list_cor_(sim|nao)")
-_RE_INVALID = re.compile("(Revogado pelo|Revogada pela|Revogado por|Revogada por)")
+_RE_INVALID = re.compile(r"\bRevogad[ao]\s+(?:pelo|pela|por)\b", re.IGNORECASE)
+_RE_HEADER_REVOKED = re.compile(
+    r"^\(\s*Revogad[ao]\s+(?:pelo|pela|por)\b[^)]*\)$", re.IGNORECASE
+)
+_RE_BODY_LABEL = re.compile(
+    r"^(?:S[uú]mula\s*:|Art\.?|§|Par[aá]grafo)\b", re.IGNORECASE
+)
+_RE_ANEXOS_LABEL = re.compile(
+    r"(?:^|\r?\n)[ \t]*ANEXOS:[ \t]*(?=$|\r?\n|<)", re.MULTILINE
+)
+_RE_DISCLAIMER = re.compile(
+    r"Este\s+texto\s+n[aã]o\s+substitui\s+o\s+publicado", re.IGNORECASE
+)
 _RE_TOTAL_RECORDS = re.compile("Total de (\\d+) registros")
 _RE_COD_ATO = re.compile(r"codAto=(\d+)")
 _RE_SITE_ERROR = re.compile(r'class="msg_aviso">([^<]*)')
@@ -89,6 +106,37 @@ class ParanaCVScraper(BaseScraper):
             )
         return docs
 
+    @staticmethod
+    def _clean_form_html(form: Tag) -> str:
+        """Strip Paraná attachment table, disclaimer footer, Voltar button, and ANEXOS chrome."""
+        table = form.find("table", id="list_tabela")
+        if isinstance(table, Tag):
+            table.decompose()
+        for inp in list(form.find_all("input")):
+            if not inp.decomposed:
+                inp.decompose()
+        for p in list(form.find_all("p")):
+            if p.decomposed:
+                continue
+            txt = " ".join(p.get_text(" ", strip=True).split())
+            if len(txt) < 300 and _RE_DISCLAIMER.search(txt):
+                prev = p.find_previous_sibling()
+                if isinstance(prev, Tag) and prev.name == "hr":
+                    prev.decompose()
+                p.decompose()
+        clean_norm_soup(
+            form,
+            remove_disclaimers=True,
+            unwrap_links=False,
+            remove_images=False,
+            remove_empty_tags=True,
+            remove_style_tags=True,
+            remove_script_tags=True,
+        )
+        html_string = _RE_ANEXOS_LABEL.sub("", str(form)).strip()
+        html_string = html_string.replace("javascript:listarAssinaturas();", "")
+        return wrap_html(html_string)
+
     async def fetch(self, doc_info: dict) -> Document:
         """Fetch a single document's HTML and convert to markdown.
 
@@ -103,16 +151,13 @@ class ParanaCVScraper(BaseScraper):
         response = await self.http.request(html_link)
         soup = response.soup()
         form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
-        if not form:
+        if not isinstance(form, Tag):
             raise ValueError("No pesquisarAtoForm found")
-        table = form.find("table", id="list_tabela")
-        if table:
-            table.decompose()
-        html_string = str(form).replace("\n ANEXOS:", "").strip()
-        html_string = html_string.replace("javascript:listarAssinaturas();", "")
-        html_string = wrap_html(html_string)
         situation = self._infer_situation(soup)
-        text_markdown = (await self.markdown(html=html_string)).strip()
+        html_string = self._clean_form_html(form)
+        text_markdown = (
+            await self.markdown(html=html_string, base_url=html_link)
+        ).strip()
         valid, reason = valid_markdown(text_markdown)
         if not valid:
             raise ValueError(f"Invalid markdown: {reason}")
@@ -135,10 +180,11 @@ class ParanaCVScraper(BaseScraper):
         response = await self.http.request(html_link)
         soup = response.soup()
         form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
-        if not form:
+        if not isinstance(form, Tag):
             raise ValueError("No pesquisarAtoForm found")
+        situation = self._infer_situation(soup)
         table = form.find("table", id="list_tabela")
-        if table:
+        if isinstance(table, Tag):
             table.decompose()
         lines = [
             clean_title(line)
@@ -149,11 +195,10 @@ class ParanaCVScraper(BaseScraper):
         year_match = re.search(r"\b((?:18|19|20)\d{2})\b", " ".join(lines[:5]))
         year = int(year_match.group(1)) if year_match else 0
         norm_type = infer_type_from_title(title, TYPES) or "Lei"
-        html_string = str(form).replace("\n ANEXOS:", "").strip()
-        html_string = html_string.replace("javascript:listarAssinaturas();", "")
-        html_string = wrap_html(html_string)
-        situation = self._infer_situation(soup)
-        text_markdown = (await self.markdown(html=html_string)).strip()
+        html_string = self._clean_form_html(form)
+        text_markdown = (
+            await self.markdown(html=html_string, base_url=html_link)
+        ).strip()
         valid, reason = valid_markdown(text_markdown)
         if not valid:
             raise ValueError(f"Invalid markdown: {reason}")
@@ -317,12 +362,31 @@ class ParanaCVScraper(BaseScraper):
 
     @staticmethod
     def _infer_situation(soup: BeautifulSoup) -> str:
-        status = soup.find(string=re.compile("^\\s*Situa[çc][ãa]o\\s*:", re.IGNORECASE))
+        status = soup.find(string=re.compile(r"^\s*Situa[çc][ãa]o\s*:", re.IGNORECASE))
         if status is not None:
             text = status.parent.get_text(" ", strip=True)
             sibling = status.parent.find_next_sibling()
             if sibling is not None and (not text.partition(":")[2].strip()):
                 text += " " + sibling.get_text(" ", strip=True)
             if _RE_INVALID.search(text):
+                return DEFAULT_INVALID_SITUATION
+            return DEFAULT_VALID_SITUATION
+        # Paraná Casa Civil places whole-act revocations inside pesquisarAtoForm
+        # directly below "Publicado no Diário Oficial..." before Súmula: / Art. 1º
+        # as a standalone parenthesized notice `(Revogado pelo ...)`.
+        form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
+        if not isinstance(form, Tag):
+            return DEFAULT_VALID_SITUATION
+        for p in form.find_all("p"):
+            label = p.find("b", class_="labelAto")
+            label_text = label.get_text(" ", strip=True) if label else ""
+            if label_text and _RE_BODY_LABEL.match(label_text):
+                break
+            p_text = " ".join(p.get_text(" ", strip=True).split())
+            if not p_text:
+                continue
+            if _RE_BODY_LABEL.match(p_text):
+                break
+            if _RE_HEADER_REVOKED.match(p_text):
                 return DEFAULT_INVALID_SITUATION
         return DEFAULT_VALID_SITUATION

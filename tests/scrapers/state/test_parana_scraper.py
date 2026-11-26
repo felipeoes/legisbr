@@ -115,6 +115,34 @@ class TestInferSituation:
         soup = BeautifulSoup(html, "lxml")
         assert ParanaCVScraper._infer_situation(soup) == DEFAULT_INVALID_SITUATION
 
+    def test_header_level_revocation_below_publicado_returns_invalid(self):
+        html = """
+        <html><body><form name="pesquisarAtoForm">
+          <h3>Decreto 12131 - 03 de Dezembro de 2025</h3>
+          <br/>Publicado no <a href="#">Diário Oficial nº. 12041</a> de 3 de Dezembro de 2025<br/><br/>
+          <p><b class="labelAto"></b>
+            <a href="pesquisarAto.do?action=exibir&amp;codAto=412339"> (Revogado pelo Decreto 15914 de 25/11/2026)</a>
+          </p>
+          <p><b class="labelAto"><strike>Súmula:</strike></b><strike><a>Resumo.</a></strike></p>
+        </form></body></html>
+        """
+        soup = BeautifulSoup(html, "lxml")
+        assert ParanaCVScraper._infer_situation(soup) == DEFAULT_INVALID_SITUATION
+
+    def test_partial_in_body_revocation_and_amended_sumula_stay_valid(self):
+        html = """
+        <html><body><form name="pesquisarAtoForm">
+          <h3>Lei 22.916 - 12 de dezembro de 2025</h3>
+          <p><b class="labelAto"><strike>Súmula:</strike></b><strike><a>Ementa antiga.</a></strike></p>
+          <p><b class="labelAto"></b><a>Ementa nova.</a><a href="#"> (Redação dada pela Lei 23202)</a></p>
+          <p><b class="labelAto"><strike>Art. 1º</strike></b><strike><a>Texto.</a></strike>
+            <a href="#"> (Revogado pela Lei 23291 de 24/06/2026)</a>
+          </p>
+        </form></body></html>
+        """
+        soup = BeautifulSoup(html, "lxml")
+        assert ParanaCVScraper._infer_situation(soup) == DEFAULT_VALID_SITUATION
+
 
 class TestFetch:
     REF = {
@@ -151,6 +179,27 @@ class TestFetch:
         scraper.http.request.side_effect = [make_mock_response("<html></html>")]
         with pytest.raises(ValueError, match="pesquisarAtoForm"):
             await scraper.fetch(dict(self.REF))
+
+    async def test_fetch_strips_disclaimer_hr_and_tabbed_anexos_chrome(self):
+        scraper = _make_scraper()
+        html = (
+            '<html><body><form name="pesquisarAtoForm">'
+            "<h3>Lei 22.966 - 18 de dezembro de 2025</h3>"
+            '<p><b class="labelAto">Súmula:</b> <a>Extingue serviços distritais estaduais.</a></p>'
+            '<p><b class="labelAto">Art. 1º</b> <a>Ficam extintos os serviços previstos nesta lei estadual.</a></p>'
+            "<hr/>"
+            '<p style="color:red; font-style:italic">Este texto não substitui o publicado no Diário Oficial do Estado</p>'
+            "\n\t\t\n\t\t   \n\t\t\tANEXOS:\n"
+            '<table id="list_tabela"><tr><td>Anexo Único</td></tr></table>'
+            '<div align="center"><input type="button" value="Voltar"/></div>'
+            "</form></body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(html)]
+        doc = await scraper.fetch(dict(self.REF))
+        assert "Este texto não substitui" not in doc.text_markdown
+        assert "ANEXOS:" not in doc.text_markdown
+        assert "Anexo Único" not in doc.text_markdown
+        assert "Art. 1º" in doc.text_markdown
 
 
 # Trimmed from live responses: an empty year, and the site's error page, which also

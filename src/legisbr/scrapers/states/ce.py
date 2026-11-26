@@ -99,7 +99,7 @@ class CearaAleceScraper(BaseScraper):
             norm_number = tds[0].text.strip()
             year = norm_number.split("/")[1]
             title = norm_number
-            summary = tds[2].text.strip()
+            summary = " ".join(tds[2].text.split())
             document_url = tds[5].find("a")["href"]
             docs.append(
                 {
@@ -123,6 +123,10 @@ class CearaAleceScraper(BaseScraper):
         response = await self.http.request(visualizar_url)
         soup = response.soup()
         content = soup.find("div", class_="card-body") or soup.find("main") or soup
+        for img in list(content.find_all("img")):
+            src = str(img.get("src") or "").lower()
+            if "/img/logo.jpg" in src or src.endswith("img/logo.jpg"):
+                img.decompose()
         clean_norm_soup(content, unwrap_links=False)
         remove_summary_element(content, doc_info.get("summary", ""))
         html_string = str(content)
@@ -175,7 +179,7 @@ class CearaAleceScraper(BaseScraper):
                 continue
             title = tds[0].text.strip()
             try:
-                summary = tds[1].text.strip()
+                summary = " ".join(tds[1].text.split())
                 html_link = tds[0].find("a")["href"]
                 html_link = html_link.replace("../", "")
             except Exception:
@@ -256,10 +260,12 @@ class CearaAleceScraper(BaseScraper):
         for a in soup.find_all("a"):
             if a.get_text(strip=True).upper() == "VOLTAR":
                 a.decompose()
-        for node in soup.find_all(
-            string=re.compile("O texto desta Lei", re.IGNORECASE)
+        for node in list(
+            soup.find_all(string=re.compile(r"O\s+texto\s+desta\s+Lei", re.IGNORECASE))
         ):
-            node.parent.decompose()
+            parent = node.parent
+            if parent and not parent.decomposed:
+                parent.decompose()
         sections = soup.find_all("div", class_=re.compile("^Section\\d+$"))
         if sections:
             container = BeautifulSoup("<div></div>", "lxml").div

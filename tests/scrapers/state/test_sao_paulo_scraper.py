@@ -211,6 +211,39 @@ class TestFetch:
         with pytest.raises(ValueError, match="no text"):
             await scraper.fetch(_ref(text_url=None))
 
+    def test_row_to_ref_strips_html_tags_from_summary(self):
+        row = {
+            "idNorma": 166919,
+            "tipo": "Decreto",
+            "nomeNorma": "Decreto nº 58.584, de 2012",
+            "dsEmenta": (
+                "Dispõe sobre percentual (<a data-idAnotacao='1' "
+                "href='https://www.al.sp.gov.br/norma/1'>Lei nº 12.345</a>)."
+            ),
+            "ano": 2012,
+        }
+        ref = SaoPauloAlespScraper._row_to_ref(
+            row, year=2012, situation="Sem revogação expressa"
+        )
+        assert ref["summary"] == "Dispõe sobre percentual (Lei nº 12.345)."
+        assert "<a" not in ref["summary"]
+
+    async def test_html_strips_texto_compilado_nav_link(self):
+        body = (
+            '<html><body><a href="http://www.al.sp.gov.br">ALESP</a>'
+            '<a href="/norma/?id=166919">Ficha informativa</a>'
+            '<a href="compilacao-resolucao-885.html">Texto compilado</a>'
+            "<h1>RESOLUÇÃO Nº 885</h1>"
+            "<p>Artigo 1º Fica criada a comissão estadual de teste.</p>"
+            "</body></html>"
+        ).encode("utf-8")
+        scraper = make_scraper(SaoPauloAlespScraper)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+        doc = await scraper.fetch(_ref(type="Resolução da Alesp"))
+        assert "Texto compilado" not in doc.text_markdown
+        assert "Ficha informativa" not in doc.text_markdown
+        assert "RESOLUÇÃO Nº 885" in doc.text_markdown
+
 
 @pytest.mark.integration
 async def test_live_2012_listing_matches_type_counts():

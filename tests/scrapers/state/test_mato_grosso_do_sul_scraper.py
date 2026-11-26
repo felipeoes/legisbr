@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import pytest
+import re
 import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock, MagicMock
 
-from conftest import make_scraper
+import pytest
+
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
@@ -202,3 +204,100 @@ async def test_malformed_view_xml_fails_instead_of_empty_year(stage):
     with pytest.raises(ET.ParseError):
         await scraper._get_type_year_docs("Lei", "lei", 2012)
     assert "Lei" not in scraper._type_year_index or stage == "entries"
+
+
+class TestTitleNormalization:
+    def test_inserts_space_before_glued_numero(self):
+        assert (
+            MSAlemsScraper._normalize_title(
+                "MENSAGEM GABGOV/MSnº 57, de 26 de Novembro de 2012."
+            )
+            == "MENSAGEM GABGOV/MS nº 57, de 26 de Novembro de 2012."
+        )
+        assert (
+            MSAlemsScraper._normalize_title(
+                "RESOLUÇÃO SEGOV/MSnº 81, de 23 de Novembro de 2012."
+            )
+            == "RESOLUÇÃO SEGOV/MS nº 81, de 23 de Novembro de 2012."
+        )
+        assert (
+            MSAlemsScraper._normalize_title(
+                "DECRETO Nº 13.488, DE 6 DE SETEMBRO DE 2012."
+            )
+            == "DECRETO Nº 13.488, DE 6 DE SETEMBRO DE 2012."
+        )
+
+
+class TestFetchDominoCleaning:
+    @pytest.mark.asyncio
+    async def test_unwraps_layout_tables_preserves_data_tables_and_cleans_chrome(self):
+        scraper = _make_scraper()
+        html = """
+        <html><body>
+        <form action="">
+          <table border="1" cellspacing="2" cellpadding="2">
+            <tr>
+              <td><a href="" onclick="return _doClick('x/$V5ACTIONS/0.1', this, null)"><img src="/icons/actn112.gif"/> Sair</a></td>
+              <td><a href="/doc?EditDocument"><img src="/icons/actn005.gif"/> Editar</a></td>
+              <td><a href="" onclick="return _doClick('x/$V5ACTIONS/0.2', this, null)">Excluir</a></td>
+              <td><a href="/open?OpenForm">Novo Anexo</a></td>
+            </tr>
+          </table>
+          <hr>
+          <ul><ul>
+            <b><i><font face="Tahoma">(*) ESTE TEXTO NÃO SUBSTITUI O ORIGINAL PUBLICADO NO DIÁRIO OFICIAL DO ESTADO.</font></i></b><br>
+            <table border="0"><tr><td><div><b><font face="Tahoma">ESTADO DE MATO GROSSO DO SUL</font></b></div></td></tr></table>
+            <table border="0"><tr><td>
+              <b><font face="Tahoma">DECRETO N<s><font>º</font></s> 13.442, DE 5 DE JUNHO DE 2012.</font></b>
+              <table border="0"><tr><td><img src="/icons/ecblank.gif"/></td><td><i><font face="Tahoma">Dispõe sobre cadastros ambientais.</font></i></td></tr></table>
+              <font face="Tahoma">Notas:</font><br>
+              <b><font face="Tahoma">Publicada no Diário Oficial.</font></b><br>
+            </td></tr></table>
+          </ul></ul>
+          <table border="0">
+            <tr><td>
+              <font face="Tahoma">O GOVERNADOR DO ESTADO DE MATO GROSSO DO SUL decreta:</font><br><br>
+              <font face="Tahoma">Art. 1<s><font>º</font></s> Ficam aprovadas as tabelas do Anexo I.</font><br><br>
+              <font face="Tahoma">Art. 2<s><font>º</font></s> Este Decreto entra em vigor na data de sua publicação.</font><br><br>
+              <table border="1">
+                <tr><th>Código</th><th>Categoria</th></tr>
+                <tr><td>01</td><td>Extração e Tratamento de Minerais</td></tr>
+                <tr><td>02</td><td>Indústria Química</td></tr>
+              </table>
+              <a href="/appls/legislacao/secoge/govato.nsf/0/abc/$FILE/anexo.doc"><img src="/icons/fileatt.gif"/><br>anexo.doc</a>
+            </td></tr>
+          </table>
+        </form>
+        </body></html>
+        """
+        url = "https://aacpdappls.net.ms.gov.br/appls/legislacao/secoge/govato.nsf/0/abc?OpenDocument"
+        scraper.http.request = AsyncMock(return_value=make_mock_response(html))
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Decreto",
+                "title": "DECRETO Nº 13.442, DE 5 DE JUNHO DE 2012.",
+                "summary": "Dispõe sobre cadastros ambientais.",
+                "situation": "Não consta",
+                "_html_link": url,
+            }
+        )
+        assert doc is not None
+        md = doc.text_markdown
+        # Domino toolbar, disclaimer, and state banner stripped.
+        assert "Sair" not in md
+        assert "Novo Anexo" not in md
+        assert "ESTE TEXTO NÃO SUBSTITUI" not in md
+        assert "ESTADO DE MATO GROSSO DO SUL\n" not in md
+        # Layout tables unwrapped so Art. 1º and Art. 2º are on separate lines (not pipe-collapsed).
+        assert any("Art. 1º" in ln and "Art. 2º" not in ln for ln in md.splitlines())
+        assert "Art. 2º" in md
+        # Real border="1" data table preserved!
+        assert re.search(r"\|\s*01\s*\|\s*Extração e Tratamento de Minerais\s*\|", md)
+        assert re.search(r"\|\s*02\s*\|\s*Indústria Química\s*\|", md)
+        # $FILE attachment icon link does not produce broken image syntax.
+        assert "![anexo.doc]" not in md
+        assert "/$FILE/" not in md
+        assert "anexo.doc" in md
+        # Strikethrough ordinals cleaned.
+        assert "~~º~~" not in md

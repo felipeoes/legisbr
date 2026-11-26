@@ -35,7 +35,8 @@ _EMENTA_STRUCTURAL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _DISCLAIMER_LINE_RE = re.compile(
-    "\\n?Est[ea]\\s+texto\\s+n[aã]o\\s+substitui[^\\n]*", re.IGNORECASE
+    r"\n?[ \t]*(?:\*{1,3}[ \t]*)?Est[ea]\s+texto\s+n[aã]o\s+substitui[^\n]*",
+    re.IGNORECASE,
 )
 
 

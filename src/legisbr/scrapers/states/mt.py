@@ -10,7 +10,9 @@ from bs4 import BeautifulSoup
 
 from legisbr.core.convert import (
     calc_pages,
+    clean_norm_soup,
     infer_type_by_prefix,
+    remove_summary_element,
     strip_html_chrome,
     valid_markdown,
 )
@@ -245,29 +247,29 @@ class MTAlmtScraper(BaseScraper):
         author = ficha_soup.find("strong", string=re.compile("Autor:|Autores:"))
         if author:
             author = author.find_parent("li").text
-            author = re.sub("Autor:|Autores:", "", author).strip()
+            author = " ".join(re.sub("Autor:|Autores:", "", author).split())
         publication = ficha_soup.find("strong", string="Publicação:")
         if publication:
-            publication = (
-                publication.find_parent("li").text.replace("Publicação:", "").strip()
+            publication = " ".join(
+                publication.find_parent("li").text.replace("Publicação:", "").split()
             )
         date = ficha_soup.find("strong", string="Data da promulgação:")
         if date:
-            date = (
-                date.find_parent("li").text.replace("Data da promulgação:", "").strip()
+            date = " ".join(
+                date.find_parent("li").text.replace("Data da promulgação:", "").split()
             )
         subject_regex = re.compile("Assunto:|Assuntos:")
         subject = ficha_soup.find("strong", string=subject_regex)
         if subject:
             subject = subject.find_parent("li").text
-            subject = re.sub(subject_regex, "", subject).strip()
+            subject = " ".join(re.sub(subject_regex, "", subject).split())
         tags = ficha_soup.find("strong", string="Tags:")
         if tags:
-            tags = tags.find_parent("li").text.replace("Tags:", "").strip()
+            tags = " ".join(tags.find_parent("li").text.replace("Tags:", "").split())
         situation = ficha_soup.find("strong", string="Situação:")
         if situation:
-            situation = (
-                situation.find_parent("li").text.replace("Situação:", "").strip()
+            situation = " ".join(
+                situation.find_parent("li").text.replace("Situação:", "").split()
             )
         frame = compilado_soup.find("turbo-frame")
         if not frame:
@@ -279,7 +281,18 @@ class MTAlmtScraper(BaseScraper):
             if (rule := header.find_next_sibling("hr")) is not None:
                 rule.decompose()
             header.decompose()
+        # ALMT footer uses a misspelled <spam id="rodape-norma-juridica"> tag.
+        for rodape in list(frame.find_all(id="rodape-norma-juridica")):
+            rodape.decompose()
         strip_html_chrome(frame)
+        clean_norm_soup(frame, remove_disclaimers=True, unwrap_links=True)
+        summary = doc_info.get("summary", "")
+        if summary:
+            for _ in range(2):
+                before = len(frame.find_all(True))
+                remove_summary_element(frame, summary)
+                if len(frame.find_all(True)) == before:
+                    break
         html_str = str(frame)
         text_markdown = await self.markdown(html=html_str)
         valid, reason = valid_markdown(text_markdown)
