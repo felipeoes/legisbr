@@ -13,7 +13,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.ba import SITUATIONS, TYPES, BahiaLegislaScraper
+from legisbr.scrapers.states.ba import SITUATIONS, TYPES, BahiaLegislaScraper
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "bahia"
 

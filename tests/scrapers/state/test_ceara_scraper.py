@@ -12,8 +12,8 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.core.http import HttpError
-from src.scrapers.states.ce import SITUATIONS, TYPES, CearaAleceScraper
+from legisbr.core.http import HttpError
+from legisbr.scrapers.states.ce import SITUATIONS, TYPES, CearaAleceScraper
 
 
 def _make_scraper(**kwargs) -> CearaAleceScraper:

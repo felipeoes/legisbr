@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from conftest import make_scraper
 from parser_assertions import TypesConstantTests
 
-from src.scrapers.states.ma import TYPES, JSFFormState, MaranhaoAlemaScraper
+from legisbr.scrapers.states.ma import TYPES, JSFFormState, MaranhaoAlemaScraper
 
 
 class FakeResponse:

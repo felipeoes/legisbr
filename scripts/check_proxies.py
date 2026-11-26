@@ -17,9 +17,9 @@ from pathlib import Path
 import aiohttp
 from aiohttp_socks import ProxyConnector
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
-from src.core.http import HttpClient  # noqa: E402  (needs the repo root on the path)
-from src.core.proxy import _with_scheme  # noqa: E402
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
+from legisbr.core.http import HttpClient  # noqa: E402  (needs the src root on the path)
+from legisbr.core.proxy import _with_scheme  # noqa: E402
 
 ECHO_URL = "https://api.ipify.org"
 SITE_URL = "https://www.legislacao.pr.gov.br/legislacao/pesquisarAto.do?action=exibir&codAto=342000"

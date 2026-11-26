@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 import main
-from src.core.scraper import BaseScraper
-from src.registry import SCRAPERS, ScraperSpec
+from legisbr.core.scraper import BaseScraper
+from legisbr.registry import SCRAPERS, ScraperSpec
 
 
 def test_selection_aliases_and_unknown_names():
@@ -68,7 +68,7 @@ async def test_cleanup_failure_sets_exit_one(tmp_path, monkeypatch):
         "SCRAPERS",
         [ScraperSpec(BrokenCleanup, ("bad",), 2024, save_dir=tmp_path)],
     )
-    monkeypatch.setattr("src.core.scraper.LOG_DIR", tmp_path)
+    monkeypatch.setattr("legisbr.core.scraper.LOG_DIR", tmp_path)
     assert await main.main(["run", "-s", "bad"]) == 1
 
 
@@ -163,7 +163,7 @@ async def test_cancelled_runner_terminates_its_children(tmp_path, monkeypatch):
 async def test_stats_command_prints_latest_run_per_archive(
     tmp_path, monkeypatch, capsys
 ):
-    from src.core.store import Store
+    from legisbr.core.store import Store
 
     spec = replace(SCRAPERS[3], save_dir=tmp_path)
     async with Store(spec.database) as store:

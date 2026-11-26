@@ -10,8 +10,8 @@ from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests
 
-from src.core.scraper import DEFAULT_VALID_SITUATION
-from src.scrapers.states.pa import TYPES, ParaAlepaScraper
+from legisbr.core.scraper import DEFAULT_VALID_SITUATION
+from legisbr.scrapers.states.pa import TYPES, ParaAlepaScraper
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "para"
 
@@ -147,8 +147,8 @@ class TestFetch:
 
 @pytest.mark.integration
 async def test_live_listing_2012_lei_complementar():
-    from src.core.http import HttpClient
-    from src.core.store import Store
+    from legisbr.core.http import HttpClient
+    from legisbr.core.store import Store
 
     async with ParaAlepaScraper(
         store=Store(":memory:"), http=HttpClient(rps=2), years=range(2012, 2013)

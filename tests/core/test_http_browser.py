@@ -6,8 +6,8 @@ import aiohttp
 import pytest
 from aiohttp_socks import ProxyConnectionError
 
-from src.core.browser import BrowserPool
-from src.core.http import HttpClient, HttpError, Response
+from legisbr.core.browser import BrowserPool
+from legisbr.core.http import HttpClient, HttpError, Response
 
 
 def test_response_encoding_filename_and_json():
@@ -92,7 +92,7 @@ async def test_http_errors_raise_after_retry_budget(status):
 async def test_body_read_is_inside_retry_and_response_is_released(monkeypatch):
     from tenacity import wait_none
 
-    import src.core.http as module
+    import legisbr.core.http as module
 
     monkeypatch.setattr(module, "wait_exponential", lambda **kw: wait_none())
     http = HttpClient(rps=1000, max_retries=2)
@@ -115,7 +115,7 @@ async def test_block_pause_holds_every_request_until_it_ends(monkeypatch):
     """Paraná answers 403 to a client that went too fast and blocks it for ~30 min."""
     from tenacity import wait_none
 
-    import src.core.http as module
+    import legisbr.core.http as module
 
     monkeypatch.setattr(module, "wait_exponential", lambda **kw: wait_none())
     # 10 rps: the second request is still waiting on the limiter when the 403 lands.
@@ -208,7 +208,7 @@ async def test_cancelled_page_wait_does_not_create_overflow():
 
 
 def _proxy_service(tmp_path, *proxies: str):
-    from src.core.proxy import ProxyService
+    from legisbr.core.proxy import ProxyService
 
     path = tmp_path / "proxies.txt"
     path.write_text("\n".join(proxies))
@@ -276,7 +276,7 @@ async def test_failed_proxy_rests_and_the_retry_uses_the_next(
 ):
     from tenacity import wait_none
 
-    import src.core.http as module
+    import legisbr.core.http as module
 
     monkeypatch.setattr(module, "wait_exponential", lambda **kw: wait_none())
     service = _proxy_service(tmp_path, "http://a:1", "http://b:2")
@@ -302,7 +302,7 @@ async def test_proxied_connections_verify_certificates(monkeypatch):
     """Free proxies are untrusted; without verification one could rewrite documents."""
     import ssl
 
-    import src.core.http as module
+    import legisbr.core.http as module
 
     from_url = MagicMock(side_effect=lambda url, **kw: aiohttp.TCPConnector())
     monkeypatch.setattr(module.ProxyConnector, "from_url", from_url)

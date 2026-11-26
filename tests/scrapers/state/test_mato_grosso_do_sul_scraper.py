@@ -11,8 +11,8 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.core.scraper import DEFAULT_INVALID_SITUATION
-from src.scrapers.states.ms import SITUATIONS, TYPES, MSAlemsScraper
+from legisbr.core.scraper import DEFAULT_INVALID_SITUATION
+from legisbr.scrapers.states.ms import SITUATIONS, TYPES, MSAlemsScraper
 
 _NSF_BASE = "/appls/legislacao/secoge/govato.nsf"
 
@@ -185,7 +185,7 @@ class TestEntryText:
 
 @pytest.mark.parametrize("stage", ["categories", "entries"])
 async def test_malformed_view_xml_fails_instead_of_empty_year(stage):
-    from src.core.http import Response
+    from legisbr.core.http import Response
 
     good = _make_category_xml([(2012, 1, 2)])
     bodies = (

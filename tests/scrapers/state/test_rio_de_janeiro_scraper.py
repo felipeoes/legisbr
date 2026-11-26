@@ -8,7 +8,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.rj import SITUATIONS, TYPES, RJAlerjScraper
+from legisbr.scrapers.states.rj import SITUATIONS, TYPES, RJAlerjScraper
 
 
 def _make_scraper(**kwargs) -> RJAlerjScraper:

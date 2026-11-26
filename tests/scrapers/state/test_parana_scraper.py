@@ -9,8 +9,8 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.core.scraper import DEFAULT_INVALID_SITUATION, DEFAULT_VALID_SITUATION
-from src.scrapers.states.pr import SITUATIONS, TYPES, ParanaCVScraper
+from legisbr.core.scraper import DEFAULT_INVALID_SITUATION, DEFAULT_VALID_SITUATION
+from legisbr.scrapers.states.pr import SITUATIONS, TYPES, ParanaCVScraper
 
 
 def _make_scraper(**kwargs) -> ParanaCVScraper:

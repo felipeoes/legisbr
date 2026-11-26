@@ -10,7 +10,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.es import (
+from legisbr.scrapers.states.es import (
     _AUTH_FOOTER_RE,
     _DISCLAIMER_RE,
     INVALID_SITUATIONS,

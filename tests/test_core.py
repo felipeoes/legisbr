@@ -11,8 +11,8 @@ import asyncio
 
 import pytest
 
-from src.core.http import RateLimiter
-from src.core.ocr import clean_md_tag
+from legisbr.core.http import RateLimiter
+from legisbr.core.ocr import clean_md_tag
 
 
 class TestCleanMdTag:
@@ -132,41 +132,41 @@ class TestBaseScraperHelpers:
     """Test BaseScraper static/class methods and utilities without full init."""
 
     def test_detect_extension_pdf(self):
-        from src.core.convert import detect_extension
+        from legisbr.core.convert import detect_extension
 
         assert detect_extension("application/pdf") == ".pdf"
 
     def test_detect_extension_html(self):
-        from src.core.convert import detect_extension
+        from legisbr.core.convert import detect_extension
 
         assert detect_extension("text/html") == ".html"
 
     def test_detect_extension_from_filename(self):
-        from src.core.convert import detect_extension
+        from legisbr.core.convert import detect_extension
 
         assert detect_extension("", "document.docx") == ".docx"
 
     def test_detect_extension_unknown(self):
-        from src.core.convert import detect_extension
+        from legisbr.core.convert import detect_extension
 
         assert detect_extension("application/octet-stream") == ".bin"
 
     def test_valid_markdown_empty(self):
-        from src.core.convert import valid_markdown
+        from legisbr.core.convert import valid_markdown
 
         valid, reason = valid_markdown(None)
         assert not valid
         assert "None or empty" in reason
 
     def test_valid_markdown_too_short(self):
-        from src.core.convert import valid_markdown
+        from legisbr.core.convert import valid_markdown
 
         valid, reason = valid_markdown("Short text", min_length=50)
         assert not valid
         assert "too short" in reason
 
     def test_valid_markdown_server_error(self):
-        from src.core.convert import valid_markdown
+        from legisbr.core.convert import valid_markdown
 
         text = "The requested URL was not found on this server. " * 5
         valid, reason = valid_markdown(text)
@@ -174,7 +174,7 @@ class TestBaseScraperHelpers:
         assert "server error" in reason
 
     def test_valid_markdown_dotnet_error(self):
-        from src.core.convert import valid_markdown
+        from legisbr.core.convert import valid_markdown
 
         text = "Object reference not set to an instance of an object\nNossa equipe resolverá o problema, você pode tentar mais tarde."
         valid, reason = valid_markdown(text)
@@ -182,7 +182,7 @@ class TestBaseScraperHelpers:
         assert "server error" in reason
 
     def test_valid_markdown_ok(self):
-        from src.core.convert import valid_markdown
+        from legisbr.core.convert import valid_markdown
 
         text = "Art. 1º Esta lei dispõe sobre a organização básica do Estado. " * 3
         valid, reason = valid_markdown(text)
@@ -190,19 +190,19 @@ class TestBaseScraperHelpers:
         assert reason == ""
 
     def test_wrap_html(self):
-        from src.core.convert import wrap_html
+        from legisbr.core.convert import wrap_html
 
         assert wrap_html("<p>Hello</p>") == "<html><body><p>Hello</p></body></html>"
 
     def test_clean_markdown_strips_links(self):
-        from src.core.convert import clean_markdown
+        from legisbr.core.convert import clean_markdown
 
         result = clean_markdown("[link text](http://example.com)")
         assert result == "link text"
         assert "http" not in result
 
     def test_clean_markdown_custom_replacements(self):
-        from src.core.convert import clean_markdown
+        from legisbr.core.convert import clean_markdown
 
         result = clean_markdown("HEADER text content", replace=[("HEADER", "")])
         assert "HEADER" not in result

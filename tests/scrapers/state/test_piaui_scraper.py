@@ -15,7 +15,7 @@ import pytest
 from conftest import make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests
 
-from src.scrapers.states.pi import TYPES, PiauiAlepiScraper
+from legisbr.scrapers.states.pi import TYPES, PiauiAlepiScraper
 
 
 def _make_scraper(**kwargs) -> PiauiAlepiScraper:

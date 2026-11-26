@@ -11,7 +11,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.mt import HISTORIC_TYPES, SITUATIONS, TYPES, MTAlmtScraper
+from legisbr.scrapers.states.mt import HISTORIC_TYPES, SITUATIONS, TYPES, MTAlmtScraper
 
 
 def _make_scraper(**kwargs) -> MTAlmtScraper:

@@ -3,7 +3,7 @@
 from bs4 import BeautifulSoup
 from conftest import make_scraper
 
-from src.scrapers.federal.camara import TYPES, CamaraDepScraper
+from legisbr.scrapers.federal.camara import TYPES, CamaraDepScraper
 
 TEST_YEAR = 2020
 TEST_TYPE = "Decreto"

@@ -8,8 +8,8 @@ from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests
 
-from src.core.http import HttpError
-from src.scrapers.states.pe import TYPES, PernambucoAlepeScraper
+from legisbr.core.http import HttpError
+from legisbr.scrapers.states.pe import TYPES, PernambucoAlepeScraper
 
 
 def _make_scraper(**kwargs) -> PernambucoAlepeScraper:
@@ -123,7 +123,7 @@ class TestClassAttributes(ScraperClassTests):
     STATE_NAME = "Pernambuco"
 
     def test_uses_string_not_text_in_bs4_calls(self):
-        import src.scrapers.states.pe as mod
+        import legisbr.scrapers.states.pe as mod
 
         source = inspect.getsource(mod)
         tree = ast.parse(source)

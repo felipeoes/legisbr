@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.core.browser import BrowserPool
-from src.core.http import HttpClient, Response
-from src.core.store import Store
+from legisbr.core.browser import BrowserPool
+from legisbr.core.http import HttpClient, Response
+from legisbr.core.store import Store
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 @pytest.fixture(autouse=True)
 def inline_pdf_work(monkeypatch):
     """Unit tests convert PDFs inline so monkeypatches reach the conversion code."""
-    from src.core import convert
+    from legisbr.core import convert
 
     async def inline(function, *args):
         return function(*args)

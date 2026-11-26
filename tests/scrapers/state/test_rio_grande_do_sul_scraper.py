@@ -12,7 +12,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.rs import SITUATIONS, TYPES, RSAlrsScraper
+from legisbr.scrapers.states.rs import SITUATIONS, TYPES, RSAlrsScraper
 
 
 def _make_scraper(**kwargs) -> RSAlrsScraper:
@@ -130,7 +130,7 @@ class TestCleanRsMarkdown:
         A subprocess is the only reliable timeout: the regex holds the GIL.
         """
         code = (
-            "from src.scrapers.states.rs import RSAlrsScraper as S; "
+            "from legisbr.scrapers.states.rs import RSAlrsScraper as S; "
             "S._clean_rs_markdown('![](data:,' + 'A' * 1_000_000 + ')')"
         )
         subprocess.run([sys.executable, "-c", code], timeout=10, check=True)

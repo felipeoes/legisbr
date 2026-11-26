@@ -7,7 +7,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.df import (
+from legisbr.scrapers.states.df import (
     INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,

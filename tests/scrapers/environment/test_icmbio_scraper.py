@@ -6,7 +6,7 @@ import fitz
 import pytest
 from conftest import make_mock_response, make_scraper
 
-from src.scrapers.environment.icmbio import (
+from legisbr.scrapers.environment.icmbio import (
     COLUMNS,
     DATASET_ID,
     MODEL_ID,
@@ -359,13 +359,13 @@ class TestICMBioFetchPage:
     def _mock_response(self, status=200, body=None):
         import json
 
-        from src.core.http import Response
+        from legisbr.core.http import Response
 
         return Response("url", status, {}, json.dumps(body or {}).encode())
 
     @pytest.mark.asyncio
     async def test_http_failure_propagates(self):
-        from src.core.http import HttpError
+        from legisbr.core.http import HttpError
 
         scraper = self._make_scraper(None)
         scraper.http.request.side_effect = HttpError("url", 503, "unavailable")
@@ -418,7 +418,7 @@ class TestICMBioFetchPage:
 
     @pytest.mark.asyncio
     async def test_invalid_json_raises(self):
-        from src.core.http import Response
+        from legisbr.core.http import Response
 
         scraper = self._make_scraper(
             Response("url", 200, {}, b"<html>Server error</html>")

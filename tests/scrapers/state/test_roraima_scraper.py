@@ -24,7 +24,7 @@ Run with:
 from conftest import make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests
 
-from src.scrapers.states.rr import TYPES, RoraimaAlerScraper
+from legisbr.scrapers.states.rr import TYPES, RoraimaAlerScraper
 
 
 def _make_scraper(**kwargs) -> RoraimaAlerScraper:

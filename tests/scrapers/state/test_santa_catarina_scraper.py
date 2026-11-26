@@ -9,7 +9,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.sc import SITUATIONS, TYPES, SantaCatarinaScraper
+from legisbr.scrapers.states.sc import SITUATIONS, TYPES, SantaCatarinaScraper
 
 
 def _make_scraper(**kwargs) -> SantaCatarinaScraper:

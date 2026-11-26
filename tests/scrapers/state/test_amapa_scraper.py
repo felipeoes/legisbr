@@ -6,8 +6,8 @@ import pytest
 from conftest import make_mock_response, make_scraper
 from parser_assertions import TypesConstantTests
 
-from src.core.scraper import DEFAULT_VALID_SITUATION
-from src.scrapers.states.ap import TYPES, AmapaAlapScraper
+from legisbr.core.scraper import DEFAULT_VALID_SITUATION
+from legisbr.scrapers.states.ap import TYPES, AmapaAlapScraper
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "amapa"
 PORTAL = "https://elegis.al.ap.leg.br/portal"

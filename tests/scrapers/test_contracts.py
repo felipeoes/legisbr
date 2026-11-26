@@ -7,23 +7,23 @@ from bs4 import BeautifulSoup
 from conftest import make_mock_json_response, make_mock_response, make_scraper
 from test_store import document
 
-from src.core.document import Document
-from src.core.http import HttpError
-from src.core.scraper import DEFAULT_VALID_SITUATION
-from src.registry import SCRAPERS
-from src.scrapers.environment.conama import ConamaScraper
-from src.scrapers.environment.icmbio import ICMBioScraper
-from src.scrapers.states.ac import AcreLegisScraper
-from src.scrapers.states.am import LegislaAMScraper
-from src.scrapers.states.ap import AmapaAlapScraper
-from src.scrapers.states.ba import BahiaLegislaScraper
-from src.scrapers.states.ce import CearaAleceScraper
-from src.scrapers.states.df import DFSinjScraper
-from src.scrapers.states.es import ESAlesScraper
-from src.scrapers.states.ms import MSAlemsScraper
-from src.scrapers.states.pr import ParanaCVScraper
-from src.scrapers.states.rs import RSAlrsScraper
-from src.scrapers.states.sp import SaoPauloAlespScraper
+from legisbr.core.document import Document
+from legisbr.core.http import HttpError
+from legisbr.core.scraper import DEFAULT_VALID_SITUATION
+from legisbr.registry import SCRAPERS
+from legisbr.scrapers.environment.conama import ConamaScraper
+from legisbr.scrapers.environment.icmbio import ICMBioScraper
+from legisbr.scrapers.states.ac import AcreLegisScraper
+from legisbr.scrapers.states.am import LegislaAMScraper
+from legisbr.scrapers.states.ap import AmapaAlapScraper
+from legisbr.scrapers.states.ba import BahiaLegislaScraper
+from legisbr.scrapers.states.ce import CearaAleceScraper
+from legisbr.scrapers.states.df import DFSinjScraper
+from legisbr.scrapers.states.es import ESAlesScraper
+from legisbr.scrapers.states.ms import MSAlemsScraper
+from legisbr.scrapers.states.pr import ParanaCVScraper
+from legisbr.scrapers.states.rs import RSAlrsScraper
+from legisbr.scrapers.states.sp import SaoPauloAlespScraper
 
 TEXT = (
     "Art. 1º Esta lei estabelece regras de organização da administração pública. " * 5
@@ -346,7 +346,7 @@ async def test_rs_fetch_defaults_status_and_resolves_relative_pdf():
     [("", DEFAULT_VALID_SITUATION), ('<p class="situacao">Revogada</p>', "Revogada")],
 )
 async def test_rj_status_scoped_before_cleaning(status, expected):
-    from src.scrapers.states.rj import RJAlerjScraper
+    from legisbr.scrapers.states.rj import RJAlerjScraper
 
     scraper = make_scraper(RJAlerjScraper)
     html = f'<div id="divConteudo">{status}<p>{TEXT}</p><p>Revogado apenas o artigo anterior.</p></div>'

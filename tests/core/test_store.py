@@ -4,8 +4,8 @@ import tracemalloc
 
 import pytest
 
-from src.core.document import Document
-from src.core.store import Store
+from legisbr.core.document import Document
+from legisbr.core.store import Store
 
 
 def document(**kwargs) -> Document:

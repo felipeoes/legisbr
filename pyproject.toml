@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "legislation-scraper"
 version = "0.1.0"
@@ -34,8 +38,24 @@ dev = [
     "ruff>=0.15.7",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/legisbr"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "proxies*.txt",
+    "logs/",
+    "outputs/",
+    ".gemini/",
+    ".claude/",
+    "docs/",
+    ".env*",
+    ".playwright/",
+    ".vscode/",
+]
+
 [tool.pyright]
-include = ["src", "main.py"]
+include = ["src/legisbr", "main.py"]
 typeCheckingMode = "basic"
 pythonVersion = "3.14"
 

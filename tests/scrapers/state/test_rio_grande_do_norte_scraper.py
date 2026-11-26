@@ -13,7 +13,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.rn import SITUATIONS, TYPES, RNAlrnScraper
+from legisbr.scrapers.states.rn import SITUATIONS, TYPES, RNAlrnScraper
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "rio_grande_do_norte"
 
@@ -214,8 +214,8 @@ class TestPagination:
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_2012_listing_has_every_page():
-    from src.core.http import HttpClient
-    from src.core.store import Store
+    from legisbr.core.http import HttpClient
+    from legisbr.core.store import Store
 
     async with RNAlrnScraper(
         store=Store(":memory:"), http=HttpClient(rps=2), years=range(2012, 2013)

@@ -11,8 +11,8 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.core.http import HttpError, Response
-from src.scrapers.states.am import SITUATIONS, TYPES, LegislaAMScraper
+from legisbr.core.http import HttpError, Response
+from legisbr.scrapers.states.am import SITUATIONS, TYPES, LegislaAMScraper
 
 
 def _make_scraper(**kwargs) -> LegislaAMScraper:

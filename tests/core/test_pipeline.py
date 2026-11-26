@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock
 
 from test_store import document
 
-from src.core.http import HttpClient, HttpError
-from src.core.scraper import BaseScraper
-from src.core.store import Store
+from legisbr.core.http import HttpClient, HttpError
+from legisbr.core.scraper import BaseScraper
+from legisbr.core.store import Store
 
 
 class Scraper(BaseScraper):
@@ -44,7 +44,7 @@ async def test_bounded_workers_year_isolation_and_global_resume():
 
 
 async def test_cleanup_attempts_every_resource(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.core.scraper.LOG_DIR", tmp_path)
+    monkeypatch.setattr("legisbr.core.scraper.LOG_DIR", tmp_path)
     http = HttpClient()
     http.close = AsyncMock(side_effect=RuntimeError("close failed"))
     browser = AsyncMock()

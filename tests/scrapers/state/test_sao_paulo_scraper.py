@@ -13,7 +13,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.sp import (
+from legisbr.scrapers.states.sp import (
     INVALID_SITUATIONS,
     SITUATIONS,
     TYPES,
@@ -212,8 +212,8 @@ class TestFetch:
 
 @pytest.mark.integration
 async def test_live_2012_listing_matches_type_counts():
-    from src.core.http import HttpClient
-    from src.core.store import Store
+    from legisbr.core.http import HttpClient
+    from legisbr.core.store import Store
 
     async with SaoPauloAlespScraper(
         store=Store(":memory:"), http=HttpClient(rps=2), years=range(2012, 2013)

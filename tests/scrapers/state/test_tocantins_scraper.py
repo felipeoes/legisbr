@@ -8,7 +8,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.to import SITUATIONS, TYPES, TocantinsScraper
+from legisbr.scrapers.states.to import SITUATIONS, TYPES, TocantinsScraper
 
 
 def _make_scraper(**kwargs) -> TocantinsScraper:

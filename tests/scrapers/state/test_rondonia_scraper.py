@@ -8,7 +8,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.ro import SITUATIONS, TYPES, RondoniaCotelScraper
+from legisbr.scrapers.states.ro import SITUATIONS, TYPES, RondoniaCotelScraper
 
 
 def _make_scraper(**kwargs) -> RondoniaCotelScraper:

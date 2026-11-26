@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 from conftest import make_scraper
 from parser_assertions import TypesConstantTests
 
-from src.scrapers.states.al import TYPES, AlagoasSefazScraper
+from legisbr.scrapers.states.al import TYPES, AlagoasSefazScraper
 
 
 def _make_scraper(**kwargs) -> AlagoasSefazScraper:

@@ -10,8 +10,8 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.core.scraper import DEFAULT_VALID_SITUATION
-from src.scrapers.states.mg import SITUATIONS, TYPES, MGAlmgScraper
+from legisbr.core.scraper import DEFAULT_VALID_SITUATION
+from legisbr.scrapers.states.mg import SITUATIONS, TYPES, MGAlmgScraper
 
 
 def _make_scraper(**kwargs) -> MGAlmgScraper:

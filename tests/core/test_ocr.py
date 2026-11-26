@@ -5,7 +5,7 @@ import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 
-from src.core.ocr import OCR, OCRError, OCROutput
+from legisbr.core.ocr import OCR, OCRError, OCROutput
 
 
 def pdf_bytes():
@@ -84,7 +84,7 @@ async def test_live_usage_cost_can_be_saved_to_sqlite() -> None:
 
     from pydantic_ai.usage import RunUsage
 
-    from src.core.store import Store
+    from legisbr.core.store import Store
 
     ocr = OCR("test")
     ocr._scoped_usage["live"]["claude-haiku-5-5"] = RunUsage(

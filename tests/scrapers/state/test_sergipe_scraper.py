@@ -9,10 +9,10 @@ import pytest
 from conftest import make_scraper
 from parser_assertions import ScraperClassTests
 
-from src.core.document import Document
-from src.core.http import Response
-from src.core.scraper import DEFAULT_VALID_SITUATION
-from src.scrapers.states.se import (
+from legisbr.core.document import Document
+from legisbr.core.http import Response
+from legisbr.core.scraper import DEFAULT_VALID_SITUATION
+from legisbr.scrapers.states.se import (
     API_URL,
     INVALID_SITUATIONS,
     SITUATIONS,

@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
 from parser_assertions import TypesConstantTests
 
-from src.scrapers.states.ac import TYPES, AcreLegisScraper
+from legisbr.scrapers.states.ac import TYPES, AcreLegisScraper
 
 
 def _make_scraper(**kwargs) -> AcreLegisScraper:

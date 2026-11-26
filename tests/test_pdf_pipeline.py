@@ -3,8 +3,8 @@
 import fitz
 import pytest
 
-from src.core.convert import _in_process as REAL_IN_PROCESS
-from src.core.convert import is_pdf_scanned
+from legisbr.core.convert import _in_process as REAL_IN_PROCESS
+from legisbr.core.convert import is_pdf_scanned
 
 
 def _make_digital_pdf(
@@ -95,7 +95,7 @@ class TestIsPdfScanned:
 
 
 async def test_digital_pdf_conversion_and_plain_fallback(monkeypatch):
-    from src.core import convert
+    from legisbr.core import convert
 
     pdf = _make_digital_pdf("Art. 1 - " + "Texto legal para a administracao. " * 8)
     result = await convert.pdf_to_markdown(pdf)
@@ -109,8 +109,8 @@ async def test_digital_pdf_conversion_and_plain_fallback(monkeypatch):
 async def test_scan_requires_ocr_and_failure_propagates():
     from unittest.mock import AsyncMock
 
-    from src.core.convert import pdf_to_markdown
-    from src.core.ocr import OCRError
+    from legisbr.core.convert import pdf_to_markdown
+    from legisbr.core.ocr import OCRError
 
     pdf = _make_scanned_pdf()
     with pytest.raises(ValueError, match="needs OCR"):
@@ -135,7 +135,7 @@ async def test_html_preserves_images_including_empty_containers(tag):
 
     from bs4 import BeautifulSoup
 
-    from src.core.convert import clean_norm_soup, html_to_markdown
+    from legisbr.core.convert import clean_norm_soup, html_to_markdown
 
     html = str(
         clean_norm_soup(BeautifulSoup(f'<div><a href="other">{tag}</a></div>', "lxml"))
@@ -167,7 +167,7 @@ NAME_LIST = (
 async def test_garbage_text_layer_goes_to_ocr(text, ocr_called):
     from unittest.mock import AsyncMock
 
-    from src.core.convert import pdf_to_markdown
+    from legisbr.core.convert import pdf_to_markdown
 
     ocr = AsyncMock()
     ocr.pdf.return_value = "Art. 1º Texto reconhecido pelo modelo. " * 5
@@ -177,7 +177,7 @@ async def test_garbage_text_layer_goes_to_ocr(text, ocr_called):
 
 
 async def test_garbage_text_layer_is_kept_without_ocr():
-    from src.core.convert import pdf_to_markdown
+    from legisbr.core.convert import pdf_to_markdown
 
     assert "DEPUTADO" in await pdf_to_markdown(_make_digital_pdf(GARBAGE_LAYER * 4))
 
@@ -220,13 +220,13 @@ def _make_docx(paragraph: str) -> bytes:
     ],
 )
 def test_sniff_extension_trusts_content_over_names(content, ext):
-    from src.core.convert import sniff_extension
+    from legisbr.core.convert import sniff_extension
 
     assert sniff_extension(content) == ext
 
 
 async def test_docx_converts_through_html():
-    from src.core.convert import bytes_to_markdown
+    from legisbr.core.convert import bytes_to_markdown
 
     text = "Art. 1º Fica instituído o programa estadual de incentivo à leitura."
     result = await bytes_to_markdown(_make_docx(text), "", "https://x.org", None)
@@ -235,7 +235,7 @@ async def test_docx_converts_through_html():
 
 async def test_legacy_word_doc_fails_with_clear_error():
     """RS serves some norms as Word 97 files; html-to-markdown only reports NUL bytes."""
-    from src.core.convert import bytes_to_markdown
+    from legisbr.core.convert import bytes_to_markdown
 
     data = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 512
     with pytest.raises(ValueError, match="Legacy Word"):
@@ -245,7 +245,7 @@ async def test_legacy_word_doc_fails_with_clear_error():
 async def test_html_conversion_has_no_metadata_front_matter():
     from unittest.mock import AsyncMock
 
-    from src.core.convert import html_to_markdown
+    from legisbr.core.convert import html_to_markdown
 
     html = "<html><head><title>Portal</title></head><body><p>Art. 1º Texto.</p></body></html>"
     result = await html_to_markdown(html, "https://x.org", AsyncMock())
@@ -253,7 +253,7 @@ async def test_html_conversion_has_no_metadata_front_matter():
 
 
 async def test_pymupdf4llm_placeholder_headers_are_blanked(monkeypatch):
-    from src.core import convert
+    from legisbr.core import convert
 
     table = "|Col1|TABELA DE SUBSÍDIOS|Col3|\n|---|---|---|\n|CARGOS|A|B|\n"
     monkeypatch.setattr(convert, "_digital_pdf", lambda *a: table + "Texto. " * 30)
@@ -265,7 +265,7 @@ async def test_pymupdf4llm_placeholder_headers_are_blanked(monkeypatch):
 async def test_spacer_images_are_dropped_not_inlined():
     from unittest.mock import AsyncMock
 
-    from src.core.images import inline_images_in_html
+    from legisbr.core.images import inline_images_in_html
 
     spacer = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
     fetch = AsyncMock(side_effect=[spacer, _make_png_bytes()])
@@ -285,7 +285,7 @@ def _crash_worker() -> None:
 async def test_pdf_work_runs_in_processes_and_survives_a_crashed_worker():
     from concurrent.futures.process import BrokenProcessPool
 
-    from src.core import convert
+    from legisbr.core import convert
 
     pdf = _make_digital_pdf("Art. 1 - " + "Texto legal para a administracao. " * 8)
     assert "Art." in await REAL_IN_PROCESS(convert._pdf_text_layer, pdf, 0.1, True)
@@ -297,7 +297,7 @@ async def test_pdf_work_runs_in_processes_and_survives_a_crashed_worker():
 async def test_line_breaks_between_inline_elements_survive():
     from unittest.mock import AsyncMock
 
-    from src.core.convert import html_to_markdown
+    from legisbr.core.convert import html_to_markdown
 
     html = "<p><span>Art. 1º Fica criado;</span><br><span>Art. 2º Revoga-se.</span></p>"
     result = await html_to_markdown(html, "https://x.org", AsyncMock())
@@ -308,7 +308,7 @@ async def test_line_breaks_between_inline_elements_survive():
 async def test_law_text_inside_forms_and_hidden_blocks_is_kept(wrapper):
     from unittest.mock import AsyncMock
 
-    from src.core.convert import html_to_markdown
+    from legisbr.core.convert import html_to_markdown
 
     tag = wrapper.split()[0]
     html = f"<html><body><{wrapper}><div><p>Art. 1º Texto da lei.</p></div></{tag}></body></html>"
@@ -319,7 +319,7 @@ async def test_law_text_inside_forms_and_hidden_blocks_is_kept(wrapper):
 
 def test_c1_control_characters_become_their_windows_1252_meaning():
     # Goiás' API serves cp1252 punctuation decoded as Latin-1.
-    from src.core.convert import clean_markdown
+    from legisbr.core.convert import clean_markdown
 
     assert clean_markdown("XII \x96 elaborar \x93Regimento\x94\x81") == (
         "XII – elaborar “Regimento”"

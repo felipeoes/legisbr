@@ -2,10 +2,10 @@
 
 import pytest
 
-from src.core.document import Document
-from src.core.scraper import DEFAULT_VALID_SITUATION
-from src.scrapers.states.am import LegislaAMScraper
-from src.scrapers.states.ba import BahiaLegislaScraper
+from legisbr.core.document import Document
+from legisbr.core.scraper import DEFAULT_VALID_SITUATION
+from legisbr.scrapers.states.am import LegislaAMScraper
+from legisbr.scrapers.states.ba import BahiaLegislaScraper
 
 pytestmark = pytest.mark.integration
 

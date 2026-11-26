@@ -10,19 +10,19 @@ from pathlib import Path
 
 from loguru import logger
 
-from src.config import (
+from legisbr.config import (
     LLM_BATCH_SIZE,
     LLM_CONCURRENCY,
     LLM_MODEL,
     LLM_PDF_INPUT,
     build_proxy_config,
 )
-from src.core.browser import BrowserPool
-from src.core.http import HttpClient
-from src.core.ocr import OCR
-from src.core.proxy import ProxyService
-from src.core.store import Store
-from src.registry import SCRAPERS, ScraperSpec
+from legisbr.core.browser import BrowserPool
+from legisbr.core.http import HttpClient
+from legisbr.core.ocr import OCR
+from legisbr.core.proxy import ProxyService
+from legisbr.core.store import Store
+from legisbr.registry import SCRAPERS, ScraperSpec
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

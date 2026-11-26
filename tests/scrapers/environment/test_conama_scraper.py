@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from conftest import make_scraper
 from parser_assertions import TypesConstantTests
 
-from src.scrapers.environment.conama import TYPES, ConamaScraper
+from legisbr.scrapers.environment.conama import TYPES, ConamaScraper
 
 
 def _make_scraper(**kwargs) -> ConamaScraper:

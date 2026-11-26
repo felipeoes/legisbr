@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 from conftest import make_scraper
 
-from src.core.sapl import SAPLBaseScraper
+from legisbr.core.sapl import SAPLBaseScraper
 
 TYPES: dict[str, int] = {"Lei Ordinária": 2, "Lei Complementar": 1, "Decreto": 3}
 

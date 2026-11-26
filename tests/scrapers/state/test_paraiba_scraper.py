@@ -14,7 +14,7 @@ import pytest
 from conftest import make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests
 
-from src.scrapers.states.pb import TYPES, ParaibaAlpbScraper
+from legisbr.scrapers.states.pb import TYPES, ParaibaAlpbScraper
 
 
 def _make_scraper(**kwargs) -> ParaibaAlpbScraper:

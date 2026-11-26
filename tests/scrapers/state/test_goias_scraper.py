@@ -9,7 +9,7 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
-from src.scrapers.states.go import (
+from legisbr.scrapers.states.go import (
     _TYPE_ID_TO_SUFFIX,
     SITUATIONS,
     TYPES,
