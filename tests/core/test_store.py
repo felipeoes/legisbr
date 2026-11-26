@@ -1,11 +1,13 @@
 from __future__ import annotations
 import json
+import logging
 import sqlite3
 import tracemalloc
 
 import pytest
 
 from legisbr.core.document import Document
+from legisbr.core.sink import DocumentSink, ErrorRecord, NullSink
 from legisbr.core.store import Store
 
 
@@ -220,3 +222,112 @@ async def test_runs_keep_stats_and_old_archives_gain_the_column(tmp_path):
         await store.finish_run(run, 1, 0, {}, {"seconds": 2.5})
         (stats,) = store.connection.execute("SELECT stats FROM runs").fetchone()
     assert json.loads(stats) == {"seconds": 2.5}
+
+
+async def test_memory_store_save_raw_false_and_true():
+    async with Store(":memory:", save_raw=True) as strict_store:
+        with pytest.raises(ValueError, match="filesystem store"):
+            await strict_store.save(document(raw=b"pdf-bytes", raw_ext=".pdf"))
+
+    async with Store(":memory:", save_raw=False) as mem_store:
+        await mem_store.save(document(raw=b"pdf-bytes", raw_ext=".pdf"))
+        assert await mem_store.keys() == {("https://example.org/1", "Lei 1")}
+        doc = await mem_store.get_by_url("https://example.org/1")
+        assert doc is not None and doc["file_path"] is None
+
+
+async def test_filesystem_store_save_raw_false_writes_no_raw_files(tmp_path):
+    async with Store(tmp_path / "documents.db", save_raw=False) as store:
+        await store.save(document(raw=b"pdf-bytes", raw_ext=".pdf"))
+        doc = await store.get_document(1)
+        assert doc is not None and doc["file_path"] is None
+    assert _raw_files(tmp_path) == []
+
+
+async def test_low_memory_and_default_cache_pragmas(tmp_path):
+    async with Store(tmp_path / "default.db") as store:
+        (cache_size,) = store.connection.execute("PRAGMA cache_size").fetchone()
+        assert cache_size == -16000
+    async with Store(tmp_path / "low.db", low_memory=True) as store:
+        (cache_size,) = store.connection.execute("PRAGMA cache_size").fetchone()
+        assert cache_size == -4000
+
+
+async def test_iter_keys_streams_in_batches_and_filters_year(tmp_path):
+    async with Store(tmp_path / "documents.db") as store:
+        for i in range(7):
+            year = 2023 if i < 3 else 2024
+            await store.save(
+                document(
+                    year=year,
+                    title=f"Lei {i}",
+                    document_url=f"https://example.org/{i}",
+                )
+            )
+        all_keys = [key async for key in store.iter_keys(batch_size=2)]
+        assert len(all_keys) == 7
+        assert set(all_keys) == await store.keys()
+
+        keys_2023 = [key async for key in store.iter_keys(year=2023, batch_size=2)]
+        assert set(keys_2023) == await store.keys(year=2023)
+        assert len(keys_2023) == 3
+
+
+async def test_document_sink_protocol_error_record_and_null_sink(caplog):
+    store = Store(":memory:", save_raw=False)
+    null_sink = NullSink()
+    assert isinstance(store, DocumentSink)
+    assert isinstance(null_sink, DocumentSink)
+
+    async with store:
+        run_id = await store.start_run("TEST")
+        err = ErrorRecord(
+            message="boom",
+            run_id=run_id,
+            year=2024,
+            type="Lei",
+            situation="Vigente",
+            title="Lei 1",
+            url="https://example.org/1",
+        )
+        await store.record_error(err)
+        row = store.connection.execute(
+            "SELECT run_id, year, type, situation, title, url, message FROM errors"
+        ).fetchone()
+        assert dict(row) == {
+            "run_id": run_id,
+            "year": 2024,
+            "type": "Lei",
+            "situation": "Vigente",
+            "title": "Lei 1",
+            "url": "https://example.org/1",
+            "message": "boom",
+        }
+
+    # NullSink logs when no on_error callback is given.
+    with caplog.at_level(logging.ERROR, logger="legisbr.core.sink"):
+        async with null_sink:
+            run_id = await null_sink.start_run("TEST")
+            assert run_id == 0
+            assert [k async for k in null_sink.iter_keys()] == []
+            await null_sink.save(document())
+            await null_sink.record_error(
+                ErrorRecord(message="logged err", title="Lei 9", url="https://x.test/9")
+            )
+            await null_sink.finish_run(run_id, 1, 1, {})
+    assert "logged err" in caplog.text
+
+    # NullSink supports both sync and async on_error callbacks.
+    sync_seen: list[ErrorRecord] = []
+    async_seen: list[ErrorRecord] = []
+
+    async def on_err_async(record: ErrorRecord) -> None:
+        async_seen.append(record)
+
+    sync_sink = NullSink(on_error=sync_seen.append)
+    async_sink = NullSink(on_error=on_err_async)
+    sample_err = ErrorRecord(message="cb err")
+    await sync_sink.record_error(sample_err)
+    await async_sink.record_error(sample_err)
+    assert sync_seen == [sample_err]
+    assert async_seen == [sample_err]
