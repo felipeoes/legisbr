@@ -39,10 +39,9 @@ dependencies = [
     "html-to-markdown>=3.22.0",
     "lxml>=6.0",
     "mammoth>=1.13.0",
+    "pdf-oxide>=0.3.78",
     "pydantic>=2.10",
-    "pymupdf>=1.27.1",
-    # 1.x requires the unused layout/onnxruntime stack.
-    "pymupdf4llm>=0.3.4,<1",
+    "pypdf>=7.0",
     "tenacity>=9.1.3",
 ]
 

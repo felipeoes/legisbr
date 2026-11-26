@@ -8,7 +8,6 @@ from collections.abc import Sequence
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
-import fitz
 from pydantic import BaseModel
 from pydantic_core import to_jsonable_python
 from tenacity import (
@@ -19,6 +18,7 @@ from tenacity import (
 )
 
 from legisbr.core.convert import clean_md_tag
+from legisbr.core.pdf import pdf_page_count, render_pdf_batch, slice_pdf_pages
 
 if TYPE_CHECKING:
     from pydantic_ai import BinaryContent
@@ -74,6 +74,7 @@ class OCR:
         batch_size: int = 5,
         concurrency: int = 8,
         pdf_input: bool = False,
+        dpi: int = 150,
     ) -> None:
         try:
             from pydantic_ai import Agent, BinaryContent
@@ -84,8 +85,8 @@ class OCR:
             raise ImportError(_INSTALL_HINT) from exc
 
         names = [name.strip() for name in models.split(",") if name.strip()]
-        if not names or batch_size < 1 or concurrency < 1:
-            raise ValueError("OCR needs models and positive batch_size/concurrency")
+        if not names or batch_size < 1 or concurrency < 1 or dpi < 1:
+            raise ValueError("OCR needs models and positive batch_size/concurrency/dpi")
         self._binary_content = BinaryContent
         self._model_http_error = ModelHTTPError
         model = FallbackModel(*names) if len(names) > 1 else names[0]
@@ -94,6 +95,7 @@ class OCR:
         self.batch_size = batch_size
         self.concurrency = concurrency
         self.pdf_input = pdf_input
+        self.dpi = dpi
         self.usage: dict[str, RunUsage] = defaultdict(RunUsage)
         self._scoped_usage: dict[str, dict[str, RunUsage]] = defaultdict(
             lambda: defaultdict(RunUsage)
@@ -139,30 +141,19 @@ class OCR:
         return "\n\n".join(texts)
 
     def _render_batch(self, data: bytes, start: int, end: int) -> list[BinaryContent]:
-        with fitz.open(stream=data, filetype="pdf") as doc:
-            if self.pdf_input:
-                with fitz.open() as chunk:
-                    chunk.insert_pdf(doc, from_page=start, to_page=end - 1)
-                    return [
-                        self._binary_content(
-                            data=chunk.tobytes(), media_type="application/pdf"
-                        )
-                    ]
+        if self.pdf_input:
+            chunk_bytes = slice_pdf_pages(data, list(range(start + 1, end + 1)))
             return [
-                self._binary_content(
-                    data=doc[i].get_pixmap(dpi=150).tobytes("png"),
-                    media_type="image/png",
-                )
-                for i in range(start, end)
+                self._binary_content(data=chunk_bytes, media_type="application/pdf")
             ]
+        return [
+            self._binary_content(data=png, media_type="image/png")
+            for png in render_pdf_batch(data, start, end, dpi=self.dpi)
+        ]
 
     async def pdf(self, data: bytes) -> str:
-        def pages() -> int:
-            with fitz.open(stream=data, filetype="pdf") as doc:
-                return doc.page_count
-
         try:
-            count = await asyncio.to_thread(pages)
+            count = await asyncio.to_thread(pdf_page_count, data)
             texts = []
 
             async def batch(start: int) -> str:
@@ -173,7 +164,10 @@ class OCR:
                         start,
                         min(start + self.batch_size, count),
                     )
-                    return await self._run(parts)
+                    try:
+                        return await self._run(parts)
+                    finally:
+                        parts.clear()
 
             starts = range(0, count, self.batch_size)
             for offset in range(0, len(starts), self.concurrency):

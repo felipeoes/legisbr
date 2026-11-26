@@ -6,7 +6,6 @@ import re
 from collections.abc import AsyncIterator
 from typing import Any
 
-import fitz
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from legisbr.core.convert import (
@@ -20,6 +19,7 @@ from legisbr.core.convert import (
     wrap_html,
 )
 from legisbr.core.document import Document
+from legisbr.core.pdf import slice_pdf_pages
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -553,23 +553,7 @@ class DFSinjScraper(BaseScraper):
 
     @staticmethod
     def _extract_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> bytes:
-        if not pages:
-            return pdf_bytes
-        source = fitz.open(stream=pdf_bytes, filetype="pdf")
-        extracted = fitz.open()
-        try:
-            for page_number in pages:
-                page_index = page_number - 1
-                if 0 <= page_index < source.page_count:
-                    extracted.insert_pdf(
-                        source, from_page=page_index, to_page=page_index
-                    )
-            if extracted.page_count == 0:
-                return pdf_bytes
-            return extracted.tobytes(garbage=4, deflate=True)
-        finally:
-            extracted.close()
-            source.close()
+        return slice_pdf_pages(pdf_bytes, pages)
 
     async def _fetch_diary_pdf_fallback(
         self, doc: dict

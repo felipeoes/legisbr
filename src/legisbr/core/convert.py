@@ -3,37 +3,59 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import io
-import os
 import re
 import string
 import zipfile
 from collections.abc import Awaitable, Callable
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING
 
-import fitz
-import mammoth
 from bs4 import BeautifulSoup, Tag
 from html_to_markdown import ConversionOptions, PreprocessingOptions
 from html_to_markdown import convert as html_to_md
 
 from legisbr.core.http import HttpClient, Response
 from legisbr.core.images import ImageCache, inline_images_in_html
+from legisbr.core.pdf import (
+    _pdf_text_layer,
+    default_pdf_workers,
+    is_pdf_scanned,
+    pdf_page_count,
+    pdf_to_markdown,
+    readable_text,
+    slice_pdf_pages,
+)
 
 if TYPE_CHECKING:
     from legisbr.core.ocr import OCR
 
-_T = TypeVar("_T")
-
-
-def default_pdf_workers() -> int:
-    """Resolve worker count for PDF text extraction at call time."""
-    raw = os.environ.get("PDF_WORKERS")
-    return int(raw) if raw else min(8, os.cpu_count() or 1)
+__all__ = [
+    "_pdf_text_layer",
+    "bytes_to_markdown",
+    "calc_pages",
+    "clean_markdown",
+    "clean_md_tag",
+    "clean_norm_soup",
+    "default_pdf_workers",
+    "detect_extension",
+    "html_to_markdown",
+    "infer_type_by_prefix",
+    "infer_type_from_title",
+    "is_pdf",
+    "is_pdf_scanned",
+    "normalize_type",
+    "pdf_page_count",
+    "pdf_to_markdown",
+    "readable_text",
+    "remove_summary_element",
+    "remove_summary_from_markdown",
+    "slice_pdf_pages",
+    "sniff_extension",
+    "strip_html_chrome",
+    "valid_markdown",
+    "wrap_html",
+]
 
 
 def clean_md_tag(md_content: str) -> str:
@@ -70,19 +92,6 @@ _IMAGE_MAGIC_BYTES: list[bytes] = [
     b"BM",
     b"RIFF",
 ]
-_OCR_METADATA_KEYWORDS: list[str] = [
-    "tesseract",
-    "ocr",
-    "abbyy",
-    "omnipage",
-    "paper capture",
-    "scanner",
-    "scanned",
-    "clearscan",
-    "readiris",
-    "iris",
-]
-_INVISIBLE_TEXT_RE = re.compile(b"(?:\\s|^)3\\s+Tr(?:\\s|$)")
 
 
 def is_pdf(body: bytes, content_type: str = "") -> bool:
@@ -96,98 +105,6 @@ def _is_image_bytes(raw: bytes) -> bool:
         if raw[: len(magic)] == magic:
             return True
     return False
-
-
-def _pdf_page_count(body: bytes) -> int:
-    """Return the number of pages in a PDF, or 1 on any error."""
-    try:
-        doc = fitz.open(stream=body, filetype="pdf")
-        count = doc.page_count
-        doc.close()
-        return max(1, count)
-    except Exception:
-        return 1
-
-
-def is_pdf_scanned(content: bytes, max_pages_to_check: int = 10) -> tuple[bool, float]:
-    """Determine whether a PDF is primarily a scanned/image document.
-
-    Analyses metadata, image coverage, text density and invisible-text
-    operators on a sample of pages.
-
-    Returns:
-        ``(is_scanned, confidence)`` where *confidence* represents how
-        certain the heuristic is about the result (0–1).
-    """
-    try:
-        doc = fitz.open(stream=content, filetype="pdf")
-    except Exception as exc:
-        raise ValueError(f"Could not open PDF: {exc}") from exc
-    total_pages = len(doc)
-    if total_pages == 0:
-        doc.close()
-        return (False, 0.0)
-    producer = doc.metadata.get("producer", "").lower() if doc.metadata else ""
-    creator = doc.metadata.get("creator", "").lower() if doc.metadata else ""
-    metadata_text = producer + " " + creator
-    has_ocr_metadata = any((kw in metadata_text for kw in _OCR_METADATA_KEYWORDS))
-    if total_pages <= max_pages_to_check:
-        pages_to_check = list(range(total_pages))
-    else:
-        step = total_pages / max_pages_to_check
-        pages_to_check = sorted(
-            list(set((int(i * step) for i in range(max_pages_to_check))))
-        )
-    page_scores: list[float] = []
-    for page_num in pages_to_check:
-        page = doc[page_num]
-        page_area = page.rect.width * page.rect.height
-        if page_area <= 0:
-            continue
-        images = page.get_image_info()
-        total_img_area = sum(
-            (
-                max(0, img["bbox"][2] - img["bbox"][0])
-                * max(0, img["bbox"][3] - img["bbox"][1])
-                for img in images
-            )
-        )
-        coverage = min(1.0, total_img_area / page_area)
-        text = page.get_text().strip()
-        text_length = len(text)
-        contents = page.read_contents()
-        has_invisible_text = bool(_INVISIBLE_TEXT_RE.search(contents))
-        score = 0.5
-        is_blank = False
-        if coverage > 0.8:
-            if has_invisible_text or has_ocr_metadata:
-                score = 1.0
-            elif text_length < 50:
-                score = 1.0
-            elif text_length > 200:
-                score = 0.9
-            elif page.rect.width > page.rect.height:
-                score = 0.2
-            else:
-                score = 0.8
-        elif coverage > 0.1:
-            if text_length < 50:
-                score = 0.8
-            else:
-                score = 0.1
-        elif text_length > 10:
-            score = 0.0
-        else:
-            is_blank = True
-        if not is_blank:
-            page_scores.append(score)
-    doc.close()
-    if not page_scores:
-        return (False, 1.0)
-    avg_score = sum(page_scores) / len(page_scores)
-    is_scanned = avg_score > 0.5
-    confidence = avg_score if is_scanned else 1.0 - avg_score
-    return (is_scanned, round(confidence, 4))
 
 
 def detect_extension(content_type: str, filename: str | None = None) -> str:
@@ -423,119 +340,6 @@ async def html_to_markdown(
     return clean_markdown(result.content or "")
 
 
-_WATERMARK_CHECK_RE = re.compile("(?:\\n[^\\n]{0,2}){15,}")
-_MD_BASE64_IMAGE_RE = re.compile("!\\[[^\\]]*\\]\\(data:image/[^)]+\\)")
-# pymupdf4llm names header cells it could not read "Col1", "Col2", ...
-_PLACEHOLDER_CELL_RE = re.compile("(?<=\\|)Col\\d+(?=\\|)")
-
-
-_WORD_SHAPE_RE = re.compile("^(?:[a-zà-ÿ]+|[A-ZÀ-Þ]+|[A-ZÀ-Þ][a-zà-ÿ]+)$")
-_LOWER_WORD_RE = re.compile("[a-zà-ÿ]+")
-_COMMON_WORDS = frozenset(
-    "de da do das dos que em no na nos nas para com por os as um uma ao aos se ou "
-    "lei art estado sua seu pelo pela este esta sobre mais não nao como ser sem entre "
-    "dia ano governo poder fica ficam artigo parágrafo inciso".split()
-)
-
-
-def readable_text(text: str) -> bool:
-    """False for noisy OCR layers: odd-shaped tokens and few Portuguese function words.
-
-    Calibrated on 2012 archives: flags 13 of ~450 PB/PI scans, no clean documents.
-    """
-    shaped = odd = 0
-    for raw in text.split():
-        token = raw.strip(".,;:()[]\"'“”‘’-–—ºª°§/")
-        if any(c.isalpha() for c in token):
-            if _WORD_SHAPE_RE.match(token):
-                shaped += 1
-            else:
-                odd += 1
-    words = [w for w in _LOWER_WORD_RE.findall(text.lower()) if len(w) >= 2]
-    if shaped + odd < 20 or not words:
-        return True
-    common = sum(w in _COMMON_WORDS for w in words) / len(words)
-    return shaped / (shaped + odd) >= 0.8 or common >= 0.3
-
-
-def _digital_pdf(data: bytes, image_size_limit: float) -> str:
-    with contextlib.redirect_stdout(io.StringIO()):  # its import prints a layout nag
-        import pymupdf4llm.helpers.pymupdf_rag
-
-    with fitz.open(stream=data, filetype="pdf") as doc:
-        try:
-            return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
-                doc, embed_images=True, image_size_limit=image_size_limit
-            )
-        except Exception:
-            return pymupdf4llm.helpers.pymupdf_rag.to_markdown(
-                doc,
-                embed_images=True,
-                table_strategy=None,
-                image_size_limit=image_size_limit,
-            )
-
-
-def _pdf_text_layer(
-    data: bytes, image_size_limit: float, check_readable: bool
-) -> str | None:
-    """Best embedded text (pymupdf4llm, else plain); None means it needs OCR.
-
-    Runs in a worker process, so it must not log.
-    """
-    with fitz.open(stream=data, filetype="pdf") as doc:
-        plain = "\n\n".join(page.get_text() for page in doc)
-        minimum = max(50, doc.page_count * 100)
-
-    def long_enough(text: str) -> bool:
-        check = _WATERMARK_CHECK_RE.sub("", _MD_BASE64_IMAGE_RE.sub("", text)).strip()
-        return valid_markdown(check, min_length=minimum)[0]
-
-    # Judge the plain layer: the gate was calibrated on it, and markdown table
-    # pipes would read as noise. Without OCR a noisy layer beats no document.
-    if check_readable and not readable_text(plain):
-        return None
-    scanned, confidence = is_pdf_scanned(data)
-    if not scanned and confidence >= 0.7:
-        try:
-            markdown = _digital_pdf(data, image_size_limit)
-        except Exception:  # pymupdf4llm fails on some layouts; plain text remains
-            markdown = ""
-        if long_enough(markdown):
-            return clean_markdown(_PLACEHOLDER_CELL_RE.sub("", markdown))
-    return clean_markdown(plain) if long_enough(plain) else None
-
-
-_pool: ProcessPoolExecutor | None = None
-
-
-async def _in_process(function: Callable[..., _T], *args: Any) -> _T:
-    """CPU-bound PDF work in worker processes: pymupdf4llm holds the GIL."""
-    global _pool
-    if _pool is None:
-        _pool = ProcessPoolExecutor(default_pdf_workers())
-    pool = _pool
-    try:
-        return await asyncio.get_running_loop().run_in_executor(pool, function, *args)
-    except BrokenProcessPool:
-        # A crashed worker fails only its own document; later ones get a new pool.
-        if _pool is pool:
-            _pool = None
-            pool.shutdown(wait=False, cancel_futures=True)
-        raise
-
-
-async def pdf_to_markdown(
-    data: bytes, ocr: OCR | None = None, *, image_size_limit: float = 0.1
-) -> str:
-    text = await _in_process(_pdf_text_layer, data, image_size_limit, ocr is not None)
-    if text is not None:
-        return text
-    if ocr is not None:
-        return clean_markdown(await ocr.pdf(data))
-    raise ValueError("PDF needs OCR but no OCR model is configured")
-
-
 async def bytes_to_markdown(
     data: bytes, content_type: str, url: str, http: HttpClient, ocr: OCR | None = None
 ) -> str:
@@ -554,6 +358,8 @@ async def bytes_to_markdown(
     image_cache = getattr(http, "image_cache", None)
     sniffed = sniff_extension(data)
     if sniffed == ".docx":
+        import mammoth
+
         result = await asyncio.to_thread(mammoth.convert_to_html, io.BytesIO(data))
         return await html_to_markdown(result.value, url, fetch_image, cache=image_cache)
     if sniffed == ".doc":

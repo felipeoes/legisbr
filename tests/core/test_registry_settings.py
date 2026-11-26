@@ -22,6 +22,7 @@ def test_all_30_sources_resolve_cleanly_and_match_classes():
     all_infos = sources()
     assert len(all_infos) == 30
     assert all(isinstance(info, SourceInfo) for info in all_infos)
+    assert {spec.code for spec in SCRAPERS if spec.insecure_tls} == {"ac", "ba"}
 
     seen_names: set[str] = set()
     for spec in SCRAPERS:
@@ -65,7 +66,7 @@ def test_import_legisbr_and_sources_is_lazy_without_heavy_imports():
         "import sys, legisbr; "
         "infos = legisbr.sources(); "
         "assert len(infos) == 30; "
-        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'fitz', 'pydantic_ai'); "
+        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pdf_oxide', 'pypdf', 'pydantic_ai'); "
         "loaded = [m for m in forbidden if m in sys.modules]; "
         "scrapers = [m for m in sys.modules if m.startswith('legisbr.scrapers')]; "
         "assert not loaded, f'Heavy modules loaded: {loaded}'; "

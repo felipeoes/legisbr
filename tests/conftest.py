@@ -19,12 +19,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 @pytest.fixture(autouse=True)
 def inline_pdf_work(monkeypatch):
     """Unit tests convert PDFs inline so monkeypatches reach the conversion code."""
-    from legisbr.core import convert
+    from legisbr.core import pdf
 
-    async def inline(function, *args):
-        return function(*args)
+    async def inline(
+        function,
+        *args,
+        executor="auto",
+        max_workers=None,
+        **kwargs,
+    ):
+        del executor, max_workers
+        return function(*args, **kwargs)
 
-    monkeypatch.setattr(convert, "_in_process", inline)
+    monkeypatch.setattr(pdf, "run_pdf_task", inline)
 
 
 def make_scraper(cls, **overrides):

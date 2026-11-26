@@ -191,6 +191,8 @@ SCRAPERS: list[ScraperSpec] = [
         "ac",
         ("Acre", "AC"),
         1963,
+        # legis.ac.gov.br omits its intermediate CA certificate on OpenSSL 3.0 & 3.5.
+        insecure_tls=True,
         capabilities=SearchCapabilities(native_year=False, fast_catalog=True),
     ),
     _state(
@@ -229,6 +231,8 @@ SCRAPERS: list[ScraperSpec] = [
         1891,
         max_retries=7,
         rps=1,
+        # www.legislabahia.ba.gov.br offers TLS 1.2 static RSA only, rejected by
+        # OpenSSL 3.5+ default security level without DEFAULT@SECLEVEL=1.
         insecure_tls=True,
         capabilities=_CAP_YEAR_ONLY,
     ),

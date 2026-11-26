@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
-import fitz
+import pdf_oxide
 import pytest
 from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
@@ -23,11 +23,7 @@ def _html(name: str) -> str:
 
 
 def _pdf(text: str) -> bytes:
-    doc = fitz.open()
-    doc.new_page().insert_textbox(fitz.Rect(72, 72, 520, 770), text, fontsize=12)
-    content = doc.tobytes()
-    doc.close()
-    return content
+    return pdf_oxide.Pdf.from_text(text).to_bytes()
 
 
 class TestTypesConstant(TypesConstantTests):

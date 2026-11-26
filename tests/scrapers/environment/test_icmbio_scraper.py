@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
-import fitz
+import pdf_oxide
 import pytest
 from conftest import make_mock_response, make_scraper
 
@@ -464,16 +464,9 @@ _ARTICLE = (
 
 
 def _pdf() -> bytes:
-    doc = fitz.open()
-    page = doc.new_page(width=595, height=842)
-    page.insert_textbox(
-        fitz.Rect(72, 72, 520, 770),
-        "Art. 1º Fica aprovado o plano de manejo da unidade de conservação. " * 20,
-        fontsize=12,
-    )
-    content = doc.tobytes()
-    doc.close()
-    return content
+    return pdf_oxide.Pdf.from_text(
+        "Art. 1º Fica aprovado o plano de manejo da unidade de conservação. " * 20
+    ).to_bytes()
 
 
 class TestICMBioFetch:

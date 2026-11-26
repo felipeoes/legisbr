@@ -1,32 +1,28 @@
-"""Tests for the PDF scan detection and pymupdf4llm conversion pipeline."""
+"""Tests for the PDF scan detection and permissive conversion pipeline."""
 
 from __future__ import annotations
 
-import fitz
+import io
+import struct
+import zlib
+
+import pdf_oxide
+import pypdf
 import pytest
 
-from legisbr.core.convert import _in_process as REAL_IN_PROCESS
 from legisbr.core.convert import is_pdf_scanned
+from legisbr.core.pdf import run_pdf_task as REAL_RUN_PDF_TASK
 
 
 def _make_digital_pdf(
     text: str = "Art. 1º Este é um decreto digital com texto suficiente para validação.",
 ) -> bytes:
     """Create a minimal digital PDF with selectable text (no images)."""
-    doc = fitz.open()
-    page = doc.new_page(width=595, height=842)
-    page.insert_textbox(fitz.Rect(72, 72, 520, 770), text, fontsize=12)
-    content = doc.tobytes()
-    doc.close()
-    return content
+    return pdf_oxide.Pdf.from_text(text).to_bytes()
 
 
 def _make_scanned_pdf() -> bytes:
     """Create a PDF that looks scanned (full-page image, no text)."""
-    doc = fitz.open()
-    page = doc.new_page(width=595, height=842)
-    import struct
-    import zlib
 
     def _minimal_png(w: int, h: int) -> bytes:
         raw = b""
@@ -50,12 +46,21 @@ def _make_scanned_pdf() -> bytes:
             + _chunk(b"IEND", b"")
         )
 
-    png = _minimal_png(595, 842)
-    rect = fitz.Rect(0, 0, 595, 842)
-    page.insert_image(rect, stream=png)
-    content = doc.tobytes()
-    doc.close()
-    return content
+    raw = pdf_oxide.Pdf.from_image_bytes(_minimal_png(595, 842)).to_bytes()
+    doc = pdf_oxide.PdfDocument.from_bytes(raw)
+    imgs = doc.page_images(0)
+    if not imgs:
+        return raw
+    reader = pypdf.PdfReader(io.BytesIO(raw))
+    writer = pypdf.PdfWriter()
+    page = writer.add_page(reader.pages[0])
+    img = imgs[0]
+    x0, y0 = float(img["x"]), float(img["y"])
+    page.mediabox.lower_left = (x0, y0)
+    page.mediabox.upper_right = (x0 + float(img["width"]), y0 + float(img["height"]))
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
 
 
 def _make_png_bytes() -> bytes:
@@ -77,11 +82,11 @@ class TestIsPdfScanned:
         assert confidence > 0.5
 
     def test_empty_pdf(self):
-        doc = fitz.open()
-        doc.new_page()
-        content = doc.tobytes()
-        doc.close()
-        is_scanned, confidence = is_pdf_scanned(content)
+        writer = pypdf.PdfWriter()
+        writer.add_blank_page(width=595, height=842)
+        buf = io.BytesIO()
+        writer.write(buf)
+        is_scanned, confidence = is_pdf_scanned(buf.getvalue())
         assert is_scanned is False
 
     def test_invalid_bytes_raises(self):
@@ -97,13 +102,13 @@ class TestIsPdfScanned:
 
 
 async def test_digital_pdf_conversion_and_plain_fallback(monkeypatch):
-    from legisbr.core import convert
+    from legisbr.core import convert, pdf as pdf_mod
 
     pdf = _make_digital_pdf("Art. 1 - " + "Texto legal para a administracao. " * 8)
     result = await convert.pdf_to_markdown(pdf)
     assert "Art." in result
     monkeypatch.setattr(
-        convert, "_digital_pdf", lambda *a: "![page](data:image/png;base64,AAAA)"
+        pdf_mod, "_digital_pdf", lambda *a, **kw: "![page](data:image/png;base64,AAAA)"
     )
     assert "Art." in await convert.pdf_to_markdown(pdf)
 
@@ -254,14 +259,23 @@ async def test_html_conversion_has_no_metadata_front_matter():
     assert result == "Art. 1º Texto."
 
 
-async def test_pymupdf4llm_placeholder_headers_are_blanked(monkeypatch):
+async def test_dense_pdf_legal_line_breaks_restored():
     from legisbr.core import convert
 
-    table = "|Col1|TABELA DE SUBSÍDIOS|Col3|\n|---|---|---|\n|CARGOS|A|B|\n"
-    monkeypatch.setattr(convert, "_digital_pdf", lambda *a: table + "Texto. " * 30)
-    pdf = _make_digital_pdf("Art. 1 - " + "Texto legal para a administracao. " * 8)
-    result = await convert.pdf_to_markdown(pdf)
-    assert "||TABELA DE SUBSÍDIOS||\n|---|---|---|\n|CARGOS|A|B|" in result
+    dense = (
+        "Art. 1º Esta lei estabelece diretrizes gerais para a administração estadual. "
+        "Parágrafo único. A regulamentação ocorrerá em trinta dias. "
+        "Art. 2º Ficam estabelecidos os seguintes princípios: "
+        "I - transparência nos atos públicos; "
+        "II - eficiência na gestão orçamentária."
+    )
+    result = await convert.pdf_to_markdown(_make_digital_pdf(dense))
+    lines = [line.strip() for line in result.splitlines() if line.strip()]
+    assert any(line.startswith("Art. 1º") for line in lines)
+    assert any(line.startswith("Art. 2º") for line in lines)
+    assert any(line.startswith("Parágrafo único.") for line in lines)
+    assert any(line.startswith("I -") for line in lines)
+    assert any(line.startswith("II -") for line in lines)
 
 
 async def test_spacer_images_are_dropped_not_inlined():
@@ -287,13 +301,17 @@ def _crash_worker() -> None:
 async def test_pdf_work_runs_in_processes_and_survives_a_crashed_worker():
     from concurrent.futures.process import BrokenProcessPool
 
-    from legisbr.core import convert
+    from legisbr.core import pdf as pdf_mod
 
     pdf = _make_digital_pdf("Art. 1 - " + "Texto legal para a administracao. " * 8)
-    assert "Art." in await REAL_IN_PROCESS(convert._pdf_text_layer, pdf, 0.1, True)
+    assert "Art." in await REAL_RUN_PDF_TASK(
+        pdf_mod._pdf_text_layer, pdf, 0.1, True, executor="process", max_workers=2
+    )
     with pytest.raises(BrokenProcessPool):
-        await REAL_IN_PROCESS(_crash_worker)
-    assert "Art." in await REAL_IN_PROCESS(convert._pdf_text_layer, pdf, 0.1, True)
+        await REAL_RUN_PDF_TASK(_crash_worker, executor="process", max_workers=2)
+    assert "Art." in await REAL_RUN_PDF_TASK(
+        pdf_mod._pdf_text_layer, pdf, 0.1, True, executor="process", max_workers=2
+    )
 
 
 async def test_line_breaks_between_inline_elements_survive():

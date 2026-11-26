@@ -1,7 +1,9 @@
 from __future__ import annotations
-import asyncio
 
-import fitz
+import asyncio
+import io
+
+import pypdf
 import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
@@ -10,10 +12,12 @@ from legisbr.core.ocr import OCR, OCRError, OCROutput
 
 
 def pdf_bytes():
-    with fitz.open() as doc:
-        for _ in range(3):
-            doc.new_page()
-        return doc.tobytes()
+    writer = pypdf.PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=595, height=842)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
 
 
 @pytest.mark.parametrize("pdf_input", [False, True])
@@ -117,3 +121,16 @@ def test_ocr_missing_pydantic_ai_raises_install_hint(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "pydantic_ai", None)
     with pytest.raises(ImportError, match="legisbr\\[ocr\\]"):
         OCR("openai:gpt-4.1-mini")
+
+
+def test_ocr_dpi_validation_and_batch_rendering() -> None:
+    import struct
+
+    with pytest.raises(ValueError, match="positive"):
+        OCR("test", dpi=0)
+    ocr_low = OCR("test", dpi=100)
+    parts = ocr_low._render_batch(pdf_bytes(), 0, 1)
+    assert len(parts) == 1
+    assert parts[0].data.startswith(b"\x89PNG\r\n\x1a\n")
+    width, _ = struct.unpack(">II", parts[0].data[16:24])
+    assert 800 <= width <= 900

@@ -88,8 +88,8 @@ def _strip_summary(text_markdown: str, summary: str) -> str:
 def _clean_markdown(text_markdown: str, summary: str = "") -> str:
     """Remove ES-specific PDF/HTML artefacts and strip the listing summary.
 
-    pymupdf4llm already strips page-number footers, authentication watermarks,
-    and sidebar text that the old PyMuPDF plain-text extractor used to include.
+    pdf_oxide already strips page-number footers, authentication watermarks,
+    and sidebar text that older plain-text extractors used to include.
     The only ES-specific artefacts that survive are:
 
     * The "MANIFESTO DE ASSINATURAS" digital-signature block at the end of PDFs.
@@ -121,7 +121,7 @@ class ESAlesScraper(BaseScraper):
         not Playwright.
       - "NORMA ORIGINAL" links (.pdf) — scanned PDFs at
         /Arquivo/Documents/legislacao/image/. Downloaded and converted via
-        pymupdf4llm with LLM OCR fallback.
+        pdf_oxide with LLM OCR fallback.
       - "Digital.aspx" links — document viewer URLs; the embedded PDF path is
         extracted from the ``arquivo`` query param and fetched as a regular PDF.
 
