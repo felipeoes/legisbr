@@ -1,3 +1,4 @@
+from __future__ import annotations
 from legisbr.core.sapl import SAPLBaseScraper
 
 TYPES = {

@@ -1,7 +1,10 @@
 """Buffered HTTP responses with rate limiting and retries."""
 
+from __future__ import annotations
+
 import asyncio
 import json
+import logging
 import ssl
 import time
 from dataclasses import dataclass
@@ -17,7 +20,6 @@ from aiohttp_socks import (
 )
 from bs4 import BeautifulSoup
 from bs4.dammit import EncodingDetector
-from loguru import logger
 from multidict import CIMultiDict
 from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate
 from tenacity import (
@@ -28,6 +30,8 @@ from tenacity import (
 )
 
 from legisbr.core.proxy import ProxyService
+
+logger = logging.getLogger(__name__)
 
 
 # How long a proxy that failed to connect or answer sits out before another try.

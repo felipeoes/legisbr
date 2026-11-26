@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for tocantins_scraper."
 
+from __future__ import annotations
+
 from bs4 import BeautifulSoup
 from conftest import make_scraper
 from parser_assertions import (

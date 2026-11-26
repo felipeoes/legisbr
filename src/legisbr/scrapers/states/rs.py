@@ -1,13 +1,16 @@
+from __future__ import annotations
+import logging
 import re
 from collections.abc import AsyncIterator
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
-from loguru import logger
 
 from legisbr.core.convert import valid_markdown, wrap_html
 from legisbr.core.document import Document
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
+
+logger = logging.getLogger(__name__)
 
 TYPES = {}
 SITUATIONS = {"Não consta": "Não consta"}

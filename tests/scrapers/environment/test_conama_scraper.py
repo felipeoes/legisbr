@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for conama_scraper."
 
+from __future__ import annotations
+
 import re
 from unittest.mock import AsyncMock, MagicMock
 

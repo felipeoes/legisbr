@@ -1,3 +1,4 @@
+from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit

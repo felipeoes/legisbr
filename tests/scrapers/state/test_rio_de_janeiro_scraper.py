@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for rio_de_janeiro_scraper."
 
+from __future__ import annotations
+
 from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
 from parser_assertions import (
@@ -252,7 +254,6 @@ class TestFetch:
         assert doc.raw_ext == ".html"
         assert "programa estadual de teste" in doc.text_markdown
         assert doc.document_url == "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/def"
-        scraper.browser.snapshot.assert_not_called()
 
     async def test_domino_icons_are_dropped_without_fetching(self):
         """alerjln1 (the Domino host of spacer/twistie icons) refuses connections; fetching stalls on retries."""

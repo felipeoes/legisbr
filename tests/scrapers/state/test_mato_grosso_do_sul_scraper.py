@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for mato_grosso_do_sul_scraper."
 
+from __future__ import annotations
+
 import pytest
 import xml.etree.ElementTree as ET
 from unittest.mock import AsyncMock, MagicMock

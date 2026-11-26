@@ -1,6 +1,9 @@
 """Bounded listing → fetch → save pipeline shared by every scraper."""
 
+from __future__ import annotations
+
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack
@@ -8,10 +11,6 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 from urllib.parse import urljoin
 
-from loguru import logger
-
-from legisbr.config import LOG_DIR
-from legisbr.core.browser import BrowserPool
 from legisbr.core.convert import (
     bytes_to_markdown,
     detect_extension,
@@ -22,6 +21,8 @@ from legisbr.core.document import DocRef, Document, clean_title
 from legisbr.core.http import HttpClient
 from legisbr.core.ocr import OCR, usage_scope
 from legisbr.core.store import Store
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_VALID_SITUATION = "Não consta revogação expressa"
 DEFAULT_INVALID_SITUATION = "Revogada"
@@ -78,14 +79,12 @@ class BaseScraper:
         http: HttpClient,
         years: range,
         ocr: OCR | None = None,
-        browser: BrowserPool | None = None,
         workers: int = 16,
         overwrite: bool = False,
     ) -> None:
         if workers < 1:
             raise ValueError("workers must be positive")
         self.store, self.http, self.ocr = (store, http, ocr)
-        self.browser = browser or BrowserPool(limiter=http.limiter)
         self.years, self.workers, self.overwrite = (years, workers, overwrite)
         self._stack = AsyncExitStack()
         self._run_id: int | None = None
@@ -94,14 +93,7 @@ class BaseScraper:
     async def __aenter__(self) -> BaseScraper:
         try:
             self._stack.push_async_callback(self.http.close)
-            self._stack.push_async_callback(self.browser.close)
             await self._stack.enter_async_context(self.store)
-            await asyncio.to_thread(LOG_DIR.mkdir, parents=True, exist_ok=True)
-            sink = logger.add(
-                LOG_DIR / f"{self.name}.log",
-                filter=lambda record: record["extra"].get("scraper") == self.name,
-            )
-            self._stack.callback(logger.remove, sink)
             return self
         except BaseException:
             await self._stack.aclose()
@@ -154,32 +146,30 @@ class BaseScraper:
         self._run_id = await self.store.start_run(self.name)
         scope = f"{self.name}:{self._run_id}"
         token = usage_scope.set(scope)
-        with logger.contextualize(scraper=self.name):
+        try:
+            await self.setup()
+            # Overwrite re-scrapes everything; each save replaces the old row.
+            await self._scrape(set() if self.overwrite else await self.store.keys())
+        except Exception as exc:
+            await self.error({}, exc)
+        finally:
+            self._result.seconds = time.perf_counter() - started
+            stats = {
+                **self._result.stats(),
+                "years": f"{self.years.start}-{self.years.stop - 1}",
+                "workers": self.workers,
+                "http": dict(self.http.stats),
+            }
             try:
-                await self.setup()
-                # Overwrite re-scrapes everything; each save replaces the old row.
-                await self._scrape(set() if self.overwrite else await self.store.keys())
-            except Exception as exc:
-                await self.error({}, exc)
+                await self.store.finish_run(
+                    self._run_id,
+                    self._result.docs,
+                    self._result.errors,
+                    self.ocr.usage_for(scope) if self.ocr else {},
+                    stats,
+                )
             finally:
-                self._result.seconds = time.perf_counter() - started
-                stats = {
-                    **self._result.stats(),
-                    "years": f"{self.years.start}-{self.years.stop - 1}",
-                    "workers": self.workers,
-                    "http": dict(self.http.stats),
-                    "browser_navigations": self.browser.navigations,
-                }
-                try:
-                    await self.store.finish_run(
-                        self._run_id,
-                        self._result.docs,
-                        self._result.errors,
-                        self.ocr.usage_for(scope) if self.ocr else {},
-                        stats,
-                    )
-                finally:
-                    usage_scope.reset(token)
+                usage_scope.reset(token)
         return self._result
 
     async def _scrape(self, keys: set[tuple[str, str]]) -> None:
@@ -303,9 +293,9 @@ class BaseScraper:
         )
 
     async def fetch_html(
-        self, ref: DocRef, html: str, url: str, raw: bytes, raw_ext: str = ".mhtml"
+        self, ref: DocRef, html: str, url: str, raw: bytes, raw_ext: str = ".html"
     ) -> Document:
-        """Build a Document from page HTML; raw is the browser MHTML or the HTTP body (".html")."""
+        """Build a Document from page HTML and raw HTTP body bytes."""
         return Document(
             **{
                 **ref,

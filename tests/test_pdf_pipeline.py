@@ -1,5 +1,7 @@
 """Tests for the PDF scan detection and pymupdf4llm conversion pipeline."""
 
+from __future__ import annotations
+
 import fitz
 import pytest
 

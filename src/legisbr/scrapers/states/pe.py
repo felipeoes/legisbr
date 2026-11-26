@@ -1,3 +1,5 @@
+from __future__ import annotations
+import logging
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -5,7 +7,6 @@ from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
-from loguru import logger
 
 from legisbr.core.convert import clean_norm_soup, valid_markdown, wrap_html
 from legisbr.core.document import Document
@@ -14,6 +15,8 @@ from legisbr.core.scraper import (
     DEFAULT_VALID_SITUATION,
     BaseScraper,
 )
+
+logger = logging.getLogger(__name__)
 
 TYPES = {
     "Ato Administrativo Normativo": 0,

@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for goias_scraper."
 
+from __future__ import annotations
+
 from unittest.mock import AsyncMock, MagicMock
 
 from conftest import make_scraper

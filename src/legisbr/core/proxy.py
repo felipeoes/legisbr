@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
 import aiohttp
-from loguru import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_proxy_list(content: str) -> list[str]:
@@ -13,7 +17,7 @@ def _parse_proxy_list(content: str) -> list[str]:
         data = json.loads(content)
         if isinstance(data, dict) and "proxies" in data:
             return [p.strip() for p in data["proxies"] if p.strip()]
-    except ValueError, TypeError:
+    except (ValueError, TypeError):
         pass
     return [p.strip() for p in content.splitlines() if p.strip()]
 

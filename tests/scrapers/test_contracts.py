@@ -1,5 +1,7 @@
 """Exercise the new injected listing/fetch contract with buffered responses."""
 
+from __future__ import annotations
+
 from unittest.mock import AsyncMock
 
 import pytest
@@ -30,7 +32,7 @@ TEXT = (
 )
 
 
-@pytest.mark.parametrize("spec", SCRAPERS, ids=lambda s: s.cls.name)
+@pytest.mark.parametrize("spec", SCRAPERS, ids=lambda s: s.name)
 async def test_all_scrapers_record_listing_transport_failures(spec):
     scraper = make_scraper(spec.cls, years=range(2024, 2025), workers=1)
     scraper.http.request = AsyncMock(
@@ -107,16 +109,13 @@ async def test_html_fetch_returns_validated_document(cls, html, extra):
     scraper = make_scraper(cls)
     body = f"<html><body>{html}</body></html>"
     scraper.http.request = AsyncMock(return_value=make_mock_response(body))
-    scraper.browser.snapshot = AsyncMock(
-        return_value=(BeautifulSoup(body, "lxml"), b"mhtml")
-    )
     ref = {**document().model_dump(), **extra}
     ref.pop("text_markdown")
     result = await scraper.fetch(ref)
     assert isinstance(result, Document)
     assert "Art." in result.text_markdown
     assert result.year == 2024 and result.type and result.situation
-    assert result.raw and result.raw_ext in {".html", ".mhtml"}
+    assert result.raw and result.raw_ext == ".html"
 
 
 async def test_rs_single_page_without_pagination_yields_records():
@@ -254,9 +253,6 @@ async def test_other_html_fetch_contracts(alias, html, extra):
     scraper = make_scraper(spec.cls)
     body = f"<html><body>{html}</body></html>"
     scraper.http.request = AsyncMock(return_value=make_mock_response(body))
-    scraper.browser.snapshot = AsyncMock(
-        return_value=(BeautifulSoup(body, "lxml"), b"mhtml")
-    )
     ref = {**document().model_dump(), **extra}
     ref.pop("text_markdown")
     result = await scraper.fetch(ref)

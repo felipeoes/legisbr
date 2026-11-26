@@ -1,28 +1,67 @@
 """Run scrapers and import/export their SQLite archives."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 
-from loguru import logger
-
-from legisbr.config import (
-    LLM_BATCH_SIZE,
-    LLM_CONCURRENCY,
-    LLM_MODEL,
-    LLM_PDF_INPUT,
-    build_proxy_config,
-)
-from legisbr.core.browser import BrowserPool
 from legisbr.core.http import HttpClient
 from legisbr.core.ocr import OCR
 from legisbr.core.proxy import ProxyService
 from legisbr.core.store import Store
 from legisbr.registry import SCRAPERS, ScraperSpec
+from legisbr.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def load_settings() -> Settings:
+    """Load CLI settings from environment and optional local .env file."""
+    return Settings.from_env(env_file=Path(".env"))
+
+
+def _configure_logging(
+    *, verbose: bool, log_file: Path | None = None
+) -> logging.Handler | None:
+    level = logging.DEBUG if verbose else logging.WARNING
+    root = logging.getLogger("legisbr")
+    root.setLevel(level)
+    if not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in root.handlers
+    ):
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root.addHandler(stream)
+    for handler in root.handlers:
+        handler.setLevel(level)
+    logger.setLevel(level)
+    if not logger.handlers:
+        stream = logging.StreamHandler(sys.stderr)
+        stream.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        logger.addHandler(stream)
+    for handler in logger.handlers:
+        handler.setLevel(level)
+    if log_file is None:
+        return None
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    root.addHandler(file_handler)
+    return file_handler
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -36,6 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--year", type=int)
     run.add_argument("--overwrite", action="store_true")
     run.add_argument("-v", "--verbose", action="store_true")
+    run.add_argument("--log-file", type=Path, help="Optional path for a run log file")
     run.add_argument(
         "--jobs",
         type=int,
@@ -66,12 +106,24 @@ def select_scrapers(names: list[str] | None) -> list[ScraperSpec]:
     return [spec for spec in SCRAPERS if spec.names & requested]
 
 
+def _database_for(spec: ScraperSpec, settings: Settings) -> Path:
+    return spec.database_path(
+        settings.save_dir,
+        state_dir=settings.state_legislation_save_dir,
+        specific_dir=settings.specific_legislation_save_dir,
+    )
+
+
 async def run_scraper(
-    spec: ScraperSpec, args: argparse.Namespace, ocr: OCR | None
+    spec: ScraperSpec,
+    args: argparse.Namespace,
+    ocr: OCR | None,
+    settings: Settings | None = None,
 ) -> bool:
-    name = spec.cls.name
+    cfg = settings or load_settings()
+    name = spec.name
     try:
-        proxy_config = build_proxy_config() if spec.needs_proxy else None
+        proxy_config = cfg.build_proxy_config() if spec.needs_proxy else None
         http = HttpClient(
             rps=spec.rps,
             max_retries=spec.max_retries,
@@ -80,11 +132,10 @@ async def run_scraper(
             proxy_service=ProxyService(proxy_config) if proxy_config else None,
         )
         years = range(args.year, args.year + 1) if args.year is not None else spec.years
-        scraper = spec.cls(
-            store=Store(spec.database),
+        scraper = spec.load_cls()(
+            store=Store(_database_for(spec, cfg)),
             http=http,
             ocr=ocr if spec.needs_ocr else None,
-            browser=BrowserPool(spec.browser_pages, limiter=http.limiter),
             years=years,
             workers=spec.workers,
             overwrite=args.overwrite,
@@ -123,7 +174,7 @@ async def run_in_processes(specs: list[ScraperSpec], args: argparse.Namespace) -
     async def child(spec: ScraperSpec) -> int:
         async with gate:
             process = await asyncio.create_subprocess_exec(
-                sys.executable, __file__, "run", "-s", spec.cls.name, *extra, env=env
+                sys.executable, __file__, "run", "-s", spec.name, *extra, env=env
             )
             try:
                 return await process.wait()
@@ -152,18 +203,18 @@ _STATS_COLUMNS = (
     "HTTP req",
     "Retries",
     "MB",
-    "Browser navs",
     "LLM req",
 )
 
 
-async def print_stats(specs: list[ScraperSpec]) -> None:
+async def print_stats(specs: list[ScraperSpec], settings: Settings) -> None:
     print("| " + " | ".join(_STATS_COLUMNS) + " |")
     print("|" + "---|" * len(_STATS_COLUMNS))
     for spec in specs:
-        if not spec.database.exists():
+        database = _database_for(spec, settings)
+        if not database.exists():
             continue
-        async with Store(spec.database) as store:
+        async with Store(database) as store:
             row = store.connection.execute(
                 "SELECT llm_usage, stats FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -175,7 +226,7 @@ async def print_stats(specs: list[ScraperSpec]) -> None:
             usage.get("requests", 0) for usage in json.loads(row["llm_usage"]).values()
         )
         cells = [
-            spec.cls.name,
+            spec.name,
             stats.get("years"),
             stats.get("listed"),
             stats.get("docs"),
@@ -189,71 +240,86 @@ async def print_stats(specs: list[ScraperSpec]) -> None:
             http.get("requests"),
             http.get("retries"),
             round(http["bytes"] / 2**20, 1) if "bytes" in http else None,
-            stats.get("browser_navigations"),
             llm,
         ]
         cells[5:7] = [f"{v:.0f}" if v is not None else None for v in cells[5:7]]
         print("| " + " | ".join("–" if c is None else str(c) for c in cells) + " |")
 
 
-async def main(argv: list[str] | None = None) -> int:
+async def main(
+    argv: list[str] | None = None, *, settings: Settings | None = None
+) -> int:
     args = parse_args(argv)
-    logger.remove()
-    logger.add(
-        sys.stderr, level="DEBUG" if getattr(args, "verbose", False) else "WARNING"
-    )
     if args.command == "list":
         for spec in SCRAPERS:
             print(
-                f"{spec.cls.__name__.removesuffix('Scraper')} [{', '.join(spec.aliases)}] {spec.years.start}–{spec.years.stop - 1}"
+                f"{spec.cls_name.removesuffix('Scraper')} [{', '.join(spec.aliases)}] {spec.years.start}–{spec.years.stop - 1}"
             )
         return 0
+    cfg = settings or load_settings()
+    file_handler: logging.Handler | None = None
     try:
         specs = select_scrapers(None if getattr(args, "all", False) else args.scrapers)
+        log_file: Path | None = getattr(args, "log_file", None)
+        if (
+            log_file is None
+            and args.command == "run"
+            and len(specs) == 1
+            and cfg.log_dir is not None
+        ):
+            log_file = cfg.log_dir / f"{specs[0].name}.log"
+        file_handler = _configure_logging(
+            verbose=getattr(args, "verbose", False), log_file=log_file
+        )
         if args.command == "stats":
-            await print_stats(specs)
+            await print_stats(specs, cfg)
             return 0
         if args.command == "run" and len(specs) > 1:
             return await run_in_processes(specs, args)
         if args.command == "run":
             async with AsyncExitStack() as stack:
                 ocr = None
-                if LLM_MODEL and any(spec.needs_ocr for spec in specs):
+                if cfg.llm_model and any(spec.needs_ocr for spec in specs):
                     ocr = OCR(
-                        LLM_MODEL,
-                        batch_size=LLM_BATCH_SIZE,
-                        concurrency=LLM_CONCURRENCY,
-                        pdf_input=LLM_PDF_INPUT,
+                        cfg.llm_model,
+                        batch_size=cfg.llm_batch_size,
+                        concurrency=cfg.llm_concurrency,
+                        pdf_input=cfg.llm_pdf_input,
                     )
                     await stack.enter_async_context(ocr.agent)
-                ok = await run_scraper(specs[0], args, ocr)
+                ok = await run_scraper(specs[0], args, ocr, cfg)
             return 0 if ok else 1
         failed = False
         for spec in specs:
             try:
-                if args.command == "export" and not spec.database.exists():
-                    raise FileNotFoundError(spec.database)
-                async with Store(spec.database) as store:
+                database = _database_for(spec, cfg)
+                if args.command == "export" and not database.exists():
+                    raise FileNotFoundError(database)
+                async with Store(database) as store:
                     if args.command == "import-json":
-                        count, rejected = await store.import_json(spec.database.parent)
+                        count, rejected = await store.import_json(database.parent)
                         if rejected:
                             failed = True
                             print(
-                                f"{spec.cls.name}: {rejected} invalid rows rejected (see errors table)"
+                                f"{spec.name}: {rejected} invalid rows rejected (see errors table)"
                             )
                     else:
-                        out = args.out or spec.database.parent / "export"
+                        out = args.out or database.parent / "export"
                         if args.out and len(specs) > 1:
-                            out /= spec.cls.name
+                            out /= spec.name
                         count = await store.export(out, args.format)
-                print(f"{spec.cls.name}: {count} documents {args.command}")
+                print(f"{spec.name}: {count} documents {args.command}")
             except Exception:
-                logger.exception(f"{spec.cls.name}: {args.command} failed")
+                logger.exception(f"{spec.name}: {args.command} failed")
                 failed = True
         return int(failed)
     except Exception:
         logger.exception("Command failed")
         return 1
+    finally:
+        if file_handler is not None:
+            logging.getLogger("legisbr").removeHandler(file_handler)
+            file_handler.close()
 
 
 if __name__ == "__main__":

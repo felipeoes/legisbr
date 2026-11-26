@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for icmbio_scraper."
 
+from __future__ import annotations
+
 from unittest.mock import AsyncMock
 
 import fitz
@@ -484,7 +486,6 @@ class TestICMBioFetch:
         assert doc.raw_ext == ".html"
         assert "conselho consultivo" in doc.text_markdown
         assert "PORTARIA Nº 1.039" not in doc.text_markdown
-        scraper.browser.snapshot.assert_not_called()
 
     async def test_legacy_asset_publisher_link_uses_article_slug(self):
         """Azion blocks /materia/-/asset_publisher/ with 403; the same slug works under /web/dou/-/."""

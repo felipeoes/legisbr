@@ -1,3 +1,5 @@
+from __future__ import annotations
+import logging
 import asyncio
 import json
 import re
@@ -6,7 +8,6 @@ from typing import Any
 
 import fitz
 from bs4 import BeautifulSoup, NavigableString, Tag
-from loguru import logger
 
 from legisbr.core.convert import (
     bytes_to_markdown,
@@ -20,6 +21,8 @@ from legisbr.core.convert import (
 )
 from legisbr.core.document import Document
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
+
+logger = logging.getLogger(__name__)
 
 TYPES = {
     "Ato da Mesa Diretora": 17000000,

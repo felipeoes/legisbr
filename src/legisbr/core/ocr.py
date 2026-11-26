@@ -1,17 +1,15 @@
 """Shared PydanticAI OCR with bounded rendering and all-or-nothing batches."""
 
+from __future__ import annotations
+
 import asyncio
 from collections import defaultdict
 from collections.abc import Sequence
 from contextvars import ContextVar
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import fitz
 from pydantic import BaseModel
-from pydantic_ai import Agent, BinaryContent
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.usage import RunUsage
 from pydantic_core import to_jsonable_python
 from tenacity import (
     AsyncRetrying,
@@ -20,7 +18,27 @@ from tenacity import (
     wait_exponential,
 )
 
+from legisbr.core.convert import clean_md_tag
+
+if TYPE_CHECKING:
+    from pydantic_ai import BinaryContent
+    from pydantic_ai.usage import RunUsage
+
+__all__ = [
+    "DEFAULT_PROMPT",
+    "OCR",
+    "OCRError",
+    "OCROutput",
+    "clean_md_tag",
+    "usage_scope",
+]
+
 usage_scope: ContextVar[str] = ContextVar("ocr_usage_scope", default="global")
+
+_INSTALL_HINT = (
+    "Install OCR support with: pip install 'legisbr[ocr]' "
+    "(or ocr-anthropic / ocr-google / ocr-bedrock)"
+)
 
 
 class OCRError(Exception):
@@ -29,16 +47,6 @@ class OCRError(Exception):
 
 class OCROutput(BaseModel):
     text_markdown: str
-
-
-def clean_md_tag(md_content: str) -> str:
-    if md_content.startswith("```markdown"):
-        md_content = md_content.removeprefix("```markdown").strip()
-    elif md_content.startswith("```md"):
-        md_content = md_content.removeprefix("```md").strip()
-    if md_content.endswith("```"):
-        md_content = md_content.removesuffix("```").strip()
-    return md_content
 
 
 DEFAULT_PROMPT = """Você é um especialista de extração e formatação de textos jurídicos. O documento fornecido é uma norma jurídica. Extraia todo o conteúdo principal e formate-o em Markdown, seguindo rigorosamente estas regras:
@@ -67,9 +75,19 @@ class OCR:
         concurrency: int = 8,
         pdf_input: bool = False,
     ) -> None:
+        try:
+            from pydantic_ai import Agent, BinaryContent
+            from pydantic_ai.exceptions import ModelHTTPError
+            from pydantic_ai.models.fallback import FallbackModel
+            from pydantic_ai.usage import RunUsage
+        except ImportError as exc:
+            raise ImportError(_INSTALL_HINT) from exc
+
         names = [name.strip() for name in models.split(",") if name.strip()]
         if not names or batch_size < 1 or concurrency < 1:
             raise ValueError("OCR needs models and positive batch_size/concurrency")
+        self._binary_content = BinaryContent
+        self._model_http_error = ModelHTTPError
         model = FallbackModel(*names) if len(names) > 1 else names[0]
         self.agent = Agent(model, instructions=prompt, output_type=OCROutput)
         self.sem = asyncio.Semaphore(concurrency)
@@ -85,7 +103,7 @@ class OCR:
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(min=1, max=10),
-            retry=retry_if_exception_type((ModelHTTPError, TimeoutError)),
+            retry=retry_if_exception_type((self._model_http_error, TimeoutError)),
             reraise=True,
         ):
             with attempt:
@@ -111,7 +129,7 @@ class OCR:
                     texts.append(
                         await self._run(
                             [
-                                BinaryContent(data=png, media_type="image/png")
+                                self._binary_content(data=png, media_type="image/png")
                                 for png in pngs[offset : offset + self.batch_size]
                             ]
                         )
@@ -126,12 +144,12 @@ class OCR:
                 with fitz.open() as chunk:
                     chunk.insert_pdf(doc, from_page=start, to_page=end - 1)
                     return [
-                        BinaryContent(
+                        self._binary_content(
                             data=chunk.tobytes(), media_type="application/pdf"
                         )
                     ]
             return [
-                BinaryContent(
+                self._binary_content(
                     data=doc[i].get_pixmap(dpi=150).tobytes("png"),
                     media_type="image/png",
                 )

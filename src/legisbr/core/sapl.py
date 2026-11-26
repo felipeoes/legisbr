@@ -7,6 +7,8 @@ This base class provides the shared logic for:
   - PDF processing with pymupdf4llm → OCR fallback
 """
 
+from __future__ import annotations
+
 import re
 from collections.abc import AsyncIterator
 from typing import Any

@@ -1,3 +1,5 @@
+from __future__ import annotations
+import logging
 import re
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
@@ -6,11 +8,12 @@ from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
 from bs4 import BeautifulSoup, Tag
-from loguru import logger
 
 from legisbr.core.convert import calc_pages
 from legisbr.core.document import Document
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
+
+logger = logging.getLogger(__name__)
 
 TYPES = {
     "Constituição Estadual": "constituicao-estadual/detalhe.html?dswid=-4293",

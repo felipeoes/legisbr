@@ -1,62 +1,73 @@
-"""Scraper registration and site-specific runtime defaults."""
+"""Lazy scraper registration and site-specific runtime defaults."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from datetime import datetime
+from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from legisbr.config import (
-    SAVE_DIR,
-    SPECIFIC_LEGISLATION_SAVE_DIR,
-    STATE_LEGISLATION_SAVE_DIR,
-)
-from legisbr.core.scraper import BaseScraper
-from legisbr.scrapers.environment.conama import ConamaScraper
-from legisbr.scrapers.environment.icmbio import ICMBioScraper
-from legisbr.scrapers.federal.camara import CamaraDepScraper
-from legisbr.scrapers.states.ac import AcreLegisScraper
-from legisbr.scrapers.states.al import AlagoasSefazScraper
-from legisbr.scrapers.states.am import LegislaAMScraper
-from legisbr.scrapers.states.ap import AmapaAlapScraper
-from legisbr.scrapers.states.ba import BahiaLegislaScraper
-from legisbr.scrapers.states.ce import CearaAleceScraper
-from legisbr.scrapers.states.df import DFSinjScraper
-from legisbr.scrapers.states.es import ESAlesScraper
-from legisbr.scrapers.states.go import LegislaGoias
-from legisbr.scrapers.states.ma import MaranhaoAlemaScraper
-from legisbr.scrapers.states.mg import MGAlmgScraper
-from legisbr.scrapers.states.ms import MSAlemsScraper
-from legisbr.scrapers.states.mt import MTAlmtScraper
-from legisbr.scrapers.states.pa import ParaAlepaScraper
-from legisbr.scrapers.states.pb import ParaibaAlpbScraper
-from legisbr.scrapers.states.pe import PernambucoAlepeScraper
-from legisbr.scrapers.states.pi import PiauiAlepiScraper
-from legisbr.scrapers.states.pr import ParanaCVScraper
-from legisbr.scrapers.states.rj import RJAlerjScraper
-from legisbr.scrapers.states.rn import RNAlrnScraper
-from legisbr.scrapers.states.ro import RondoniaCotelScraper
-from legisbr.scrapers.states.rr import RoraimaAlerScraper
-from legisbr.scrapers.states.rs import RSAlrsScraper
-from legisbr.scrapers.states.sc import SantaCatarinaScraper
-from legisbr.scrapers.states.se import SergipeLegsonScraper
-from legisbr.scrapers.states.sp import SaoPauloAlespScraper
-from legisbr.scrapers.states.to import TocantinsScraper
+if TYPE_CHECKING:
+    from legisbr.core.scraper import BaseScraper
+
+Scope = Literal["federal", "state", "environment"]
+
+_CLS_CACHE: dict[tuple[str, str], type[BaseScraper]] = {}
+
+
+@dataclass(frozen=True)
+class SourceInfo:
+    """Lightweight, import-free metadata describing a registered source."""
+
+    code: str
+    name: str
+    scope: Scope
+    aliases: tuple[str, ...]
+    start_year: int
+    uses_pdf: bool
+    needs_ocr: bool
+    needs_proxy: bool
+    insecure_tls: bool
 
 
 @dataclass(frozen=True)
 class ScraperSpec:
-    cls: type[BaseScraper]
+    name: str
+    cls_name: str
+    cls_path: str
+    code: str
+    scope: Scope
     aliases: tuple[str, ...]
     start_year: int
+    uses_pdf: bool = False
     rps: float = 10
     workers: int = 16
     needs_proxy: bool = False
     needs_ocr: bool = False
-    browser_pages: int = 4
-    save_dir: Path = SAVE_DIR
     max_retries: int = 6
     pause_on_403: float = 0
     disable_cookies: bool = False
+    insecure_tls: bool = False
+    _cls: type[BaseScraper] | None = field(default=None, repr=False, compare=False)
+
+    def load_cls(self) -> type[BaseScraper]:
+        """Lazily import and cache the scraper class."""
+        if self._cls is not None:
+            return self._cls
+        key = (self.cls_path, self.cls_name)
+        cached = _CLS_CACHE.get(key)
+        if cached is not None:
+            return cached
+        module_path, _, attr = self.cls_path.partition(":")
+        attr_name = attr or self.cls_name
+        loaded: type[BaseScraper] = getattr(import_module(module_path), attr_name)
+        _CLS_CACHE[key] = loaded
+        return loaded
+
+    @property
+    def cls(self) -> type[BaseScraper]:
+        return self.load_cls()
 
     @property
     def years(self) -> range:
@@ -65,63 +76,209 @@ class ScraperSpec:
     @property
     def names(self) -> set[str]:
         return {
-            self.cls.__name__.lower(),
-            self.cls.__name__.removesuffix("Scraper").lower(),
-            self.cls.name.lower(),
+            self.cls_name.lower(),
+            self.cls_name.removesuffix("Scraper").lower(),
+            self.name.lower(),
+            self.code.lower(),
             *(alias.lower() for alias in self.aliases),
         }
 
-    @property
-    def database(self) -> Path:
-        return self.save_dir / self.cls.name / "documents.db"
+    def database_path(
+        self,
+        save_dir: Path,
+        *,
+        state_dir: Path | None = None,
+        specific_dir: Path | None = None,
+    ) -> Path:
+        root = save_dir
+        if self.scope == "state" and state_dir is not None:
+            root = state_dir
+        elif self.scope == "environment" and specific_dir is not None:
+            root = specific_dir
+        return root / self.name / "documents.db"
+
+    def info(self) -> SourceInfo:
+        return SourceInfo(
+            code=self.code,
+            name=self.name,
+            scope=self.scope,
+            aliases=self.aliases,
+            start_year=self.start_year,
+            uses_pdf=self.uses_pdf,
+            needs_ocr=self.needs_ocr,
+            needs_proxy=self.needs_proxy,
+            insecure_tls=self.insecure_tls,
+        )
 
 
-def state(*args: Any, **kwargs: Any) -> ScraperSpec:
-    return ScraperSpec(*args, save_dir=STATE_LEGISLATION_SAVE_DIR or SAVE_DIR, **kwargs)
+def _state(
+    name: str,
+    cls_name: str,
+    code: str,
+    aliases: tuple[str, ...],
+    start_year: int,
+    **kwargs: Any,
+) -> ScraperSpec:
+    return ScraperSpec(
+        name=name,
+        cls_name=cls_name,
+        cls_path=f"legisbr.scrapers.states.{code}:{cls_name}",
+        code=code,
+        scope="state",
+        aliases=aliases,
+        start_year=start_year,
+        **kwargs,
+    )
 
 
-SCRAPERS = [
-    ScraperSpec(CamaraDepScraper, (), 1808, rps=100),
+SCRAPERS: list[ScraperSpec] = [
     ScraperSpec(
-        ConamaScraper,
-        (),
-        1984,
+        name="LEGISLACAO_FEDERAL",
+        cls_name="CamaraDepScraper",
+        cls_path="legisbr.scrapers.federal.camara:CamaraDepScraper",
+        code="camara",
+        scope="federal",
+        aliases=(),
+        start_year=1808,
+        uses_pdf=True,
+        rps=100,
+    ),
+    ScraperSpec(
+        name="CONAMA",
+        cls_name="ConamaScraper",
+        cls_path="legisbr.scrapers.environment.conama:ConamaScraper",
+        code="conama",
+        scope="environment",
+        aliases=(),
+        start_year=1984,
+        uses_pdf=True,
         needs_ocr=True,
-        save_dir=SPECIFIC_LEGISLATION_SAVE_DIR or SAVE_DIR,
     ),
     ScraperSpec(
-        ICMBioScraper,
-        (),
-        2016,
+        name="ICMBIO",
+        cls_name="ICMBioScraper",
+        cls_path="legisbr.scrapers.environment.icmbio:ICMBioScraper",
+        code="icmbio",
+        scope="environment",
+        aliases=(),
+        start_year=2016,
+        uses_pdf=True,
         disable_cookies=True,
-        save_dir=SPECIFIC_LEGISLATION_SAVE_DIR or SAVE_DIR,
     ),
-    state(AcreLegisScraper, ("Acre", "AC"), 1963),
-    state(AlagoasSefazScraper, ("Alagoas", "AL"), 1942, needs_ocr=True, rps=5),
-    state(LegislaAMScraper, ("Amazonas", "AM"), 1956, rps=50),
-    state(AmapaAlapScraper, ("Amapa", "AP"), 1991),
-    state(BahiaLegislaScraper, ("Bahia", "BA"), 1891, max_retries=7, rps=1),
-    state(CearaAleceScraper, ("Ceara", "CE"), 1968, needs_ocr=True),
-    state(
-        DFSinjScraper,
+    _state("ACRE", "AcreLegisScraper", "ac", ("Acre", "AC"), 1963),
+    _state(
+        "ALAGOAS",
+        "AlagoasSefazScraper",
+        "al",
+        ("Alagoas", "AL"),
+        1942,
+        uses_pdf=True,
+        needs_ocr=True,
+        rps=5,
+    ),
+    _state("AMAZONAS", "LegislaAMScraper", "am", ("Amazonas", "AM"), 1956, rps=50),
+    _state("AMAPA", "AmapaAlapScraper", "ap", ("Amapa", "AP"), 1991),
+    _state(
+        "BAHIA",
+        "BahiaLegislaScraper",
+        "ba",
+        ("Bahia", "BA"),
+        1891,
+        max_retries=7,
+        rps=1,
+        insecure_tls=True,
+    ),
+    _state("CEARA", "CearaAleceScraper", "ce", ("Ceara", "CE"), 1968, needs_ocr=True),
+    _state(
+        "DISTRITO_FEDERAL",
+        "DFSinjScraper",
+        "df",
         ("DF", "DistritoFederal"),
         1922,
+        uses_pdf=True,
         needs_ocr=True,
         rps=100,
         workers=100,
     ),
-    state(ESAlesScraper, ("ES", "EspiritoSanto"), 1958, needs_ocr=True, rps=50),
-    state(LegislaGoias, ("Goias", "GO"), 1887, needs_ocr=True, rps=100),
-    state(MaranhaoAlemaScraper, ("Maranhao", "MA"), 1906, needs_ocr=True),
-    state(MSAlemsScraper, ("MS", "MatoGrossoDoSul"), 1979),
-    state(MTAlmtScraper, ("MT", "MatoGrosso"), 2017, needs_ocr=True, rps=5),
-    state(MGAlmgScraper, ("MG", "MinasGerais"), 1831, needs_ocr=True),
-    state(ParaAlepaScraper, ("Para", "PA"), 1990, needs_ocr=True, rps=5),
-    state(
-        ParaibaAlpbScraper, ("Paraiba", "PB"), 1924, needs_ocr=True, workers=2, rps=1
+    _state(
+        "ESPIRITO_SANTO",
+        "ESAlesScraper",
+        "es",
+        ("ES", "EspiritoSanto"),
+        1958,
+        uses_pdf=True,
+        needs_ocr=True,
+        rps=50,
     ),
-    state(
-        ParanaCVScraper,
+    _state(
+        "GOIAS",
+        "LegislaGoias",
+        "go",
+        ("Goias", "GO"),
+        1887,
+        uses_pdf=True,
+        needs_ocr=True,
+        rps=100,
+    ),
+    _state(
+        "MARANHAO",
+        "MaranhaoAlemaScraper",
+        "ma",
+        ("Maranhao", "MA"),
+        1906,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state(
+        "MATO_GROSSO_DO_SUL",
+        "MSAlemsScraper",
+        "ms",
+        ("MS", "MatoGrossoDoSul"),
+        1979,
+    ),
+    _state(
+        "MATO_GROSSO",
+        "MTAlmtScraper",
+        "mt",
+        ("MT", "MatoGrosso"),
+        2017,
+        needs_ocr=True,
+        rps=5,
+    ),
+    _state(
+        "MINAS_GERAIS",
+        "MGAlmgScraper",
+        "mg",
+        ("MG", "MinasGerais"),
+        1831,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state(
+        "PARA",
+        "ParaAlepaScraper",
+        "pa",
+        ("Para", "PA"),
+        1990,
+        uses_pdf=True,
+        needs_ocr=True,
+        rps=5,
+    ),
+    _state(
+        "PARAIBA",
+        "ParaibaAlpbScraper",
+        "pb",
+        ("Paraiba", "PB"),
+        1924,
+        uses_pdf=True,
+        needs_ocr=True,
+        workers=2,
+        rps=1,
+    ),
+    _state(
+        "PARANA",
+        "ParanaCVScraper",
+        "pr",
         ("Parana", "PR"),
         2025,
         # The site allows ~20 requests per rolling minute per IP; beyond that it answers
@@ -143,16 +300,107 @@ SCRAPERS = [
         # A retry after a proxy failure goes through the next proxy.
         max_retries=4,
     ),
-    state(PernambucoAlepeScraper, ("Pernambuco", "PE"), 1835),
-    state(PiauiAlepiScraper, ("Piaui", "PI"), 1922, needs_ocr=True),
+    _state(
+        "PERNAMBUCO",
+        "PernambucoAlepeScraper",
+        "pe",
+        ("Pernambuco", "PE"),
+        1835,
+    ),
+    _state(
+        "PIAUI",
+        "PiauiAlepiScraper",
+        "pi",
+        ("Piaui", "PI"),
+        1922,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
     # RJ documents use a 300 s timeout; 3 attempts caps one document at 15 min.
-    state(RJAlerjScraper, ("RJ", "RioDeJaneiro"), 1891, max_retries=3),
-    state(RNAlrnScraper, ("RN", "RioGrandeDoNorte"), 1971, needs_ocr=True),
-    state(RSAlrsScraper, ("RS", "RioGrandeDoSul"), 1830, needs_ocr=True),
-    state(RondoniaCotelScraper, ("Rondonia", "RO"), 1981, needs_ocr=True),
-    state(RoraimaAlerScraper, ("Roraima", "RR"), 1991, needs_ocr=True),
-    state(SantaCatarinaScraper, ("SC",), 1946),
-    state(SaoPauloAlespScraper, ("SaoPaulo", "SP"), 1835, needs_ocr=True),
-    state(SergipeLegsonScraper, ("Sergipe", "SE"), 1940, needs_ocr=True),
-    state(TocantinsScraper, ("TO",), 1989, needs_ocr=True),
+    _state(
+        "RIO_DE_JANEIRO",
+        "RJAlerjScraper",
+        "rj",
+        ("RJ", "RioDeJaneiro"),
+        1891,
+        max_retries=3,
+    ),
+    _state(
+        "RIO_GRANDE_DO_NORTE",
+        "RNAlrnScraper",
+        "rn",
+        ("RN", "RioGrandeDoNorte"),
+        1971,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state(
+        "RIO_GRANDE_DO_SUL",
+        "RSAlrsScraper",
+        "rs",
+        ("RS", "RioGrandeDoSul"),
+        1830,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state(
+        "RONDONIA",
+        "RondoniaCotelScraper",
+        "ro",
+        ("Rondonia", "RO"),
+        1981,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state(
+        "RORAIMA",
+        "RoraimaAlerScraper",
+        "rr",
+        ("Roraima", "RR"),
+        1991,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state("SANTA_CATARINA", "SantaCatarinaScraper", "sc", ("SC",), 1946),
+    _state(
+        "SAO_PAULO",
+        "SaoPauloAlespScraper",
+        "sp",
+        ("SaoPaulo", "SP"),
+        1835,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state(
+        "SERGIPE",
+        "SergipeLegsonScraper",
+        "se",
+        ("Sergipe", "SE"),
+        1940,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
+    _state(
+        "TOCANTINS",
+        "TocantinsScraper",
+        "to",
+        ("TO",),
+        1989,
+        uses_pdf=True,
+        needs_ocr=True,
+    ),
 ]
+
+
+def sources() -> list[SourceInfo]:
+    """Return metadata for all registered legislation sources without importing scrapers."""
+    return [spec.info() for spec in SCRAPERS]
+
+
+def get_spec(name: str) -> ScraperSpec:
+    """Resolve a single source by code, name, class name, or alias."""
+    key = name.strip().lower()
+    for spec in SCRAPERS:
+        if key in spec.names:
+            return spec
+    raise ValueError(f"Unknown source: {name}")

@@ -10,6 +10,8 @@ Run with:
     .venv/bin/pytest tests/test_paraiba_scraper.py -v
 """
 
+from __future__ import annotations
+
 import pytest
 from conftest import make_scraper
 from parser_assertions import ScraperClassTests, TypesConstantTests

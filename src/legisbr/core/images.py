@@ -1,13 +1,17 @@
 """Async utility for inlining ``<img>`` sources as base64 data URIs."""
 
+from __future__ import annotations
+
 import asyncio
 import base64
+import logging
 import mimetypes
 from collections.abc import Awaitable, Callable
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
-from loguru import logger
+
+logger = logging.getLogger(__name__)
 
 
 async def inline_images_in_html(

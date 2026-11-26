@@ -1,3 +1,5 @@
+from __future__ import annotations
+import logging
 import asyncio
 import re
 from collections.abc import AsyncIterator
@@ -5,7 +7,6 @@ from typing import Any
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
-from loguru import logger
 
 from legisbr.core.convert import (
     calc_pages,
@@ -15,6 +16,8 @@ from legisbr.core.convert import (
 )
 from legisbr.core.document import Document
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
+
+logger = logging.getLogger(__name__)
 
 TYPES = {
     "Constituição Estadual": 1,

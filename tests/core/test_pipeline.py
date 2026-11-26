@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
@@ -43,19 +44,16 @@ async def test_bounded_workers_year_isolation_and_global_resume():
         scraper.fetch.assert_not_called()
 
 
-async def test_cleanup_attempts_every_resource(tmp_path, monkeypatch):
-    monkeypatch.setattr("legisbr.core.scraper.LOG_DIR", tmp_path)
+async def test_cleanup_attempts_every_resource():
     http = HttpClient()
     http.close = AsyncMock(side_effect=RuntimeError("close failed"))
-    browser = AsyncMock()
     store = Store(":memory:")
-    scraper = Scraper(store=store, http=http, browser=browser, years=range(2024, 2025))
+    scraper = Scraper(store=store, http=http, years=range(2024, 2025))
     import pytest
 
     with pytest.raises(RuntimeError, match="close failed"):
         async with scraper:
             pass
-    browser.close.assert_awaited_once()
     assert store._connection is None
 
 
@@ -212,4 +210,4 @@ async def test_run_records_performance_stats():
     assert 0 <= stats["listing_seconds"] <= stats["seconds"]
     assert stats["fetch_p50"] <= stats["fetch_p95"] <= stats["fetch_max"]
     assert stats["http"] == {"requests": 0, "retries": 0, "bytes": 0}
-    assert stats["browser_navigations"] == 0
+    assert "browser_navigations" not in stats

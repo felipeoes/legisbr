@@ -4,6 +4,8 @@ Run with:
     .venv/bin/pytest tests/test_maranhao_scraper.py -v
 """
 
+from __future__ import annotations
+
 from bs4 import BeautifulSoup
 from conftest import make_scraper
 from parser_assertions import TypesConstantTests

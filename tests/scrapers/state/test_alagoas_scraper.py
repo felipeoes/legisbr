@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for alagoas_scraper."
 
+from __future__ import annotations
+
 import base64
 from unittest.mock import AsyncMock, MagicMock
 

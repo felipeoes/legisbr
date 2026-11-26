@@ -1,5 +1,7 @@
 """Regression tests for the Sergipe LegisOn API scraper, built from trimmed live responses."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock

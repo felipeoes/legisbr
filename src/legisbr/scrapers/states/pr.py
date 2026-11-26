@@ -4,6 +4,8 @@ Scrapes the Casa Civil legislation system at ``legislacao.pr.gov.br``: one
 unpaginated year listing per type, then one page per act.
 """
 
+from __future__ import annotations
+
 import re
 from collections.abc import AsyncIterator
 from urllib.parse import urljoin

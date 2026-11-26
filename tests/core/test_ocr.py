@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 
 import fitz
@@ -108,3 +109,11 @@ def test_ocr_output_requires_a_string(payload: dict) -> None:
 
     with pytest.raises(ValidationError):
         OCROutput.model_validate(payload)
+
+
+def test_ocr_missing_pydantic_ai_raises_install_hint(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pydantic_ai", None)
+    with pytest.raises(ImportError, match="legisbr\\[ocr\\]"):
+        OCR("openai:gpt-4.1-mini")

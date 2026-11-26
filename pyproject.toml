@@ -3,30 +3,65 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "legislation-scraper"
+name = "legisbr"
 version = "0.1.0"
 description = "Async web scraper for Brazilian federal and state legislation, with PDF/OCR extraction and structured data output."
 readme = "README.md"
-requires-python = ">=3.14"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Felipe Oliveira" }]
+keywords = [
+    "brazil",
+    "legislation",
+    "legal",
+    "scraper",
+    "async",
+    "pdf",
+    "ocr",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Legal Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
 dependencies = [
     "aiohttp>=3.13.3",
     "aiohttp-socks>=0.11.0",
     "beautifulsoup4>=4.13.4",
     "html-to-markdown>=3.22.0",
-    "loguru>=0.7.3",
     "lxml>=6.0",
-    "pydantic-ai-slim[openai,bedrock,anthropic,google]>=2.63",
-    "playwright>=1.58.0",
-    "playwright-stealth>=2.0.2",
+    "mammoth>=1.13.0",
+    "pydantic>=2.10",
     "pymupdf>=1.27.1",
     # 1.x requires the unused layout/onnxruntime stack.
     "pymupdf4llm>=0.3.4,<1",
     "pyrate-limiter>=4.0.2",
-    "python-dotenv>=1.1.1",
     "tenacity>=9.1.3",
-    "unidecode>=1.4.0",
-    "mammoth>=1.13.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/felipeoes/brazilian-legislation-scraper"
+Repository = "https://github.com/felipeoes/brazilian-legislation-scraper"
+Issues = "https://github.com/felipeoes/brazilian-legislation-scraper/issues"
+
+[project.optional-dependencies]
+ocr = ["pydantic-ai-slim[openai]>=2.63"]
+ocr-openai = ["pydantic-ai-slim[openai]>=2.63"]
+ocr-anthropic = ["pydantic-ai-slim[anthropic]>=2.63"]
+ocr-google = ["pydantic-ai-slim[google]>=2.63"]
+ocr-bedrock = ["pydantic-ai-slim[bedrock]>=2.63"]
+parquet = ["pyarrow>=18.0"]
+mcp = ["mcp>=1.9"]
+all = ["legisbr[ocr-openai,ocr-anthropic,ocr-google,ocr-bedrock,parquet,mcp]"]
 
 [dependency-groups]
 dev = [
@@ -54,10 +89,26 @@ exclude = [
     ".vscode/",
 ]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = [".", "src", "tests", "tests/core"]
+markers = [
+    "integration: marks tests as live-network integration tests (deselect with -m 'not integration')",
+]
+timeout = 300
+timeout_method = "thread"
+
 [tool.pyright]
 include = ["src/legisbr", "main.py"]
 typeCheckingMode = "basic"
-pythonVersion = "3.14"
+pythonVersion = "3.11"
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I002"]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]

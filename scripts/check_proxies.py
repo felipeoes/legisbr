@@ -7,6 +7,8 @@ re-reads PROXY_FILE_PATH every 60 s, so re-running this during a run refreshes t
 pool. Prints counts only, never proxy addresses.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import ssl

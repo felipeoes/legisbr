@@ -1,10 +1,11 @@
+from __future__ import annotations
+import logging
 import base64
 import re
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import quote
 
-from loguru import logger
 
 from legisbr.core.convert import (
     bytes_to_markdown,
@@ -16,6 +17,8 @@ from legisbr.core.convert import (
 )
 from legisbr.core.document import Document
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
+
+logger = logging.getLogger(__name__)
 
 TYPES = {
     "Constituição Estadual": "TIP080",

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import re
 from collections.abc import AsyncIterator
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit

@@ -1,8 +1,11 @@
 """Content detection, cleaning, and conversion with explicit dependencies."""
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import io
+import os
 import re
 import string
 import zipfile
@@ -10,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import fitz
 import mammoth
@@ -18,10 +21,30 @@ from bs4 import BeautifulSoup, Tag
 from html_to_markdown import ConversionOptions, PreprocessingOptions
 from html_to_markdown import convert as html_to_md
 
-from legisbr.config import PDF_WORKERS
 from legisbr.core.http import HttpClient, Response
 from legisbr.core.images import inline_images_in_html
-from legisbr.core.ocr import OCR, clean_md_tag
+
+if TYPE_CHECKING:
+    from legisbr.core.ocr import OCR
+
+_T = TypeVar("_T")
+
+
+def default_pdf_workers() -> int:
+    """Resolve worker count for PDF text extraction at call time."""
+    raw = os.environ.get("PDF_WORKERS")
+    return int(raw) if raw else min(8, os.cpu_count() or 1)
+
+
+def clean_md_tag(md_content: str) -> str:
+    if md_content.startswith("```markdown"):
+        md_content = md_content.removeprefix("```markdown").strip()
+    elif md_content.startswith("```md"):
+        md_content = md_content.removeprefix("```md").strip()
+    if md_content.endswith("```"):
+        md_content = md_content.removesuffix("```").strip()
+    return md_content
+
 
 _SERVER_ERROR_PATTERNS: list[str] = [
     "the requested url was not found on this server",
@@ -482,11 +505,11 @@ def _pdf_text_layer(
 _pool: ProcessPoolExecutor | None = None
 
 
-async def _in_process[T](function: Callable[..., T], *args: Any) -> T:
+async def _in_process(function: Callable[..., _T], *args: Any) -> _T:
     """CPU-bound PDF work in worker processes: pymupdf4llm holds the GIL."""
     global _pool
     if _pool is None:
-        _pool = ProcessPoolExecutor(PDF_WORKERS)
+        _pool = ProcessPoolExecutor(default_pdf_workers())
     pool = _pool
     try:
         return await asyncio.get_running_loop().run_in_executor(pool, function, *args)

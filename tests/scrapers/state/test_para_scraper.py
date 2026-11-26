@@ -1,5 +1,7 @@
 """Regression tests for the Pará Banco de Leis scraper, built from trimmed live pages."""
 
+from __future__ import annotations
+
 from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit

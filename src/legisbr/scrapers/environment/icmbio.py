@@ -1,14 +1,17 @@
+from __future__ import annotations
+
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
-from loguru import logger
-
 from legisbr.core.convert import clean_norm_soup
 from legisbr.core.document import Document
 from legisbr.core.scraper import BaseScraper
+
+logger = logging.getLogger(__name__)
 
 QUERY_URL = "https://wabi-brazil-south-api.analysis.windows.net/public/reports/querydata?synchronous=true"
 RESOURCE_KEY = "0d484acd-a8f7-46f0-ad8f-9bfd5486eee3"
@@ -196,7 +199,7 @@ class ICMBioScraper(BaseScraper):
                     try:
                         dt = datetime.fromtimestamp(val / 1000, tz=timezone.utc)
                         val = dt.strftime("%m/%d/%Y")
-                    except OSError, ValueError:
+                    except (OSError, ValueError):
                         pass
                 if val is None:
                     val = ""
@@ -269,7 +272,7 @@ class ICMBioScraper(BaseScraper):
         date_str = str(row.get("publicacao", ""))
         try:
             year = int(date_str.strip().split("/")[-1])
-        except ValueError, IndexError:
+        except (ValueError, IndexError):
             return None
         situation = row.get("condicao") or ""
         if not situation or situation in ("(Blank)", "(Em branco)"):

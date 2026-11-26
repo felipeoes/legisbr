@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for rio_grande_do_sul_scraper."
 
+from __future__ import annotations
+
 import subprocess
 import sys
 
@@ -215,4 +217,3 @@ class TestFetchHtmlNorm:
         )
         assert "programa estadual de teste" in doc.text_markdown
         assert doc.situation == "Vigente"
-        scraper.browser.snapshot.assert_not_called()

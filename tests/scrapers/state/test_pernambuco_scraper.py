@@ -1,5 +1,7 @@
 """Tests for PernambucoAlepeScraper."""
 
+from __future__ import annotations
+
 import ast
 import inspect
 from unittest.mock import AsyncMock

@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import copy
 import re
+import unicodedata
 import urllib.parse
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from bs4 import BeautifulSoup, Tag
-from unidecode import unidecode
 
 from legisbr.core.convert import (
     clean_norm_soup,
@@ -188,7 +190,12 @@ class RJAlerjScraper(BaseScraper):
 
     @staticmethod
     def _normalize_rj_text(text: str) -> str:
-        return re.sub("[^a-z0-9]+", "", unidecode(text).lower())
+        ascii_text = (
+            unicodedata.normalize("NFKD", text)
+            .encode("ascii", "ignore")
+            .decode("ascii")
+        )
+        return re.sub("[^a-z0-9]+", "", ascii_text.lower())
 
     @staticmethod
     def _extract_doc_number_and_year(

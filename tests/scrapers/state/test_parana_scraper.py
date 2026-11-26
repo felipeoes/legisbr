@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for parana_scraper."
 
+from __future__ import annotations
+
 import pytest
 from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
@@ -134,7 +136,6 @@ class TestFetch:
         assert doc.raw_ext == ".html"
         assert "Dispõe sobre assunto importante" in doc.text_markdown
         assert doc.situation == DEFAULT_VALID_SITUATION
-        scraper.browser.snapshot.assert_not_called()
 
     async def test_revoked_situation(self):
         scraper = _make_scraper()

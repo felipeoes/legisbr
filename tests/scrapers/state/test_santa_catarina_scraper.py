@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for santa_catarina_scraper."
 
+from __future__ import annotations
+
 import pytest
 from bs4 import BeautifulSoup
 from conftest import make_mock_response, make_scraper
@@ -173,7 +175,6 @@ class TestFetch:
         assert doc.raw == body.encode()
         assert doc.raw_ext == ".html"
         assert "procedimento administrativo" in doc.text_markdown
-        scraper.browser.snapshot.assert_not_called()
 
     async def test_unknown_code_raises_instead_of_becoming_type(self):
         scraper = _make_scraper()

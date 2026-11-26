@@ -1,5 +1,7 @@
 """Live source checks; excluded from the offline suite and pre-commit."""
 
+from __future__ import annotations
+
 import pytest
 
 from legisbr.core.document import Document

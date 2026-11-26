@@ -1,3 +1,4 @@
+from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
@@ -125,7 +126,7 @@ class MSAlemsScraper(BaseScraper):
                 continue
             try:
                 doc_count = int(entry.get("descendants") or "0")
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 continue
             if doc_count <= 0:
                 continue
@@ -139,7 +140,7 @@ class MSAlemsScraper(BaseScraper):
                 continue
             try:
                 return body.decode(encoding)
-            except LookupError, UnicodeDecodeError:
+            except (LookupError, UnicodeDecodeError):
                 continue
         return body.decode("utf-8", errors="replace")
 

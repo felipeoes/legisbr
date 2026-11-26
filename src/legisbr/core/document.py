@@ -1,11 +1,13 @@
 """Validated output shared by all scrapers."""
 
-from typing import Annotated, Any
+from __future__ import annotations
+
+from typing import Annotated, Any, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-type DocRef = dict[str, Any]
+DocRef: TypeAlias = dict[str, Any]
 
 
 def clean_title(text: str) -> str:

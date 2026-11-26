@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for espirito_santo_scraper."
 
+from __future__ import annotations
+
 import re
 
 from bs4 import BeautifulSoup

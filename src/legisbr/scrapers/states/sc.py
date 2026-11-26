@@ -8,6 +8,8 @@ Search: GET ``/legislativo?ano={year}&page={page}`` (legislative acts)
 Document: GET ``/ato-normativo/{path}/{id}`` returns full HTML content.
 """
 
+from __future__ import annotations
+
 import re
 from collections.abc import AsyncIterator
 from urllib.parse import urljoin

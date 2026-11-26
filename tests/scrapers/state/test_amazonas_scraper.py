@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for amazonas_scraper."
 
+from __future__ import annotations
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

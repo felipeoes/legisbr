@@ -1,5 +1,7 @@
 """Transactional document storage and streaming archive export."""
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import json
@@ -8,11 +10,13 @@ import re
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
 from legisbr.core.document import Document, clean_title
+
+_T = TypeVar("_T")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -47,7 +51,7 @@ class Store:
         self._lock = asyncio.Lock()
         self._connection: sqlite3.Connection | None = None
 
-    async def _call[T](self, operation: Callable[..., T], *args: Any) -> T:
+    async def _call(self, operation: Callable[..., _T], *args: Any) -> _T:
         async with self._lock:
             task = asyncio.create_task(asyncio.to_thread(operation, *args))
             try:

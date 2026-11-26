@@ -1,10 +1,11 @@
+from __future__ import annotations
+import logging
 import re
 import urllib.parse
 from collections.abc import AsyncIterator
 from typing import Any
 
 from bs4 import BeautifulSoup
-from loguru import logger
 
 from legisbr.core.convert import (
     bytes_to_markdown,
@@ -18,6 +19,8 @@ from legisbr.core.scraper import (
     DEFAULT_VALID_SITUATION,
     BaseScraper,
 )
+
+logger = logging.getLogger(__name__)
 
 TYPES = {
     "Resolução": 1,

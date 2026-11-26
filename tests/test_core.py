@@ -7,6 +7,8 @@ Covers:
 - RequestService (FailedRequest, detect_content_info)
 """
 
+from __future__ import annotations
+
 import asyncio
 
 import pytest

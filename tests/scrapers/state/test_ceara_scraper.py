@@ -1,5 +1,7 @@
 "Parser and metadata regression tests for ceara_scraper."
 
+from __future__ import annotations
+
 from collections import defaultdict
 from unittest.mock import AsyncMock
 
@@ -293,3 +295,67 @@ class TestFetchOverHttp:
                     type="Decreto Legislativo", document_url="x", _html_link="dl508.htm"
                 )
             )
+
+    async def test_image_only_static_page_uses_http_ocr_and_skips_spacers(self):
+        ocr = AsyncMock()
+        ocr.images = AsyncMock(return_value=_TEXT)
+        scraper = _make_scraper(ocr=ocr)
+        html = (
+            b'<html><body><div class="Section1">'
+            b'<img src="spacer.gif"><img src="page1.png">'
+            b"</div></body></html>"
+        )
+        spacer = b"GIF89a" + b"\x00" * 20
+        scan = b"\x89PNG\r\n\x1a\n" + b"\xff" * 256
+        scraper.http.request = AsyncMock(
+            side_effect=[
+                make_mock_response(html),
+                make_mock_response(spacer, content_type="image/gif"),
+                make_mock_response(scan, content_type="image/png"),
+            ]
+        )
+        doc = await scraper.fetch(
+            _ref(
+                type="Lei Complementar",
+                document_url="https://www2.al.ce.gov.br/legislativo/ementario/lc120.htm",
+                _html_link="lc120.htm",
+            )
+        )
+        ocr.images.assert_awaited_once_with([scan])
+        assert "Art. 1º" in doc.text_markdown
+        assert doc.raw == html and doc.raw_ext == ".html"
+
+    async def test_image_only_static_page_without_ocr_fails_visibly(self):
+        scraper = _make_scraper(ocr=None)
+        html = b'<html><body><div class="Section1"><img src="page1.png"></div></body></html>'
+        scan = b"\x89PNG\r\n\x1a\n" + b"\xff" * 256
+        scraper.http.request = AsyncMock(
+            side_effect=[
+                make_mock_response(html),
+                make_mock_response(scan, content_type="image/png"),
+            ]
+        )
+        with pytest.raises(ValueError, match="empty|short"):
+            await scraper.fetch(
+                _ref(
+                    type="Lei Complementar",
+                    document_url="https://www2.al.ce.gov.br/legislativo/ementario/lc120.htm",
+                    _html_link="lc120.htm",
+                )
+            )
+
+    async def test_empty_static_page_with_no_images_fails_visibly(self):
+        ocr = AsyncMock()
+        ocr.images = AsyncMock(return_value=_TEXT)
+        scraper = _make_scraper(ocr=ocr)
+        html = b'<html><body><div class="Section1"><p>   </p></div></body></html>'
+        scraper.http.request = AsyncMock(return_value=make_mock_response(html))
+        with pytest.raises(ValueError, match="empty|short"):
+            await scraper.fetch(
+                _ref(
+                    type="Lei Complementar",
+                    document_url="https://www2.al.ce.gov.br/legislativo/ementario/lc120.htm",
+                    _html_link="lc120.htm",
+                )
+            )
+        ocr.images.assert_not_awaited()

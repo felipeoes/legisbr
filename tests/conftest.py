@@ -1,5 +1,7 @@
 """Fakes use the normal scraper constructor and buffered HTTP responses."""
 
+from __future__ import annotations
+
 import json
 import sys
 from contextlib import asynccontextmanager
@@ -8,7 +10,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from legisbr.core.browser import BrowserPool
 from legisbr.core.http import HttpClient, Response
 from legisbr.core.store import Store
 
@@ -31,13 +32,7 @@ def make_scraper(cls, **overrides):
     http.request = AsyncMock(
         side_effect=AssertionError("Unexpected network request in unit test")
     )
-    browser = BrowserPool(limiter=http.limiter)
-    browser.snapshot = AsyncMock(
-        side_effect=AssertionError("Unexpected browser request in unit test")
-    )
-    scraper = cls(
-        store=Store(":memory:"), http=http, browser=browser, years=range(2024, 2025)
-    )
+    scraper = cls(store=Store(":memory:"), http=http, years=range(2024, 2025))
     for key, value in overrides.items():
         setattr(scraper, key, value)
     return scraper

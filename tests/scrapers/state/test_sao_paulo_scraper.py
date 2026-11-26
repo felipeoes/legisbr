@@ -1,5 +1,7 @@
 """Regression tests for the São Paulo (ALESP) API scraper, built from captured responses."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock

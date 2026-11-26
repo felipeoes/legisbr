@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import base64
+import logging
 import re
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -5,17 +9,21 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode, urljoin
 
-from bs4 import BeautifulSoup
-from loguru import logger
+from bs4 import BeautifulSoup, Tag
 
 from legisbr.core.convert import (
+    clean_markdown,
     clean_norm_soup,
-    pdf_to_markdown,
     remove_summary_element,
     valid_markdown,
 )
 from legisbr.core.document import Document
+from legisbr.core.images import _get_image_source
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
+
+logger = logging.getLogger(__name__)
+
+_MD_BASE64_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(data:image/[^;]+;base64,([^)]+)\)")
 
 TYPES = {
     "Ato Deliberativo": "ato-deliberativo",
@@ -262,11 +270,12 @@ class CearaAleceScraper(BaseScraper):
         if "NÄO EXISTE LEI COM ESTE NÚMERO".lower() in html_string.lower():
             raise ValueError("Invalid document (NÄO EXISTE LEI COM ESTE NÚMERO)")
         text_markdown = await self.markdown(html=html_string, base_url=url)
-        valid, reason = valid_markdown(text_markdown)
+        text_only = _MD_BASE64_IMAGE_RE.sub("", text_markdown).strip()
+        valid, reason = valid_markdown(text_only)
         if not valid:
-            pdf_md = await self._browser_pdf_to_markdown(url)
-            if pdf_md:
-                text_markdown = pdf_md
+            ocr_md = await self._ocr_embedded_images(content, url, text_markdown)
+            if ocr_md:
+                text_markdown = ocr_md
                 valid, reason = valid_markdown(text_markdown)
         if not valid:
             raise ValueError(reason)
@@ -339,8 +348,35 @@ class CearaAleceScraper(BaseScraper):
                 if ref.get("year") in self.years:
                     self._prefetched_docs[ref["year"]][norm_type].append(ref)
 
-    async def _browser_pdf_to_markdown(self, url: str) -> str:
-        async with self.browser.page() as page:
-            await self.browser.goto(page, url, wait_until="load", timeout=60000)
-            data = await page.pdf()
-        return await pdf_to_markdown(data, self.ocr)
+    async def _ocr_embedded_images(
+        self, content: BeautifulSoup | Tag, base_url: str, rendered_markdown: str = ""
+    ) -> str | None:
+        """Transcribe scanned image-only pages via OCR over plain HTTP."""
+        if self.ocr is None:
+            return None
+        images: list[bytes] = []
+        for b64_payload in _MD_BASE64_IMAGE_RE.findall(rendered_markdown):
+            try:
+                decoded = base64.b64decode(b64_payload)
+            except ValueError:
+                continue
+            if len(decoded) >= 100:
+                images.append(decoded)
+        if not images:
+            for img in content.find_all("img"):
+                src = _get_image_source(img)
+                if not src:
+                    continue
+                full_url = src if src.startswith("http") else urljoin(base_url, src)
+                try:
+                    data = (await self.http.request(full_url)).content
+                except Exception as exc:
+                    logger.debug(
+                        f"CEARA | Image fetch failed for '{full_url[:80]}': {exc}"
+                    )
+                    continue
+                if len(data) >= 100:
+                    images.append(data)
+        if not images:
+            return None
+        return clean_markdown(await self.ocr.images(images))
