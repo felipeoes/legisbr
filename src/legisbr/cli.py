@@ -13,14 +13,17 @@ from pathlib import Path
 from typing import Any
 
 from legisbr.registry import SCRAPERS, ScraperSpec, get_spec
-from legisbr.settings import Settings
+from legisbr.settings import Settings, export_dotenv
 
 logger = logging.getLogger(__name__)
 
 
 def load_settings() -> Settings:
     """Load CLI settings from environment and optional local .env file."""
-    return Settings.from_env(env_file=Path(".env"))
+    env_file = Path(".env")
+    settings = Settings.from_env(env_file=env_file)
+    export_dotenv(env_file)
+    return settings
 
 
 def parse_years_range(raw: str) -> range:
@@ -501,7 +504,7 @@ async def _run_search(args: argparse.Namespace, cfg: Settings) -> int:
     years = _resolve_years(args.year, args.years, default=None)
     items: list[dict[str, Any]] = []
     async with Client(
-        ocr=cfg.llm_model or None,
+        ocr=(cfg.llm_model or None) if args.fetch else None,
         proxy_file=cfg.proxy_file_path,
         proxy_endpoint=cfg.proxy_endpoint,
     ) as client:

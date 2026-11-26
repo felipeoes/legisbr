@@ -455,9 +455,12 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
         document_url=fake_ref["document_url"],
     )
 
+    created_clients: list[FakeClient] = []
+
     class FakeClient:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            created_clients.append(self)
 
         async def __aenter__(self):
             return self
@@ -472,7 +475,7 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
             return fake_doc
 
     monkeypatch.setattr("legisbr.client.Client", FakeClient)
-    cfg = Settings()
+    cfg = Settings(llm_model="anthropic:claude-haiku-5-5")
 
     assert (
         await cli.async_main(
@@ -494,6 +497,8 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
     )
     out = json.loads(capsys.readouterr().out)
     assert len(out) == 1 and out[0]["title"] == "Lei nº 14.133/2021"
+    # Metadata-only search never passes an OCR model to Client.
+    assert created_clients[-1].kwargs["ocr"] is None
 
     assert (
         await cli.async_main(
@@ -504,6 +509,56 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
     md = capsys.readouterr().out
     assert "# Lei nº 14.133/2021" in md
     assert "normas gerais de licitação" in md
+    assert created_clients[-1].kwargs["ocr"] == "anthropic:claude-haiku-5-5"
+
+
+def test_load_settings_exports_dotenv_provider_keys_and_respects_save_dir(
+    tmp_path, monkeypatch
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "LLM_MODEL=anthropic:claude-haiku-5-5",
+                "ANTHROPIC_API_KEY=sk-ant-from-dotenv",
+                "OPENAI_API_KEY=sk-openai-from-dotenv",
+                f"STATE_LEGISLATION_SAVE_DIR={tmp_path / 'dotenv_states'}",
+                f"SPECIFIC_LEGISLATION_SAVE_DIR={tmp_path / 'dotenv_specific'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    for key in (
+        "LLM_MODEL",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "SAVE_DIR",
+        "STATE_LEGISLATION_SAVE_DIR",
+        "SPECIFIC_LEGISLATION_SAVE_DIR",
+    ):
+        monkeypatch.setenv(key, "")
+        cli.os.environ.pop(key, None)
+
+    override_dir = tmp_path / "cli_override"
+    monkeypatch.setenv("SAVE_DIR", str(override_dir))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-from-shell")
+
+    cfg = cli.load_settings()
+
+    assert cfg.llm_model == "anthropic:claude-haiku-5-5"
+    assert cfg.save_dir == override_dir
+    assert cfg.state_legislation_save_dir is None
+    assert cfg.specific_legislation_save_dir is None
+    # Provider key from .env exported for pydantic_ai; existing shell key preserved.
+    assert cli.os.environ["ANTHROPIC_API_KEY"] == "sk-ant-from-dotenv"
+    assert cli.os.environ["OPENAI_API_KEY"] == "sk-openai-from-shell"
+    # Scoped dirs from .env did NOT leak into os.environ when SAVE_DIR was explicitly set.
+    assert "STATE_LEGISLATION_SAVE_DIR" not in cli.os.environ
+    assert "SPECIFIC_LEGISLATION_SAVE_DIR" not in cli.os.environ
+    # Both run (`_database_for`) and query (`cfg.save_dir`) resolve inside override_dir.
+    conama = cli.select_scrapers(["CONAMA"])[0]
+    assert cli._database_for(conama, cfg) == override_dir / "CONAMA" / "documents.db"
 
 
 def test_mcp_serve_command_wires_to_run_mcp_server(tmp_path, monkeypatch):

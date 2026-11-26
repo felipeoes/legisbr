@@ -91,6 +91,7 @@ class Client:
 
         self._entered = False
         self._stack = AsyncExitStack()
+        self._ocr_lock = asyncio.Lock()
         self._http_clients: dict[str, HttpClient] = {}
         self._scrapers: dict[str, BaseScraper] = {}
         self._setup_done: set[str] = set()
@@ -180,14 +181,16 @@ class Client:
         if not spec.needs_ocr:
             return None
         if self._ocr is None and self._ocr_model:
-            ocr = OCR(
-                models=self._ocr_model,
-                concurrency=self._ocr_concurrency,
-                dpi=self._ocr_dpi,
-            )
-            if self._entered:
-                await self._stack.enter_async_context(ocr.agent)
-            self._ocr = ocr
+            async with self._ocr_lock:
+                if self._ocr is None and self._ocr_model:
+                    ocr = OCR(
+                        models=self._ocr_model,
+                        concurrency=self._ocr_concurrency,
+                        dpi=self._ocr_dpi,
+                    )
+                    if self._entered:
+                        await self._stack.enter_async_context(ocr.agent)
+                    self._ocr = ocr
         return self._ocr
 
     def _build_scraper(
@@ -214,13 +217,19 @@ class Client:
         )
 
     async def _get_scraper(
-        self, spec: ScraperSpec, *, ensure_setup: bool = True
+        self,
+        spec: ScraperSpec,
+        *,
+        ensure_setup: bool = True,
+        need_ocr: bool = False,
     ) -> BaseScraper:
         scraper = self._scrapers.get(spec.code)
         if scraper is None:
-            ocr = await self._ensure_ocr(spec)
+            ocr = await self._ensure_ocr(spec) if need_ocr else None
             scraper = self._build_scraper(spec, years=spec.years, ocr=ocr)
             self._scrapers[spec.code] = scraper
+        elif need_ocr and scraper.ocr is None:
+            scraper.ocr = await self._ensure_ocr(spec)
         if ensure_setup and spec.code not in self._setup_done:
             lock = self._setup_locks.setdefault(spec.code, asyncio.Lock())
             async with lock:
@@ -341,7 +350,7 @@ class Client:
     async def fetch_ref(self, source: str, ref: DocRef) -> Document:
         """Fetch and convert a single document reference, reusing cached scraper setup."""
         spec = get_spec(source)
-        scraper = await self._get_scraper(spec, ensure_setup=True)
+        scraper = await self._get_scraper(spec, ensure_setup=True, need_ocr=True)
         doc = await scraper.fetch(dict(ref))
         if doc is None:
             raise ValueError("Fetch produced no document")

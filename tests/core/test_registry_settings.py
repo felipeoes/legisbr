@@ -14,7 +14,7 @@ from legisbr.core.http import HttpClient
 from legisbr.core.scraper import BaseScraper
 from legisbr.core.store import Store
 from legisbr.registry import SCRAPERS, SourceInfo, get_spec, sources
-from legisbr.settings import Settings
+from legisbr.settings import Settings, export_dotenv
 
 
 def test_all_30_sources_resolve_cleanly_and_match_classes():
@@ -138,3 +138,97 @@ def test_settings_from_env_reads_env_file_without_mutating_os_environ(
     assert settings.save_dir == tmp_path / "out"
     assert settings.log_dir == tmp_path / "logs"
     assert settings.build_proxy_config() == {"file_path": "proxies.txt"}
+
+
+def test_settings_from_env_explicit_save_dir_overrides_dotenv_scoped_dirs(
+    tmp_path: Path,
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"SAVE_DIR={tmp_path / 'default'}",
+                f"STATE_LEGISLATION_SAVE_DIR={tmp_path / 'states'}",
+                f"SPECIFIC_LEGISLATION_SAVE_DIR={tmp_path / 'specific'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Without SAVE_DIR in environ, .env scoped dirs still apply.
+    from_dotenv = Settings.from_env(env_file=env_file, environ={})
+    assert from_dotenv.save_dir == tmp_path / "default"
+    assert from_dotenv.state_legislation_save_dir == tmp_path / "states"
+    assert from_dotenv.specific_legislation_save_dir == tmp_path / "specific"
+
+    # Explicit SAVE_DIR in environ suppresses .env's STATE_* / SPECIFIC_* overrides.
+    override_dir = tmp_path / "override"
+    overridden = Settings.from_env(
+        env_file=env_file, environ={"SAVE_DIR": str(override_dir)}
+    )
+    assert overridden.save_dir == override_dir
+    assert overridden.state_legislation_save_dir is None
+    assert overridden.specific_legislation_save_dir is None
+
+    # Explicit STATE_LEGISLATION_SAVE_DIR in environ alongside SAVE_DIR is still honored.
+    explicit_state = tmp_path / "explicit_states"
+    both = Settings.from_env(
+        env_file=env_file,
+        environ={
+            "SAVE_DIR": str(override_dir),
+            "STATE_LEGISLATION_SAVE_DIR": str(explicit_state),
+        },
+    )
+    assert both.save_dir == override_dir
+    assert both.state_legislation_save_dir == explicit_state
+    assert both.specific_legislation_save_dir is None
+
+
+def test_export_dotenv_exports_missing_keys_and_respects_existing_env(
+    tmp_path: Path, monkeypatch
+):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "LEGISBR_PROVIDER_A=from_dotenv_a",
+                "LEGISBR_PROVIDER_B=from_dotenv_b",
+                f"SAVE_DIR={tmp_path / 'dotenv_save'}",
+                f"STATE_LEGISLATION_SAVE_DIR={tmp_path / 'dotenv_states'}",
+                f"SPECIFIC_LEGISLATION_SAVE_DIR={tmp_path / 'dotenv_specific'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # Track keys with monkeypatch so teardown cleans up everything added.
+    for key in (
+        "LEGISBR_PROVIDER_A",
+        "LEGISBR_PROVIDER_B",
+        "SAVE_DIR",
+        "STATE_LEGISLATION_SAVE_DIR",
+        "SPECIFIC_LEGISLATION_SAVE_DIR",
+    ):
+        monkeypatch.setenv(key, "")
+        os.environ.pop(key, None)
+
+    monkeypatch.setenv("LEGISBR_PROVIDER_B", "from_shell_b")
+    monkeypatch.setenv("SAVE_DIR", str(tmp_path / "shell_save"))
+
+    export_dotenv(env_file)
+
+    assert os.environ["LEGISBR_PROVIDER_A"] == "from_dotenv_a"
+    assert os.environ["LEGISBR_PROVIDER_B"] == "from_shell_b"
+    assert os.environ["SAVE_DIR"] == str(tmp_path / "shell_save")
+    # Scoped dirs from .env are not exported when SAVE_DIR was already explicitly set.
+    assert "STATE_LEGISLATION_SAVE_DIR" not in os.environ
+    assert "SPECIFIC_LEGISLATION_SAVE_DIR" not in os.environ
+
+    # Without SAVE_DIR in os.environ, .env's SAVE_DIR and scoped dirs are all exported.
+    os.environ.pop("SAVE_DIR", None)
+    export_dotenv(env_file)
+    assert os.environ["SAVE_DIR"] == str(tmp_path / "dotenv_save")
+    assert os.environ["STATE_LEGISLATION_SAVE_DIR"] == str(tmp_path / "dotenv_states")
+    assert os.environ["SPECIFIC_LEGISLATION_SAVE_DIR"] == str(
+        tmp_path / "dotenv_specific"
+    )

@@ -412,3 +412,70 @@ async def test_scraper_forwards_pdf_executor_and_workers_to_bytes_to_markdown(
     )
     await scraper.download("https://example.org/a.pdf")
     assert captured == {"pdf_executor": "thread", "pdf_workers": 1}
+
+
+async def test_client_defers_ocr_construction_until_fetch_or_scrape(monkeypatch):
+    created_ocr: list[dict] = []
+
+    class FakeAgent:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+    class FakeOCR:
+        def __init__(self, models, **kwargs):
+            created_ocr.append({"models": models, **kwargs})
+            self.agent = FakeAgent()
+
+        def usage_for(self, scope):
+            return {}
+
+    fake_spec = _make_fake_spec(
+        _StreamingDummyScraper,
+        code="ocrsrc",
+        name="OCRSRC",
+        needs_ocr=True,
+        capabilities=SearchCapabilities(native_year=True, native_type=True),
+    )
+    monkeypatch.setattr("legisbr.client.get_spec", lambda name: fake_spec)
+    monkeypatch.setattr("legisbr.client.OCR", FakeOCR)
+
+    async with Client(ocr="anthropic:claude-haiku-5-5") as client:
+        # Metadata-only list_refs() and search_refs() must NEVER construct OCR.
+        refs = [
+            ref async for ref in client.list_refs("ocrsrc", years=2024, types=["Lei"])
+        ]
+        assert len(refs) == 10
+        assert created_ocr == []
+        assert client._scrapers["ocrsrc"].ocr is None
+
+        found = [
+            ref
+            async for ref in client.search_refs(
+                "ocrsrc", years=2024, type="Lei", limit=2
+            )
+        ]
+        assert len(found) == 2
+        assert created_ocr == []
+        assert client._scrapers["ocrsrc"].ocr is None
+
+        # Only fetch_ref() triggers OCR construction and attaches it to cached scraper.
+        doc1 = await client.fetch_ref("ocrsrc", found[0])
+        assert doc1.title == found[0]["title"]
+        assert len(created_ocr) == 1
+        assert created_ocr[0]["models"] == "anthropic:claude-haiku-5-5"
+        assert isinstance(client._scrapers["ocrsrc"].ocr, FakeOCR)
+
+        # Subsequent fetch_ref() reuses the same OCR instance.
+        await client.fetch_ref("ocrsrc", found[1])
+        assert len(created_ocr) == 1
+
+    # Fresh Client calling scrape() constructs OCR once.
+    created_ocr.clear()
+    async with Client(ocr="anthropic:claude-haiku-5-5") as client:
+        async with client.scrape("ocrsrc", years=2024, types=["Lei"], limit=1) as docs:
+            got = [doc async for doc in docs]
+        assert len(got) == 1
+        assert len(created_ocr) == 1
