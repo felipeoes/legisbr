@@ -157,7 +157,7 @@ class RunResult:
     )
 
     def stats(self) -> dict:
-        """Performance summary stored with the run (see `main.py stats`)."""
+        """Performance summary stored with the run (see `legisbr stats`)."""
         p50 = self.fetch_histogram.quantile(0.5)
         p95 = self.fetch_histogram.quantile(0.95)
         pmax = self.fetch_histogram.max_val

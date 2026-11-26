@@ -1,55 +1,45 @@
-# Brazilian Legislation Scraper
+# `legisbr`
+
+See [AGENTS.md](../AGENTS.md) for the authoritative repository development guide.
 
 ## Project Overview
-This is a Python-based asynchronous web scraper designed to collect legal documents regarding Brazilian legislation at the federal and state levels, as well as from environment regulatory bodies like CONAMA and ICMBio. It extracts structured data and saves it as JSON files grouped by year.
 
-**Key Features & Architecture:**
-- **Concurrency:** Built heavily on `asyncio` and `aiohttp` for non-blocking I/O.
-- **Data Extraction:** Supports PDF to Markdown conversion and includes optional LLM-powered OCR (using OpenAI-compatible APIs or AWS Bedrock Converse) for image-based documents.
-- **Browser Automation:** Uses Playwright for JavaScript-rendered pages.
-- **Rate Limiting:** Independent per-scraper rate limiting for HTTP requests and shared rate limiting for LLM API calls.
-- **Proxy Support:** Includes optional proxy rotation from a file or HTTP endpoint.
+`legisbr` (`felipeoes/legisbr`) is an async Python library, CLI, and optional MCP server covering **30 official Brazilian legislation portals** (Federal Câmara dos Deputados, all 27 state jurisdictions, CONAMA, and ICMBio).
 
-**Tech Stack:** Python (>=3.12), `uv` (package manager), `aiohttp`, `Playwright`, `openai`, `aiofiles`, `loguru`, `tenacity`.
+- **Pure HTTP:** Zero Playwright or Chromium overhead.
+- **Permissive Core:** `aiohttp`, `beautifulsoup4` (`lxml`), `html-to-markdown`, `mammoth`, `pdf_oxide`, `pypdf`, `pydantic`, `tenacity` (100% permissive MIT/BSD/Apache licenses).
+- **Storage & Search:** Zero-disk async streaming (`legisbr.Client`), SQLite Schema v2 archives with Portuguese diacritic-insensitive FTS5, streaming ZSTD Parquet export (`legisbr[parquet]`), read-only multi-archive `ArchiveIndex`, and an optional MCP server (`legisbr[mcp]`).
+- **Optional OCR & Proxies:** PydanticAI OCR (`legisbr[ocr-*]`) and SOCKS/HTTP proxy rotation (`legisbr[proxy]`).
 
-## Building and Running
+## Commands
 
-The project relies on `uv` for dependency management and execution.
+Python 3.11+ (tested on 3.11–3.14), managed with `uv`:
 
-### Environment Setup
-1. Install dependencies: `uv sync`
-2. Install Playwright browsers: `uv run playwright install chromium`
-3. Configure environment variables by copying `.env.example` to `.env` and filling in the necessary API keys and paths.
+```bash
+uv sync --all-extras --group dev
+uv run legisbr list
+uv run legisbr run -s Acre Conama --year 2024 --no-raw --fts
+uv run legisbr search -s Camara --year 2021 --number 14133 --strict-native --fetch
+uv run legisbr index --all
+uv run legisbr query "licenciamento ambiental" --year 2024
+uv run legisbr export -s Acre --format parquet --single-file --out exports/acre.parquet
+uv run legisbr stats
+uv run legisbr mcp serve --data-dir outputs/legislation
+```
 
-### Execution Commands
-*   **Run enabled scrapers:**
-    ```bash
-    uv run main.py
-    ```
-*   **Run specific scrapers by name:**
-    ```bash
-    uv run main.py --scrapers Conama SaoPauloAlesp
-    ```
-*   **List all available scrapers:**
-    ```bash
-    uv run main.py --list
-    ```
-*   **Run with verbose logging:**
-    ```bash
-    uv run main.py --verbose
-    ```
-*   **Force re-scrape (ignore resume logic):**
-    ```bash
-    uv run main.py --overwrite
-    ```
+## Lint, Format & Tests
 
-## Development Conventions
+```bash
+uv run ruff check --fix src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+uv run ruff format src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+uv run pytest tests -m "not integration" -n auto --timeout=60
+uv run pytest tests -m integration
+uv run pre-commit run --all-files
+```
 
-*   **Dependency Management:** Always use `uv` for managing dependencies and running scripts.
-*   **Asynchronous Code:** The codebase is heavily asynchronous (`async`/`await`). Maintain this pattern for network and file I/O operations.
-*   **Linting and Formatting:** The project uses `ruff` for both linting and formatting.
-    *   Check and fix: `uv run ruff check --fix src/ main.py`
-    *   Format code: `uv run ruff format src/ main.py`
-*   **Pre-commit Hooks:** Use pre-commit to ensure code quality before pushing.
-    *   Run hooks on all files: `uv run pre-commit run --all-files`
-*   **Testing:** Not explicitly found in the root structure, but any new additions should ideally conform to the existing `async` patterns and error-handling strategies using `tenacity` for retries.
+## Key Conventions
+
+- Every module starts with `from __future__ import annotations` (Ruff `I002`, `target-version = "py311"`).
+- Use stdlib `logging.getLogger(__name__)` everywhere; centralize environment loading in `src/legisbr/settings.py` (never auto-load `.env` at import time).
+- Keep scraper constructors pure and put I/O initialization in `setup()`. Yield `DocRef` dicts from `list_type()`/`list_documents()` and build `Document` only in `fetch()`.
+- Construct scrapers normally with fakes from `tests/conftest.py` (no `object.__new__`); mark live-network tests `@pytest.mark.integration`.

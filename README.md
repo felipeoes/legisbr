@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/legisbr.svg)](https://pypi.org/project/legisbr/)
 [![Python](https://img.shields.io/pypi/pyversions/legisbr.svg)](https://pypi.org/project/legisbr/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/felipeoes/brazilian-legislation-scraper/actions/workflows/ci.yml/badge.svg)](https://github.com/felipeoes/brazilian-legislation-scraper/actions/workflows/ci.yml)
+[![CI](https://github.com/felipeoes/legisbr/actions/workflows/ci.yml/badge.svg)](https://github.com/felipeoes/legisbr/actions/workflows/ci.yml)
 
 High-performance, async Python library, CLI, and MCP server covering **30 official Brazilian legislation portals** — Federal legislation (Câmara dos Deputados), all **27 state jurisdictions**, CONAMA, and ICMBio.
 

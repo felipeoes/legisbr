@@ -1,79 +1,55 @@
-# Copilot Instructions
+# Copilot Instructions (`legisbr`)
 
-## Build & Run
+See [AGENTS.md](../AGENTS.md) for the authoritative repository development guide.
 
-```bash
-uv sync                              # install deps
-uv sync --group dev                  # install dev deps
-uv run playwright install chromium   # install browser (needed by 3 state scrapers)
+## Build, Run & Test
 
-uv run main.py                       # run enabled scrapers
-uv run main.py --scrapers AcreLegis Conama  # run specific scrapers by short name or class name
-uv run main.py --list                # list all scrapers and their on/off status
-uv run main.py --verbose             # show all info/debug logs (default shows only warnings + tqdm bars)
-uv run main.py --overwrite           # ignore resume logic, re-scrape everything
-```
-
-## Lint & Format
+Python 3.11+ (tested on 3.11–3.14), managed with `uv`. Pure HTTP — no Playwright or Chromium required.
 
 ```bash
-uv run ruff check --fix src/ main.py
-uv run ruff format src/ main.py
-uv run pre-commit run --all-files     # trailing-whitespace, end-of-file-fixer, ruff
+uv sync --all-extras --group dev
+uv run legisbr list
+uv run legisbr run -s Acre Conama --year 2024 --no-raw --fts
+uv run legisbr search -s Camara --year 2021 --number 14133 --strict-native --fetch
+uv run legisbr index --all
+uv run legisbr query "licenciamento ambiental" --year 2024
+uv run legisbr export -s Acre --format parquet --single-file --out exports/acre.parquet
+uv run legisbr stats
+uv run legisbr mcp serve --data-dir outputs/legislation
 ```
 
-There are no tests in this project.
+## Lint, Format & Tests
+
+```bash
+uv run ruff check --fix src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+uv run ruff format src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+uv run pytest tests -m "not integration" -n auto --timeout=60
+uv run pytest tests -m integration
+uv run pre-commit run --all-files
+```
 
 ## Architecture
 
-### Class Hierarchy
+- `src/legisbr/__init__.py`: PEP 562 lazy public exports (`Client`, `Store`, `ArchiveIndex`, `SearchHit`, `Document`, `OCR`, `Query`, `SearchCapabilities`, `UnsupportedQueryError`, `ErrorRecord`, `DocumentSink`, `NullSink`, `Settings`, `scrape`, `search_refs`, `sources`, `SourceInfo`) with `logging.NullHandler()` and fast (<30 ms) zero-heavy-import startup.
+- `src/legisbr/registry.py`: Lazy `ScraperSpec` entries for all 30 official sources (27 states, Câmara dos Deputados, CONAMA, ICMBio) with codes, aliases, start years, rates, workers, `insecure_tls` (`ac` and `ba` only), and `SearchCapabilities`.
+- `src/legisbr/client.py`: Async `Client` facade managing per-source `HttpClient` pools, cached `setup()` scrapers, `low_memory` preset, `list_refs()`, `search_refs()`, `fetch_ref()`, and PEP 789-safe `async with client.scrape(...)`.
+- `src/legisbr/cli.py` & `src/legisbr/__main__.py`: Stdlib-only CLI (`legisbr` / `python -m legisbr`).
+- `src/legisbr/mcp_server.py`: Optional MCP server (`legisbr[mcp]`) for read-only archive queries and opt-in `--allow-live-fetch`.
+- `src/legisbr/core/`:
+  - `document.py`: Pydantic `Document` (`DocRef` alias) with validated Markdown.
+  - `sink.py`: `ErrorRecord`, `DocumentSink` protocol, and stateless `NullSink`.
+  - `store.py` & `archive.py`: SQLite Schema v2 per archive with Portuguese diacritic-insensitive FTS5, streaming JSON/JSONL/ZSTD Parquet export, and read-only multi-archive `ArchiveIndex`.
+  - `scraper.py` & `sapl.py`: `BaseScraper` bounded queue workers, resume deduplication, stats, streaming, and shared SAPL API support (`pb`, `pi`, `rr`).
+  - `http.py` & `proxy.py`: `HttpClient`, zero-dependency GCRA `RateLimiter`, verified TLS by default, and optional proxy rotation (`legisbr[proxy]`).
+  - `pdf.py`, `convert.py`, `images.py`, `ocr.py`: Permissive `pdf_oxide` + `pypdf` PDF pipeline, HTML/DOCX conversion, bounded single-flight `ImageCache`, and optional PydanticAI `OCR` (`legisbr[ocr-*]`).
+- `src/legisbr/scrapers/`: `states/<uf>.py`, `federal/camara.py`, and `environment/{conama,icmbio}.py`.
 
-```
-BaseScraper                          # src/scraper/base/scraper.py — async HTTP, PDF/OCR, markdown, save/resume
-  └─ StateScraper                    # same file — sets STATE_LEGISLATION_SAVE_DIR default
-       ├─ SAPLBaseScraper            # src/scraper/base/sapl_scraper.py — for SAPL REST API sites (Paraíba, Piauí, Roraima)
-       └─ (27 state scrapers)       # src/scraper/state_legislation/<state>.py
-  └─ CamaraDepScraper               # federal
-  └─ ConamaScraper, ICMBioScraper   # envrionment regulatory bodies
-```
+## Scraper Contract & Conventions
 
-All scrapers inherit from `BaseScraper`. State scrapers go through `StateScraper`. States using the SAPL REST API extend `SAPLBaseScraper`.
-
-### Services (composed into BaseScraper)
-
-- **RequestService** (`src/services/request/service.py`) — `aiohttp` with per-scraper `RateLimiter`, retries via `tenacity`, optional proxy rotation.
-- **LLMOCRService** (`src/services/ocr/llm.py`) — renders PDF pages to PNG via PyMuPDF, sends to LLM vision model. Provider clients live in `src/services/ocr/clients/`, including `OpenAIClient`, `BedrockClient`, and `SnowflakeClient`.
-- **BrowserService** (`src/services/browser/playwright.py`) — Playwright page pool for JS-rendered sites. Used by Maranhão, Paraná, and Pernambuco.
-- **ProxyService** (`src/services/proxy/service.py`) — proxy rotation from file or HTTP endpoint.
-- **FileSaver** (`src/database/saver.py`) — async JSON persistence via `aiofiles`. Saves documents grouped by year into `data.json` files with document-level resume support.
-
-### Concurrency Model
-
-- **Years** — scraped **sequentially** (one year completes before next).
-- **Types/Situations within a year** — scraped **concurrently** via `asyncio.gather()`.
-- **Pages and documents** — scraped **concurrently** via `_gather_results()` (wraps `asyncio.gather` with error filtering and progress bars).
-- **Rate limiting** — each scraper has its own `RateLimiter` for HTTP (via `rps` param). All scrapers share a single `RateLimiter` for LLM API calls.
-- **CPU-bound work** (PDF rendering) — offloaded via `asyncio.to_thread()` / `run_in_thread()`.
-
-### Adding a New State Scraper
-
-1. Create `src/scraper/state_legislation/<state>.py`.
-2. Subclass `StateScraper` (or `SAPLBaseScraper` for SAPL API sites).
-3. Define module-level `TYPES` dict/list and `SITUATIONS` list.
-4. Implement `_format_search_url()`, `_get_docs_links()`, `_get_doc_data()`, and `_scrape_type()`.
-5. Export the class from `src/scraper/state_legislation/__init__.py`.
-6. Add a `ScraperConfig` entry in `main.py` → `build_scraper_configs()`.
-
-### Key Patterns
-
-- Use `_build_doc_result()` to construct output dicts with a consistent schema (`year`, `type`, `situation`, `title`, `text_markdown`, `document_url`).
-- Use `_save_doc_result()` to persist documents immediately (supports raw file saving + `data.json` append).
-- Use `_save_doc_error()` to log document-level failures.
-- Use `_is_already_scraped()` for resume support — checks `(document_url, title)` keys loaded by `_load_scraped_keys()`.
-- Use `_get_markdown()` for flexible content→markdown conversion (accepts url, response, stream, or html_content).
-- Use `_download_and_convert()` when you also need the raw bytes (e.g., for saving source PDFs).
-- The LLM OCR prompt is in Portuguese and defined as a default parameter in `BaseScraper.__init__`. Override `llm_prompt` only if a scraper needs different extraction instructions.
-
-## Environment
-
-Python ≥ 3.12, managed with `uv`. Config via `.env` (copy `.env.example`). Key variables: `LLM_API_KEY`, `LLM_MODEL`, `PROVIDER_BASE_URL`, `SAVE_DIR`, `STATE_LEGISLATION_SAVE_DIR`.
+- Keep scraper constructors pure (attribute assignment only); do I/O initialization in `async def setup()`.
+- Implement `list_type(year, name, value)` (or override `list_documents(year)`) yielding `DocRef` dicts with stable `document_url` and `title`, and build `Document` only inside `fetch(ref)`.
+- Every Python module must begin with `from __future__ import annotations` (enforced by Ruff `I002`, `target-version = "py311"`).
+- Use stdlib `logging.getLogger(__name__)` everywhere; never auto-load `.env` or mutate `os.environ` at import time (centralize env config in `src/legisbr/settings.py`).
+- Keep core dependencies 100% permissive (`scripts/check_licenses.py --mode core`) and optional extras free of GPL/AGPL/LGPL (`--mode extras`).
+- Never swallow errors or add custom scraper retry loops; preserve embedded images (`embed_images=True`, inline HTML images before Markdown conversion) and use BeautifulSoup's `lxml` parser.
+- Write offline unit tests using fakes from `tests/conftest.py` (no `object.__new__`); mark any live-network tests with `@pytest.mark.integration`.
