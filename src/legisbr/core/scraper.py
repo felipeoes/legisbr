@@ -19,6 +19,7 @@ from legisbr.core.convert import (
 )
 from legisbr.core.document import DocRef, Document, clean_title
 from legisbr.core.http import HttpClient
+from legisbr.core.images import ImageCache
 from legisbr.core.ocr import OCR, usage_scope
 from legisbr.core.store import Store
 
@@ -81,10 +82,16 @@ class BaseScraper:
         ocr: OCR | None = None,
         workers: int = 16,
         overwrite: bool = False,
+        image_cache: ImageCache | None = None,
     ) -> None:
         if workers < 1:
             raise ValueError("workers must be positive")
         self.store, self.http, self.ocr = (store, http, ocr)
+        self.image_cache = (
+            image_cache
+            if image_cache is not None
+            else getattr(http, "image_cache", None) or ImageCache()
+        )
         self.years, self.workers, self.overwrite = (years, workers, overwrite)
         self._stack = AsyncExitStack()
         self._run_id: int | None = None
@@ -277,7 +284,9 @@ class BaseScraper:
         async def fetch_image(url: str) -> bytes:
             return (await self.http.request(url)).content
 
-        return await html_to_markdown(html, base_url or self.base_url, fetch_image)
+        return await html_to_markdown(
+            html, base_url or self.base_url, fetch_image, cache=self.image_cache
+        )
 
     async def fetch_pdf(self, ref: DocRef) -> Document:
         url = urljoin(self.base_url, ref.get("_pdf_link") or ref["document_url"])

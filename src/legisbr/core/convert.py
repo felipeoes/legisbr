@@ -22,7 +22,7 @@ from html_to_markdown import ConversionOptions, PreprocessingOptions
 from html_to_markdown import convert as html_to_md
 
 from legisbr.core.http import HttpClient, Response
-from legisbr.core.images import inline_images_in_html
+from legisbr.core.images import ImageCache, inline_images_in_html
 
 if TYPE_CHECKING:
     from legisbr.core.ocr import OCR
@@ -401,9 +401,13 @@ def valid_markdown(text_markdown: str | None, min_length: int = 50) -> tuple[boo
 
 
 async def html_to_markdown(
-    html: str, base_url: str, fetch_image: Callable[[str], Awaitable[bytes | None]]
+    html: str,
+    base_url: str,
+    fetch_image: Callable[[str], Awaitable[bytes | None]],
+    *,
+    cache: ImageCache | None = None,
 ) -> str:
-    html = await inline_images_in_html(html, base_url, fetch_image)
+    html = await inline_images_in_html(html, base_url, fetch_image, cache=cache)
     result = await asyncio.to_thread(
         html_to_md,
         html,
@@ -547,15 +551,16 @@ async def bytes_to_markdown(
     async def fetch_image(image_url: str) -> bytes:
         return (await http.request(image_url)).content
 
+    image_cache = getattr(http, "image_cache", None)
     sniffed = sniff_extension(data)
     if sniffed == ".docx":
         result = await asyncio.to_thread(mammoth.convert_to_html, io.BytesIO(data))
-        return await html_to_markdown(result.value, url, fetch_image)
+        return await html_to_markdown(result.value, url, fetch_image, cache=image_cache)
     if sniffed == ".doc":
         # shortcut: no pure-Python Word 97 converter; add one if .doc norms become common.
         raise ValueError(f"Legacy Word/Office (OLE2) file is not supported: {url}")
     response = Response(url, 200, {"Content-Type": content_type}, data)
-    return await html_to_markdown(response.text, url, fetch_image)
+    return await html_to_markdown(response.text, url, fetch_image, cache=image_cache)
 
 
 def normalize_type(

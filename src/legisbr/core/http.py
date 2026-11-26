@@ -12,16 +12,9 @@ from email.message import Message
 from typing import Any
 
 import aiohttp
-from aiohttp_socks import (
-    ProxyConnectionError,
-    ProxyConnector,
-    ProxyError,
-    ProxyTimeoutError,
-)
 from bs4 import BeautifulSoup
 from bs4.dammit import EncodingDetector
 from multidict import CIMultiDict
-from pyrate_limiter import Duration, InMemoryBucket, Limiter, Rate
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -29,28 +22,43 @@ from tenacity import (
     wait_exponential,
 )
 
+from legisbr.core.images import ImageCache
 from legisbr.core.proxy import ProxyService
 
 logger = logging.getLogger(__name__)
 
-
 # How long a proxy that failed to connect or answer sits out before another try.
 _PROXY_REST = 5 * 60
+_PROXY_INSTALL_HINT = "Install proxy support with: pip install 'legisbr[proxy]'"
+
+
+def _load_proxy_module() -> Any:
+    try:
+        import aiohttp_socks
+    except ImportError as exc:
+        raise ImportError(_PROXY_INSTALL_HINT) from exc
+    return aiohttp_socks
 
 
 class RateLimiter:
+    """Strict burst=1 GCRA rate limiter (lock-free while sleeping, cancellation-safe)."""
+
     def __init__(self, requests_per_second: float) -> None:
         if requests_per_second <= 0:
             raise ValueError("rps must be positive")
         self.requests_per_second = requests_per_second
-        self._limiter = Limiter(
-            InMemoryBucket(
-                [Rate(1, max(1, Duration.SECOND * (1 / requests_per_second)))]
-            )
-        )
+        self._interval = 1.0 / requests_per_second
+        self._next_slot = 0.0
+        self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        await self._limiter.try_acquire_async("req")
+        async with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + self._interval
+        delay = slot - now
+        if delay > 0:
+            await asyncio.sleep(delay)
 
 
 class HttpError(Exception):
@@ -129,14 +137,19 @@ class HttpClient:
         rps: float = 10,
         max_retries: int = 6,
         proxy_service: ProxyService | None = None,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
         disable_cookies: bool = False,
         proxy_timeout: int = 15,
         pause_on_403: float = 0,
+        max_connections: int = 100,
+        max_connections_per_host: int = 32,
+        ttl_dns_cache: int = 300,
+        image_cache: ImageCache | None = None,
     ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be positive")
         self.max_retries = max_retries
+        self.verify_ssl = verify_ssl
         self.limiter = RateLimiter(rps)
         # Sites limit each IP, so every proxy gets its own budget.
         self._proxy_limiters: dict[str, RateLimiter] = {}
@@ -158,6 +171,10 @@ class HttpClient:
         }
         self._disable_cookies = disable_cookies
         self._proxy_timeout = proxy_timeout
+        self._max_connections = max_connections
+        self._max_connections_per_host = max_connections_per_host
+        self._ttl_dns_cache = ttl_dns_cache
+        self.image_cache = image_cache if image_cache is not None else ImageCache()
         self._default_session: aiohttp.ClientSession | None = None
         self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
         self._session_lock = asyncio.Lock()
@@ -169,12 +186,19 @@ class HttpClient:
                 self._proxy_sessions.get(proxy) if proxy else self._default_session
             )
             if session is None or session.closed:
-                connector = (
+                if proxy:
                     # Proxies are untrusted: always verify, so none can alter a page.
-                    ProxyConnector.from_url(proxy, ssl=ssl.create_default_context())
-                    if proxy
-                    else aiohttp.TCPConnector(ssl=self._ssl_ctx)
-                )
+                    proxy_mod = _load_proxy_module()
+                    connector = proxy_mod.ProxyConnector.from_url(
+                        proxy, ssl=ssl.create_default_context()
+                    )
+                else:
+                    connector = aiohttp.TCPConnector(
+                        ssl=self._ssl_ctx,
+                        limit=self._max_connections,
+                        limit_per_host=self._max_connections_per_host,
+                        ttl_dns_cache=self._ttl_dns_cache,
+                    )
                 session = aiohttp.ClientSession(
                     headers=self.headers,
                     connector=connector,
@@ -212,7 +236,19 @@ class HttpClient:
                     if self.proxy_service and use_proxy
                     else None
                 )
+                retry_errors: tuple[type[BaseException], ...] = (
+                    aiohttp.ClientError,
+                    asyncio.IncompleteReadError,
+                    TimeoutError,
+                    ConnectionError,
+                )
                 if proxy:
+                    proxy_mod = _load_proxy_module()
+                    retry_errors += (
+                        proxy_mod.ProxyError,
+                        proxy_mod.ProxyConnectionError,
+                        proxy_mod.ProxyTimeoutError,
+                    )
                     if proxy not in self._proxy_limiters:
                         self._proxy_limiters[proxy] = RateLimiter(
                             self.limiter.requests_per_second
@@ -265,15 +301,7 @@ class HttpClient:
                             CIMultiDict(response.headers),
                             content,
                         )
-                except (
-                    aiohttp.ClientError,
-                    asyncio.IncompleteReadError,
-                    TimeoutError,
-                    ConnectionError,
-                    ProxyError,
-                    ProxyConnectionError,
-                    ProxyTimeoutError,
-                ) as exc:
+                except retry_errors as exc:
                     if proxy:
                         self.proxy_service.suspend(
                             proxy, _PROXY_REST, type(exc).__name__

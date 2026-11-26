@@ -129,6 +129,9 @@ async def run_scraper(
             max_retries=spec.max_retries,
             pause_on_403=spec.pause_on_403,
             disable_cookies=spec.disable_cookies,
+            verify_ssl=not spec.insecure_tls,
+            max_connections=max(100, spec.workers),
+            max_connections_per_host=max(16, spec.workers),
             proxy_service=ProxyService(proxy_config) if proxy_config else None,
         )
         years = range(args.year, args.year + 1) if args.year is not None else spec.years

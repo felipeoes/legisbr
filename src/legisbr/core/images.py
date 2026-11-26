@@ -6,12 +6,116 @@ import asyncio
 import base64
 import logging
 import mimetypes
+import re
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from typing import TypeAlias
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
 logger = logging.getLogger(__name__)
+
+_IMG_TAG_RE = re.compile(r"<img\b", re.IGNORECASE)
+
+
+class _SpacerType:
+    __slots__ = ()
+
+
+_SPACER = _SpacerType()
+CacheEntry: TypeAlias = tuple[str, str] | _SpacerType
+
+
+class ImageCache:
+    """Single-flight, memory-bounded LRU cache for inlined base64 images."""
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = 256,
+        max_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        if max_entries < 1 or max_bytes < 1:
+            raise ValueError("max_entries and max_bytes must be positive")
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[str, tuple[CacheEntry, int]] = OrderedDict()
+        self._bytes = 0
+        self._inflight: dict[str, asyncio.Task[CacheEntry | None]] = {}
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, url: object) -> bool:
+        return url in self._entries
+
+    @property
+    def current_bytes(self) -> int:
+        return self._bytes
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+
+    def _put(self, url: str, entry: CacheEntry) -> None:
+        size = 0 if isinstance(entry, _SpacerType) else len(entry[1])
+        if size > self.max_bytes // 8:
+            return
+        if url in self._entries:
+            _, old_size = self._entries.pop(url)
+            self._bytes -= old_size
+        self._entries[url] = (entry, size)
+        self._bytes += size
+        while len(self._entries) > self.max_entries or self._bytes > self.max_bytes:
+            _, (_, evicted_size) = self._entries.popitem(last=False)
+            self._bytes -= evicted_size
+
+    async def get_or_fetch(
+        self,
+        url: str,
+        fetch_fn: Callable[[str], Awaitable[bytes | None]],
+    ) -> CacheEntry | None:
+        """Return cached ``(content_type, b64)`` or ``_SPACER``, deduplicating in-flight fetches."""
+        cached = self._entries.get(url)
+        if cached is not None:
+            self._entries.move_to_end(url)
+            return cached[0]
+
+        task = self._inflight.get(url)
+        if task is None:
+
+            async def _load() -> CacheEntry | None:
+                try:
+                    entry = await _fetch_and_encode(url, fetch_fn)
+                    if entry is not None:
+                        self._put(url, entry)
+                    return entry
+                finally:
+                    self._inflight.pop(url, None)
+
+            task = asyncio.create_task(_load())
+            self._inflight[url] = task
+
+        return await asyncio.shield(task)
+
+
+async def _fetch_and_encode(
+    full_url: str,
+    fetch_fn: Callable[[str], Awaitable[bytes | None]],
+) -> CacheEntry | None:
+    try:
+        data = await fetch_fn(full_url)
+    except Exception as exc:
+        logger.debug(f"Image fetch failed for '{full_url[:80]}': {exc}")
+        return None
+    if not data:
+        return None
+    if len(data) < 100:  # 1x1 spacer GIFs/PNGs carry no content
+        return _SPACER
+    content_type = _guess_mime(full_url, data)
+    b64 = base64.b64encode(data).decode("ascii")
+    return (content_type, b64)
 
 
 async def inline_images_in_html(
@@ -20,6 +124,7 @@ async def inline_images_in_html(
     fetch_fn: Callable[[str], Awaitable[bytes | None]],
     *,
     max_concurrent: int = 10,
+    cache: ImageCache | None = None,
 ) -> str:
     """Replace every ``<img src>`` in *html* with an inline base64 data URI.
 
@@ -34,36 +139,41 @@ async def inline_images_in_html(
         Return ``None`` to skip the image gracefully.
     max_concurrent:
         Maximum number of concurrent image fetches.
+    cache:
+        Optional single-flight bounded ``ImageCache`` shared across documents.
 
     Returns
     -------
     str
         HTML with images inlined. Failed fetches are left unchanged.
     """
+    if not _IMG_TAG_RE.search(html):
+        return html
     soup = BeautifulSoup(html, "lxml")
     imgs = soup.find_all("img")
     if not imgs:
         return html
     sem = asyncio.Semaphore(max_concurrent)
 
+    async def _bounded_fetch(full_url: str) -> bytes | None:
+        async with sem:
+            return await fetch_fn(full_url)
+
     async def _fetch_one(img_tag: Tag) -> None:
         src = _get_image_source(img_tag)
         if not src:
             return
         full_url = src if src.startswith("http") else urljoin(base_url, src)
-        try:
-            async with sem:
-                data = await fetch_fn(full_url)
-        except Exception as exc:
-            logger.debug(f"Image fetch failed for '{full_url[:80]}': {exc}")
+        if cache is not None:
+            entry = await cache.get_or_fetch(full_url, _bounded_fetch)
+        else:
+            entry = await _fetch_and_encode(full_url, _bounded_fetch)
+        if entry is None:
             return
-        if not data:
-            return
-        if len(data) < 100:  # 1x1 spacer GIFs/PNGs carry no content
+        if isinstance(entry, _SpacerType):
             img_tag.decompose()
             return
-        content_type = _guess_mime(full_url, data)
-        b64 = base64.b64encode(data).decode("ascii")
+        content_type, b64 = entry
         img_tag["src"] = f"data:{content_type};base64,{b64}"
         for attr in ("data-src", "srcset", "data-srcset"):
             img_tag.attrs.pop(attr, None)

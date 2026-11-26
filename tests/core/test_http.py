@@ -241,11 +241,108 @@ async def test_proxied_connections_verify_certificates(monkeypatch):
     """Free proxies are untrusted; without verification one could rewrite documents."""
     import ssl
 
-    import legisbr.core.http as module
+    import aiohttp_socks
 
     from_url = MagicMock(side_effect=lambda url, **kw: aiohttp.TCPConnector())
-    monkeypatch.setattr(module.ProxyConnector, "from_url", from_url)
+    monkeypatch.setattr(aiohttp_socks.ProxyConnector, "from_url", from_url)
     http = HttpClient(verify_ssl=False)
     await http._ensure_session("socks5://a:1")
     assert from_url.call_args.kwargs["ssl"].verify_mode == ssl.CERT_REQUIRED
     await http.close()
+
+
+def test_http_client_verifies_ssl_by_default_and_honors_insecure_opt_in():
+    import ssl
+
+    secure = HttpClient()
+    assert secure.verify_ssl is True
+    assert secure._ssl_ctx.check_hostname is True
+    assert secure._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+
+    insecure = HttpClient(verify_ssl=False)
+    assert insecure.verify_ssl is False
+    assert insecure._ssl_ctx.check_hostname is False
+    assert insecure._ssl_ctx.verify_mode == ssl.CERT_NONE
+
+
+async def test_http_client_configures_tcp_connector_limits(monkeypatch):
+    captured: dict = {}
+
+    class SpyConnector(aiohttp.TCPConnector):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(aiohttp, "TCPConnector", SpyConnector)
+    http = HttpClient(
+        max_connections=64, max_connections_per_host=24, ttl_dns_cache=120
+    )
+    await http._ensure_session(None)
+    assert captured["limit"] == 64
+    assert captured["limit_per_host"] == 24
+    assert captured["ttl_dns_cache"] == 120
+    assert "enable_cleanup_closed" not in captured
+    await http.close()
+
+
+async def test_missing_aiohttp_socks_raises_proxy_install_hint(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "aiohttp_socks", None)
+    service = _proxy_service(tmp_path, "socks5://a:1")
+    http = HttpClient(rps=1000, max_retries=1, proxy_service=service)
+    with pytest.raises(ImportError, match="legisbr\\[proxy\\]"):
+        await http.request("https://example.org")
+
+
+async def test_gcra_rate_limiter_enforces_burst_one_spacing_at_0_3_rps(monkeypatch):
+    """Paraná requires strict burst=1 spacing at 0.3 rps (~3.333 s per slot)."""
+    import legisbr.core.http as module
+    from legisbr.core.http import RateLimiter
+
+    clock = 100.0
+    sleeps: list[float] = []
+
+    def fake_monotonic() -> float:
+        return clock
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
+
+    limiter = RateLimiter(0.3)
+    await asyncio.gather(*(limiter.acquire() for _ in range(4)))
+    # First request fires immediately (0 sleep); subsequent ones wait 1/0.3, 2/0.3, 3/0.3.
+    expected = [1 / 0.3, 2 / 0.3, 3 / 0.3]
+    assert len(sleeps) == 3
+    for actual, exp in zip(sleeps, expected, strict=True):
+        assert actual == pytest.approx(exp, rel=1e-6)
+
+
+async def test_gcra_rate_limiter_enforces_burst_one_spacing_at_100_rps():
+    from legisbr.core.http import RateLimiter
+
+    limiter = RateLimiter(100)
+    stamps: list[float] = []
+    for _ in range(6):
+        await limiter.acquire()
+        stamps.append(time.monotonic())
+    gaps = [stamps[i + 1] - stamps[i] for i in range(len(stamps) - 1)]
+    assert stamps[-1] - stamps[0] >= 0.045
+    assert all(gap >= 0.007 for gap in gaps)
+
+
+async def test_gcra_rate_limiter_does_not_hold_lock_while_sleeping():
+    from legisbr.core.http import RateLimiter
+
+    limiter = RateLimiter(2)
+    await limiter.acquire()
+    waiter = asyncio.create_task(limiter.acquire())
+    await asyncio.sleep(0.02)
+    assert not limiter._lock.locked()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert not limiter._lock.locked()
