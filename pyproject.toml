@@ -50,6 +50,9 @@ Homepage = "https://github.com/felipeoes/brazilian-legislation-scraper"
 Repository = "https://github.com/felipeoes/brazilian-legislation-scraper"
 Issues = "https://github.com/felipeoes/brazilian-legislation-scraper/issues"
 
+[project.scripts]
+legisbr = "legisbr.cli:entrypoint"
+
 [project.optional-dependencies]
 ocr = ["pydantic-ai-slim[openai]>=2.63"]
 ocr-openai = ["pydantic-ai-slim[openai]>=2.63"]
@@ -98,7 +101,7 @@ timeout = 300
 timeout_method = "thread"
 
 [tool.pyright]
-include = ["src/legisbr", "main.py"]
+include = ["src/legisbr"]
 typeCheckingMode = "basic"
 pythonVersion = "3.11"
 
