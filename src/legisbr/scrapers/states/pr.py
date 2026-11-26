@@ -7,13 +7,20 @@ unpaginated year listing per type, then one page per act.
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-from legisbr.core.convert import valid_markdown, wrap_html
-from legisbr.core.document import Document
+from legisbr.core.convert import infer_type_from_title, valid_markdown, wrap_html
+from legisbr.core.document import DocRef, Document, clean_title
+from legisbr.core.query import (
+    Query,
+    SearchCapabilities,
+    UnsupportedQueryError,
+    match_type_entry,
+    matches_query,
+)
 from legisbr.core.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
@@ -52,6 +59,12 @@ class ParanaCVScraper(BaseScraper):
     situations = SITUATIONS
     name = "PARANA"
     base_url = "https://www.legislacao.pr.gov.br"
+    capabilities = SearchCapabilities(
+        native_year=True,
+        native_type=True,
+        native_number=True,
+        direct_id=True,
+    )
 
     @staticmethod
     def _parse_results_table(soup: BeautifulSoup) -> list[dict]:
@@ -112,6 +125,135 @@ class ParanaCVScraper(BaseScraper):
             "raw_ext": ".html",
         }
         return Document(**result)
+
+    async def fetch_by_id(self, cod_ato: str) -> Document:
+        """Fetch a single Paraná act directly by its ``codAto`` identifier."""
+        cod = str(cod_ato).strip()
+        html_link = urljoin(
+            self.base_url, f"/legislacao/pesquisarAto.do?action=exibir&codAto={cod}"
+        )
+        response = await self.http.request(html_link)
+        soup = response.soup()
+        form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
+        if not form:
+            raise ValueError("No pesquisarAtoForm found")
+        table = form.find("table", id="list_tabela")
+        if table:
+            table.decompose()
+        lines = [
+            clean_title(line)
+            for line in form.get_text("\n").splitlines()
+            if line.strip()
+        ]
+        title = lines[0] if lines else f"Ato {cod}"
+        year_match = re.search(r"\b((?:18|19|20)\d{2})\b", " ".join(lines[:5]))
+        year = int(year_match.group(1)) if year_match else 0
+        norm_type = infer_type_from_title(title, TYPES) or "Lei"
+        html_string = str(form).replace("\n ANEXOS:", "").strip()
+        html_string = html_string.replace("javascript:listarAssinaturas();", "")
+        html_string = wrap_html(html_string)
+        situation = self._infer_situation(soup)
+        text_markdown = (await self.markdown(html=html_string)).strip()
+        valid, reason = valid_markdown(text_markdown)
+        if not valid:
+            raise ValueError(f"Invalid markdown: {reason}")
+        return Document(
+            id=cod,
+            title=title,
+            year=year,
+            type=norm_type,
+            situation=situation,
+            document_url=html_link,
+            text_markdown=text_markdown,
+            raw=response.content,
+            raw_ext=".html",
+        )
+
+    @staticmethod
+    def _infer_row_year(row: dict, fallback: int | None) -> int:
+        if fallback is not None:
+            return fallback
+        for field in (row.get("date", ""), row.get("title", "")):
+            matches = re.findall(r"\b((?:18|19|20)\d{2})\b", str(field))
+            if matches:
+                return int(matches[-1])
+        return 0
+
+    async def search_refs(
+        self,
+        query: Query,
+        *,
+        strict_native: bool = False,
+        on_error: Callable[[DocRef, Exception], Awaitable[None] | None] | None = None,
+    ) -> AsyncIterator[DocRef]:
+        """Targeted ``pesquisarAto.do`` search avoiding the 13 MB bulk ``listarAtosAno.do`` dump."""
+        if strict_native and not self.capabilities.supports_query(query):
+            raise UnsupportedQueryError(f"{self.name} does not support {query!r}")
+        if query.limit == 0:
+            return
+
+        type_name = ""
+        type_id = ""
+        if query.type is not None:
+            matched = match_type_entry(TYPES, query.type)
+            if matched is None:
+                return
+            type_name, raw_id = matched
+            type_id = str(raw_id)
+
+        target_years: list[int | None] = (
+            [None]
+            if query.years is None
+            else ([query.years] if isinstance(query.years, int) else list(query.years))
+        )
+
+        search_url = f"{self.base_url}/legislacao/pesquisarAto.do?action=pesquisar"
+        yielded = 0
+        seen: set[str] = set()
+        for year in target_years:
+            payload = {
+                "codTipoAto": type_id,
+                "numeroAto": str(query.number or ""),
+                "anoAto": "" if year is None else str(year),
+                "isPaginado": "true",
+                "site": "1",
+            }
+            try:
+                response = await self.http.request(
+                    search_url, method="POST", data=payload
+                )
+                soup = response.soup()
+                if error := _RE_SITE_ERROR.search(str(soup)):
+                    raise ValueError(f"Paraná search failed: {error.group(1).strip()}")
+                rows = self._parse_results_table(soup)
+            except Exception as exc:
+                await self._report_search_error(
+                    {"year": year, "document_url": search_url}, exc, on_error
+                )
+                continue
+            for row in rows:
+                if row["id"] in seen:
+                    continue
+                seen.add(row["id"])
+                ref: DocRef = {
+                    **row,
+                    "title": clean_title(row["title"]),
+                    "year": self._infer_row_year(row, year),
+                    "type": type_name
+                    or infer_type_from_title(row["title"], TYPES)
+                    or "Lei",
+                    "situation": DEFAULT_VALID_SITUATION,
+                    "document_url": urljoin(
+                        self.base_url,
+                        f"/legislacao/pesquisarAto.do?action=exibir&codAto={row['id']}",
+                    ),
+                }
+                if not matches_query(ref, query):
+                    continue
+                yield ref
+                yielded += 1
+                if query.limit is not None and yielded >= query.limit:
+                    return
 
     @staticmethod
     def _total(soup: BeautifulSoup) -> int:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -21,6 +22,13 @@ from legisbr.core.document import DocRef, Document, clean_title
 from legisbr.core.http import HttpClient
 from legisbr.core.images import ImageCache
 from legisbr.core.ocr import OCR, usage_scope
+from legisbr.core.query import (
+    Query,
+    SearchCapabilities,
+    UnsupportedQueryError,
+    match_type_entry,
+    matches_query,
+)
 from legisbr.core.store import Store
 
 logger = logging.getLogger(__name__)
@@ -72,6 +80,7 @@ class BaseScraper:
     types: ClassVar[dict | list] = {}
     situations: ClassVar[dict | list] = {}
     yearless: ClassVar[bool] = False
+    capabilities: ClassVar[SearchCapabilities] = SearchCapabilities()
 
     def __init__(
         self,
@@ -130,6 +139,93 @@ class BaseScraper:
     async def fetch(self, ref: DocRef) -> Document | None:
         """None is recorded as an error; skip unwanted refs while listing instead."""
         raise NotImplementedError
+
+    async def _report_search_error(
+        self,
+        ref: DocRef,
+        exc: Exception,
+        on_error: Callable[[DocRef, Exception], Awaitable[None] | None] | None,
+    ) -> None:
+        """Route on-demand search errors to *on_error* or logger without touching ``self.store``."""
+        if on_error is not None:
+            outcome = on_error(ref, exc)
+            if inspect.isawaitable(outcome):
+                await outcome
+            return
+        logger.warning(f"{self.name}: search failed for {ref}: {exc}")
+
+    async def search_refs(
+        self,
+        query: Query,
+        *,
+        strict_native: bool = False,
+        on_error: Callable[[DocRef, Exception], Awaitable[None] | None] | None = None,
+    ) -> AsyncIterator[DocRef]:
+        """Stream refs matching *query* with early exit on ``query.limit``."""
+        if strict_native and not self.capabilities.supports_query(query):
+            raise UnsupportedQueryError(
+                f"{self.name} does not natively support {query!r} "
+                f"(capabilities={self.capabilities!r})"
+            )
+        if query.limit == 0:
+            return
+        years: list[int | None] = (
+            [None] if self.yearless else list(query.year_range(self.years))
+        )
+        uses_list_type = (
+            type(self).list_documents is BaseScraper.list_documents
+            and isinstance(self.types, dict)
+            and bool(self.types)
+        )
+        selected_types: list[tuple[str, Any]] | None = None
+        if uses_list_type:
+            if query.type is not None:
+                matched = match_type_entry(self.types, query.type)
+                if matched is None:
+                    return
+                selected_types = [matched]
+            else:
+                selected_types = list(self.types.items())
+
+        yielded = 0
+        for year in years:
+            if selected_types is not None:
+                for type_name, type_value in selected_types:
+                    try:
+                        async for raw_ref in self.list_type(
+                            year, type_name, type_value
+                        ):
+                            ref = dict(raw_ref)
+                            if year is not None:
+                                ref.setdefault("year", year)
+                            if isinstance(ref.get("title"), str):
+                                ref["title"] = clean_title(ref["title"])
+                            if not matches_query(ref, query):
+                                continue
+                            yield ref
+                            yielded += 1
+                            if query.limit is not None and yielded >= query.limit:
+                                return
+                    except Exception as exc:
+                        await self._report_search_error(
+                            {"year": year, "type": type_name}, exc, on_error
+                        )
+            else:
+                try:
+                    async for raw_ref in self.list_documents(year):
+                        ref = dict(raw_ref)
+                        if year is not None:
+                            ref.setdefault("year", year)
+                        if isinstance(ref.get("title"), str):
+                            ref["title"] = clean_title(ref["title"])
+                        if not matches_query(ref, query):
+                            continue
+                        yield ref
+                        yielded += 1
+                        if query.limit is not None and yielded >= query.limit:
+                            return
+                except Exception as exc:
+                    await self._report_search_error({"year": year}, exc, on_error)
 
     async def error(self, ref: DocRef, exc: Exception) -> None:
         self._result.errors += 1

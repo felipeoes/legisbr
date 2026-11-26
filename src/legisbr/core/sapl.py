@@ -10,12 +10,19 @@ This base class provides the shared logic for:
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
-from legisbr.core.document import Document
+from legisbr.core.document import DocRef, Document, clean_title
 from legisbr.core.http import HttpError
+from legisbr.core.query import (
+    Query,
+    SearchCapabilities,
+    UnsupportedQueryError,
+    match_type_entry,
+    matches_query,
+)
 from legisbr.core.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
@@ -397,13 +404,24 @@ class SAPLBaseScraper(BaseScraper):
         result = re.sub("\\n{3,}", "\n\n", "\n".join(lines))
         return result.strip()
 
+    capabilities = SearchCapabilities(
+        native_year=True,
+        native_type=True,
+        native_number=True,
+        native_text=True,
+    )
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.subjects: dict[int, str] = {}
+        self._subjects_loaded = False
         self._id_to_type = {value: name for name, value in self.types.items()}
         self._page_size = 100
 
-    async def setup(self) -> None:
+    async def _ensure_subjects(self) -> None:
+        """Lazily load SAPL subject lookup tables once per scraper instance."""
+        if self._subjects_loaded:
+            return
         first = (await self.http.request(self._format_subjects_url())).json()
         pages = first.get("pagination", {}).get("total_pages", 1)
         for page in range(1, pages + 1):
@@ -415,6 +433,10 @@ class SAPLBaseScraper(BaseScraper):
             self.subjects.update(
                 {item["id"]: item["assunto"] for item in data["results"]}
             )
+        self._subjects_loaded = True
+
+    async def setup(self) -> None:
+        await self._ensure_subjects()
 
     async def _get_docs_links(self, url: str, data: dict | None = None) -> list[dict]:
         if data is None:
@@ -457,6 +479,73 @@ class SAPLBaseScraper(BaseScraper):
             fetch_page, first.get("pagination", {}).get("total_pages", 1)
         ):
             yield ref
+
+    async def search_refs(
+        self,
+        query: Query,
+        *,
+        strict_native: bool = False,
+        on_error: Callable[[DocRef, Exception], Awaitable[None] | None] | None = None,
+    ) -> AsyncIterator[DocRef]:
+        """Native SAPL REST search without pre-fetching assuntonorma tables."""
+        if strict_native and not self.capabilities.supports_query(query):
+            raise UnsupportedQueryError(f"{self.name} does not support {query!r}")
+        if query.limit == 0:
+            return
+
+        base_params: dict[str, Any] = {}
+        if query.type is not None:
+            matched = match_type_entry(self.types, query.type)
+            if matched is None:
+                return
+            base_params["tipo"] = matched[1]
+        if query.number is not None:
+            base_params["numero"] = query.number
+        if query.text is not None:
+            base_params["ementa"] = query.text
+
+        page_size = (
+            min(self._page_size, query.limit)
+            if query.limit is not None and query.situation is None
+            else self._page_size
+        )
+        target_years: list[int | None] = (
+            [None]
+            if query.years is None
+            else ([query.years] if isinstance(query.years, int) else list(query.years))
+        )
+
+        yielded = 0
+        for year in target_years:
+            page = 1
+            total_pages = 1
+            while page <= total_pages:
+                params = {
+                    **base_params,
+                    "page": page,
+                    "page_size": page_size,
+                }
+                if year is not None:
+                    params["ano"] = year
+                url = f"{self.base_url}/api/norma/normajuridica/?{urlencode(params)}"
+                try:
+                    data = (await self.http.request(url)).json()
+                    total_pages = data.get("pagination", {}).get("total_pages", 1)
+                    refs = await self._get_docs_links(url, data)
+                except Exception as exc:
+                    await self._report_search_error(
+                        {"year": year, "document_url": url}, exc, on_error
+                    )
+                    break
+                for ref in refs:
+                    ref["title"] = clean_title(ref["title"])
+                    if not matches_query(ref, query):
+                        continue
+                    yield ref
+                    yielded += 1
+                    if query.limit is not None and yielded >= query.limit:
+                        return
+                page += 1
 
     async def fetch(self, ref: dict) -> Document:
         if not ref.get("_pdf_link"):

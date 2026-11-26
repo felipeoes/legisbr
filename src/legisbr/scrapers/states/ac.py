@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 
 from legisbr.core.convert import clean_norm_soup
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 TYPES = {
@@ -33,6 +34,7 @@ class AcreLegisScraper(BaseScraper):
     types = TYPES
     situations = SITUATIONS
     base_url = "https://legis.ac.gov.br/principal"
+    capabilities = SearchCapabilities(native_year=False, fast_catalog=True)
 
     def _format_search_url(self, norm_type_id: str) -> str:
         """Format url for search request"""

@@ -8,12 +8,20 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from legisbr.core.query import SearchCapabilities
+
 if TYPE_CHECKING:
     from legisbr.core.scraper import BaseScraper
 
 Scope = Literal["federal", "state", "environment"]
 
 _CLS_CACHE: dict[tuple[str, str], type[BaseScraper]] = {}
+
+_CAP_YEAR_ONLY = SearchCapabilities(native_year=True)
+_CAP_YEAR_TYPE = SearchCapabilities(native_year=True, native_type=True)
+_CAP_SAPL = SearchCapabilities(
+    native_year=True, native_type=True, native_number=True, native_text=True
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,7 @@ class SourceInfo:
     needs_ocr: bool
     needs_proxy: bool
     insecure_tls: bool
+    capabilities: SearchCapabilities = SearchCapabilities()
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,7 @@ class ScraperSpec:
     pause_on_403: float = 0
     disable_cookies: bool = False
     insecure_tls: bool = False
+    capabilities: SearchCapabilities = _CAP_YEAR_ONLY
     _cls: type[BaseScraper] | None = field(default=None, repr=False, compare=False)
 
     def load_cls(self) -> type[BaseScraper]:
@@ -108,6 +118,7 @@ class ScraperSpec:
             needs_ocr=self.needs_ocr,
             needs_proxy=self.needs_proxy,
             insecure_tls=self.insecure_tls,
+            capabilities=self.capabilities,
         )
 
 
@@ -142,6 +153,13 @@ SCRAPERS: list[ScraperSpec] = [
         start_year=1808,
         uses_pdf=True,
         rps=100,
+        capabilities=SearchCapabilities(
+            native_year=True,
+            native_type=True,
+            native_number=True,
+            native_text=True,
+            native_situation=True,
+        ),
     ),
     ScraperSpec(
         name="CONAMA",
@@ -153,6 +171,7 @@ SCRAPERS: list[ScraperSpec] = [
         start_year=1984,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     ScraperSpec(
         name="ICMBIO",
@@ -164,8 +183,16 @@ SCRAPERS: list[ScraperSpec] = [
         start_year=2016,
         uses_pdf=True,
         disable_cookies=True,
+        capabilities=SearchCapabilities(native_year=False),
     ),
-    _state("ACRE", "AcreLegisScraper", "ac", ("Acre", "AC"), 1963),
+    _state(
+        "ACRE",
+        "AcreLegisScraper",
+        "ac",
+        ("Acre", "AC"),
+        1963,
+        capabilities=SearchCapabilities(native_year=False, fast_catalog=True),
+    ),
     _state(
         "ALAGOAS",
         "AlagoasSefazScraper",
@@ -175,9 +202,25 @@ SCRAPERS: list[ScraperSpec] = [
         uses_pdf=True,
         needs_ocr=True,
         rps=5,
+        capabilities=_CAP_YEAR_ONLY,
     ),
-    _state("AMAZONAS", "LegislaAMScraper", "am", ("Amazonas", "AM"), 1956, rps=50),
-    _state("AMAPA", "AmapaAlapScraper", "ap", ("Amapa", "AP"), 1991),
+    _state(
+        "AMAZONAS",
+        "LegislaAMScraper",
+        "am",
+        ("Amazonas", "AM"),
+        1956,
+        rps=50,
+        capabilities=_CAP_YEAR_TYPE,
+    ),
+    _state(
+        "AMAPA",
+        "AmapaAlapScraper",
+        "ap",
+        ("Amapa", "AP"),
+        1991,
+        capabilities=_CAP_YEAR_TYPE,
+    ),
     _state(
         "BAHIA",
         "BahiaLegislaScraper",
@@ -187,8 +230,19 @@ SCRAPERS: list[ScraperSpec] = [
         max_retries=7,
         rps=1,
         insecure_tls=True,
+        capabilities=_CAP_YEAR_ONLY,
     ),
-    _state("CEARA", "CearaAleceScraper", "ce", ("Ceara", "CE"), 1968, needs_ocr=True),
+    _state(
+        "CEARA",
+        "CearaAleceScraper",
+        "ce",
+        ("Ceara", "CE"),
+        1968,
+        needs_ocr=True,
+        capabilities=SearchCapabilities(
+            native_year=False, fast_catalog=False, heavy_setup=True
+        ),
+    ),
     _state(
         "DISTRITO_FEDERAL",
         "DFSinjScraper",
@@ -199,6 +253,7 @@ SCRAPERS: list[ScraperSpec] = [
         needs_ocr=True,
         rps=100,
         workers=100,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     _state(
         "ESPIRITO_SANTO",
@@ -209,6 +264,7 @@ SCRAPERS: list[ScraperSpec] = [
         uses_pdf=True,
         needs_ocr=True,
         rps=50,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     _state(
         "GOIAS",
@@ -219,6 +275,7 @@ SCRAPERS: list[ScraperSpec] = [
         uses_pdf=True,
         needs_ocr=True,
         rps=100,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     _state(
         "MARANHAO",
@@ -228,6 +285,7 @@ SCRAPERS: list[ScraperSpec] = [
         1906,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_YEAR_TYPE,
     ),
     _state(
         "MATO_GROSSO_DO_SUL",
@@ -235,6 +293,7 @@ SCRAPERS: list[ScraperSpec] = [
         "ms",
         ("MS", "MatoGrossoDoSul"),
         1979,
+        capabilities=_CAP_YEAR_TYPE,
     ),
     _state(
         "MATO_GROSSO",
@@ -244,6 +303,7 @@ SCRAPERS: list[ScraperSpec] = [
         2017,
         needs_ocr=True,
         rps=5,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     _state(
         "MINAS_GERAIS",
@@ -253,6 +313,9 @@ SCRAPERS: list[ScraperSpec] = [
         1831,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=SearchCapabilities(
+            native_year=True, native_type=True, native_number=True, native_text=True
+        ),
     ),
     _state(
         "PARA",
@@ -263,6 +326,7 @@ SCRAPERS: list[ScraperSpec] = [
         uses_pdf=True,
         needs_ocr=True,
         rps=5,
+        capabilities=_CAP_YEAR_TYPE,
     ),
     _state(
         "PARAIBA",
@@ -274,6 +338,7 @@ SCRAPERS: list[ScraperSpec] = [
         needs_ocr=True,
         workers=2,
         rps=1,
+        capabilities=_CAP_SAPL,
     ),
     _state(
         "PARANA",
@@ -299,6 +364,12 @@ SCRAPERS: list[ScraperSpec] = [
         needs_proxy=True,
         # A retry after a proxy failure goes through the next proxy.
         max_retries=4,
+        capabilities=SearchCapabilities(
+            native_year=True,
+            native_type=True,
+            native_number=True,
+            direct_id=True,
+        ),
     ),
     _state(
         "PERNAMBUCO",
@@ -306,6 +377,7 @@ SCRAPERS: list[ScraperSpec] = [
         "pe",
         ("Pernambuco", "PE"),
         1835,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     _state(
         "PIAUI",
@@ -315,6 +387,7 @@ SCRAPERS: list[ScraperSpec] = [
         1922,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_SAPL,
     ),
     # RJ documents use a 300 s timeout; 3 attempts caps one document at 15 min.
     _state(
@@ -324,6 +397,7 @@ SCRAPERS: list[ScraperSpec] = [
         ("RJ", "RioDeJaneiro"),
         1891,
         max_retries=3,
+        capabilities=SearchCapabilities(native_year=False, native_type=True),
     ),
     _state(
         "RIO_GRANDE_DO_NORTE",
@@ -333,6 +407,7 @@ SCRAPERS: list[ScraperSpec] = [
         1971,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     _state(
         "RIO_GRANDE_DO_SUL",
@@ -342,6 +417,7 @@ SCRAPERS: list[ScraperSpec] = [
         1830,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_YEAR_ONLY,
     ),
     _state(
         "RONDONIA",
@@ -351,6 +427,7 @@ SCRAPERS: list[ScraperSpec] = [
         1981,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_YEAR_TYPE,
     ),
     _state(
         "RORAIMA",
@@ -360,8 +437,16 @@ SCRAPERS: list[ScraperSpec] = [
         1991,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_SAPL,
     ),
-    _state("SANTA_CATARINA", "SantaCatarinaScraper", "sc", ("SC",), 1946),
+    _state(
+        "SANTA_CATARINA",
+        "SantaCatarinaScraper",
+        "sc",
+        ("SC",),
+        1946,
+        capabilities=_CAP_YEAR_TYPE,
+    ),
     _state(
         "SAO_PAULO",
         "SaoPauloAlespScraper",
@@ -370,6 +455,12 @@ SCRAPERS: list[ScraperSpec] = [
         1835,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=SearchCapabilities(
+            native_year=True,
+            native_type=True,
+            native_number=True,
+            native_situation=True,
+        ),
     ),
     _state(
         "SERGIPE",
@@ -379,6 +470,7 @@ SCRAPERS: list[ScraperSpec] = [
         1940,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_YEAR_TYPE,
     ),
     _state(
         "TOCANTINS",
@@ -388,6 +480,7 @@ SCRAPERS: list[ScraperSpec] = [
         1989,
         uses_pdf=True,
         needs_ocr=True,
+        capabilities=_CAP_YEAR_TYPE,
     ),
 ]
 

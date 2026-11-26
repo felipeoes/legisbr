@@ -1,14 +1,22 @@
 from __future__ import annotations
+
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
 
 from legisbr.core.convert import valid_markdown, wrap_html
-from legisbr.core.document import Document
+from legisbr.core.document import DocRef, Document, clean_title
+from legisbr.core.query import (
+    Query,
+    SearchCapabilities,
+    UnsupportedQueryError,
+    match_type_entry,
+    matches_query,
+)
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -58,6 +66,9 @@ _TYPE_CODE_MAP = {
     "PRT": "Portaria",
     "RAL": "Resolução",
 }
+_TYPE_NAME_TO_CODE: dict[str, str] = {}
+for _code, _type_name in _TYPE_CODE_MAP.items():
+    _TYPE_NAME_TO_CODE.setdefault(_type_name, _code)
 _TYPE_PATTERNS = [
     (
         re.compile("^ato das disposições constitucionais transitórias\\b", re.I),
@@ -118,6 +129,12 @@ class MGAlmgScraper(BaseScraper):
     situations = SITUATIONS
     name = "MINAS_GERAIS"
     base_url = "https://www.almg.gov.br"
+    capabilities = SearchCapabilities(
+        native_year=True,
+        native_type=True,
+        native_number=True,
+        native_text=True,
+    )
 
     @staticmethod
     def _clean_text(value: str) -> str:
@@ -130,19 +147,29 @@ class MGAlmgScraper(BaseScraper):
                 return tag
         return None
 
-    def _build_search_url(self, year: int, page: int = 1) -> str:
-        """Build year-only search URL from arguments."""
+    def _build_search_url(
+        self,
+        year: int | None,
+        page: int = 1,
+        *,
+        number: str = "",
+        text: str = "",
+        norm_type_code: str = "",
+    ) -> str:
+        """Build ALMG search URL from arguments."""
         params = {
             "pagina": str(page),
             "aba": "pesquisa",
-            "q": "",
-            "ano": str(year),
+            "q": text,
+            "ano": "" if year is None else str(year),
             "dataFim": "",
-            "num": "",
+            "num": number,
             "ordem": "0",
             "pesquisou": "true",
             "dataInicio": "",
         }
+        if norm_type_code:
+            params["tipo"] = norm_type_code
         return f"{self.base_url}/atividade-parlamentar/leis/legislacao-mineira?{urlencode(params)}"
 
     def _normalize_type(self, title: str, html_link: str = "") -> str:
@@ -519,6 +546,94 @@ class MGAlmgScraper(BaseScraper):
                 **ref,
                 "document_url": urljoin(self.base_url, ref["_html_link"]),
             }
+
+    @staticmethod
+    def _infer_year(ref: dict) -> int:
+        for text in (ref.get("title", ""), ref.get("_html_link", "")):
+            matches = re.findall(r"\b((?:18|19|20)\d{2})\b", str(text))
+            if matches:
+                return int(matches[-1])
+        return 0
+
+    async def search_refs(
+        self,
+        query: Query,
+        *,
+        strict_native: bool = False,
+        on_error: Callable[[DocRef, Exception], Awaitable[None] | None] | None = None,
+    ) -> AsyncIterator[DocRef]:
+        """Targeted ALMG search using native ``num``, ``q``, ``ano``, and ``tipo`` filters."""
+        if strict_native and not self.capabilities.supports_query(query):
+            raise UnsupportedQueryError(f"{self.name} does not support {query!r}")
+        if query.limit == 0:
+            return
+
+        norm_type_code = ""
+        if query.type is not None:
+            matched = match_type_entry(_TYPE_NAME_TO_CODE, query.type)
+            if matched is None:
+                return
+            norm_type_code = matched[1]
+
+        target_years: list[int | None] = (
+            [None]
+            if query.years is None
+            else ([query.years] if isinstance(query.years, int) else list(query.years))
+        )
+
+        yielded = 0
+        for year in target_years:
+            url = self._build_search_url(
+                year,
+                1,
+                number=query.number or "",
+                text=query.text or "",
+                norm_type_code=norm_type_code,
+            )
+            try:
+                first_soup = (await self.http.request(url)).soup()
+                total_pages = self._extract_total_pages(first_soup)
+            except Exception as exc:
+                await self._report_search_error(
+                    {"year": year, "document_url": url}, exc, on_error
+                )
+                continue
+
+            for page in range(1, total_pages + 1):
+                page_url = (
+                    url
+                    if page == 1
+                    else self._build_search_url(
+                        year,
+                        page,
+                        number=query.number or "",
+                        text=query.text or "",
+                        norm_type_code=norm_type_code,
+                    )
+                )
+                try:
+                    items = await self._get_docs_links(
+                        page_url, soup=first_soup if page == 1 else None
+                    )
+                except Exception as exc:
+                    await self._report_search_error(
+                        {"year": year, "document_url": page_url}, exc, on_error
+                    )
+                    continue
+                for raw in items:
+                    ref: DocRef = {
+                        "year": year if year is not None else self._infer_year(raw),
+                        "situation": DEFAULT_VALID_SITUATION,
+                        **raw,
+                        "title": clean_title(raw["title"]),
+                        "document_url": urljoin(self.base_url, raw["_html_link"]),
+                    }
+                    if not matches_query(ref, query):
+                        continue
+                    yield ref
+                    yielded += 1
+                    if query.limit is not None and yielded >= query.limit:
+                        return
 
     async def _try_fetch_text_norma(
         self, url: str, title: str

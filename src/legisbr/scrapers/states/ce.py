@@ -19,6 +19,7 @@ from legisbr.core.convert import (
 )
 from legisbr.core.document import Document
 from legisbr.core.images import _get_image_source
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,9 @@ class CearaAleceScraper(BaseScraper):
     types = TYPES
     situations = SITUATIONS
     base_url = "https://www.al.ce.gov.br/legislativo"
+    capabilities = SearchCapabilities(
+        native_year=False, fast_catalog=False, heavy_setup=True
+    )
     PAGINATED_TYPES = {"Ato Deliberativo", "Ato Normativo", "Resolução"}
     STATIC_INDEX_TYPES = {
         "Emenda Constitucional",

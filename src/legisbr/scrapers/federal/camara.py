@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import AsyncIterator
-from urllib.parse import urljoin, urlparse
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import replace
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -13,7 +14,15 @@ from legisbr.core.convert import (
     infer_type_from_title,
     strip_html_chrome,
 )
-from legisbr.core.document import Document
+from legisbr.core.document import DocRef, Document, clean_title
+from legisbr.core.query import (
+    Query,
+    SearchCapabilities,
+    UnsupportedQueryError,
+    match_type_entry,
+    matches_query,
+    normalize_search_text,
+)
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -224,16 +233,31 @@ class CamaraDepScraper(BaseScraper):
     types = TYPES
     situations = {}
     base_url = "https://www.camara.leg.br/legislacao/"
+    capabilities = SearchCapabilities(
+        native_year=True,
+        native_type=True,
+        native_number=True,
+        native_text=True,
+        native_situation=True,
+    )
 
-    def _format_search_url(self, year: str, norm_type_id: str) -> str:
-        """Format search URL for a given year and norm type (URL-encoded value)."""
+    def _format_search_url(
+        self,
+        year: str,
+        norm_type_id: str,
+        *,
+        number: str = "",
+        text: str = "",
+        situation: str = "",
+    ) -> str:
+        """Format search URL for a given year, norm type, and optional search filters."""
         params = {
             "abrangencia": self.coverage,
-            "geral": "",
+            "geral": quote_plus(text) if text else "",
             "ano": year,
-            "situacao": "",
+            "situacao": quote_plus(situation) if situation else "",
             "origem": "",
-            "numero": "",
+            "numero": quote_plus(number) if number else "",
             "ordenacao": self.ordering,
             "tipo": norm_type_id,
         }
@@ -565,3 +589,98 @@ class CamaraDepScraper(BaseScraper):
                 "document_url": ref["metadata_url"],
                 "situation": ref.get("situation") or DEFAULT_VALID_SITUATION,
             }
+
+    @staticmethod
+    def _extract_year_from_ref(ref: dict) -> int:
+        for text in (ref.get("title", ""), ref.get("metadata_url", "")):
+            matches = re.findall(r"\b((?:18|19|20)\d{2})\b", str(text))
+            if matches:
+                return int(matches[-1])
+        return 0
+
+    async def search_refs(
+        self,
+        query: Query,
+        *,
+        strict_native: bool = False,
+        on_error: Callable[[DocRef, Exception], Awaitable[None] | None] | None = None,
+    ) -> AsyncIterator[DocRef]:
+        if strict_native and not self.capabilities.supports_query(query):
+            raise UnsupportedQueryError(f"{self.name} does not support {query!r}")
+        if query.limit == 0:
+            return
+
+        effective_query = query
+        norm_type_id = ""
+        if query.type is not None:
+            matched = match_type_entry(TYPES, query.type)
+            if matched is None and normalize_search_text(query.type) == "lei":
+                matched = ("Lei Ordinária", TYPES["Lei Ordinária"])
+            if matched is not None:
+                norm_type_id = matched[1]
+                effective_query = replace(query, type=matched[0])
+            else:
+                norm_type_id = quote_plus(query.type)
+
+        target_years: list[int | None] = (
+            [None]
+            if query.years is None
+            else ([query.years] if isinstance(query.years, int) else list(query.years))
+        )
+
+        yielded = 0
+        for year in target_years:
+            base_search_url = self._format_search_url(
+                "" if year is None else str(year),
+                norm_type_id,
+                number=query.number or "",
+                text=query.text or "",
+                situation=query.situation or "",
+            )
+            try:
+                first_soup = (await self.http.request(base_search_url)).soup()
+                total = self._extract_total_results(first_soup)
+                first_items = self._parse_listing_page_documents(first_soup)
+                total_pages = (
+                    calc_pages(total, 20)
+                    if total is not None
+                    else (1 if first_items else 0)
+                )
+            except Exception as exc:
+                await self._report_search_error(
+                    {"year": year, "document_url": base_search_url}, exc, on_error
+                )
+                continue
+
+            for page in range(1, total_pages + 1):
+                if page == 1:
+                    items = first_items
+                else:
+                    page_url = f"{base_search_url}&pagina={page}"
+                    try:
+                        items = await self._get_docs_links(page_url)
+                    except Exception as exc:
+                        await self._report_search_error(
+                            {"year": year, "document_url": page_url}, exc, on_error
+                        )
+                        continue
+                for raw in items:
+                    norm_type = self._resolve_norm_type(
+                        raw["title"], metadata_url=raw["metadata_url"]
+                    )
+                    ref: DocRef = {
+                        **raw,
+                        "title": clean_title(raw["title"]),
+                        "year": year
+                        if year is not None
+                        else self._extract_year_from_ref(raw),
+                        "type": norm_type,
+                        "document_url": raw["metadata_url"],
+                        "situation": raw.get("situation") or DEFAULT_VALID_SITUATION,
+                    }
+                    if not matches_query(ref, effective_query):
+                        continue
+                    yield ref
+                    yielded += 1
+                    if query.limit is not None and yielded >= query.limit:
+                        return
