@@ -19,7 +19,7 @@ repos:
     hooks:
       - id: pytest
         name: pytest
-        entry: uv run pytest tests -q -n auto --timeout=60 --tb=short -m "not integration"
+        entry: uv run --all-extras --group dev pytest tests -q -n auto --timeout=60 --tb=short -m "not integration"
         language: system
         pass_filenames: false
         always_run: true
