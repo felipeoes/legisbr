@@ -176,6 +176,7 @@ artifacts/
 test_data/
 scripts/*
 !scripts/check_proxies.py
+!scripts/check_licenses.py
 proxies*.txt
 /docs/
 

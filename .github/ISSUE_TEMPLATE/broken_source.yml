@@ -1,0 +1,53 @@
+name: Broken Source / Scraper Bug
+description: Report a failing Brazilian legislation portal or parsing regression
+title: "[source] <UF or Source>: <short description>"
+labels: ["bug", "source"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a broken source! Please fill in the details below so we can reproduce and add an offline regression fixture.
+  - type: input
+    id: source
+    attributes:
+      label: Source name or alias
+      description: Which scraper is failing (e.g. `AC`, `SP`, `camara`, `conama`, `icmbio`)?
+      placeholder: "SP"
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command or code snippet
+      description: Exact CLI command or Python snippet that reproduced the issue.
+      placeholder: "legisbr run -s SP --year 2025"
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Failing URL (if known)
+      placeholder: "https://..."
+  - type: textarea
+    id: error
+    attributes:
+      label: Error message / traceback
+      description: Paste the error output or relevant log lines (redact any API keys or proxy credentials).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: "`legisbr` version, Python version, and OS"
+      placeholder: "legisbr 0.1.0, Python 3.12, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Quick checks
+      options:
+        - label: I confirmed the official portal URL is reachable in a browser / curl.
+        - label: I redacted any API keys, tokens, or proxy credentials from the output.

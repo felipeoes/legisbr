@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --all-extras --group dev
+      - name: Ruff check
+        run: uv run ruff check src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+      - name: Ruff format check
+        run: uv run ruff format --check src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+
+  test:
+    name: Test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: uv sync --python ${{ matrix.python-version }} --all-extras --group dev
+      - name: Run offline unit tests
+        run: uv run pytest tests -m "not integration" -n auto --timeout=60
+
+  lowest-direct:
+    name: Lowest Direct Dependencies (py3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - name: Install lowest-direct dependencies
+        run: uv sync --python 3.11 --resolution lowest-direct --all-extras --group dev
+      - name: Run offline unit tests
+        run: uv run pytest tests -m "not integration" -n auto --timeout=60
+
+  package:
+    name: Wheel, Sdist & License Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Verify sdist contains no local secrets or artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDIST=$(ls dist/legisbr-*.tar.gz | head -n 1)
+          if tar -tzf "$SDIST" | grep -E '(^|/)(proxies[^/]*\.txt|\.env(\.[^/]*)?|logs/|outputs/|\.gemini/|\.claude/)'; then
+            echo "ERROR: Forbidden files found in $SDIST"
+            exit 1
+          fi
+      - name: Smoke test core wheel & audit core licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/legisbr-*.whl | head -n 1)
+          uv venv .venv-core --python 3.12
+          uv pip install --python .venv-core/bin/python "$WHEEL"
+          .venv-core/bin/legisbr list
+          .venv-core/bin/python -c "import legisbr; assert len(legisbr.sources()) == 30"
+          .venv-core/bin/python scripts/check_licenses.py --mode core --verbose
+      - name: Audit extras licenses ([all])
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/legisbr-*.whl | head -n 1)
+          uv venv .venv-all --python 3.12
+          uv pip install --python .venv-all/bin/python "${WHEEL}[all]"
+          .venv-all/bin/python scripts/check_licenses.py --mode extras --verbose
