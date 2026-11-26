@@ -18,6 +18,7 @@ from html_to_markdown import convert as html_to_md
 from legisbr.core.http import HttpClient, Response
 from legisbr.core.images import ImageCache, inline_images_in_html
 from legisbr.core.pdf import (
+    PdfExecutor,
     _pdf_text_layer,
     default_pdf_workers,
     is_pdf_scanned,
@@ -341,12 +342,21 @@ async def html_to_markdown(
 
 
 async def bytes_to_markdown(
-    data: bytes, content_type: str, url: str, http: HttpClient, ocr: OCR | None = None
+    data: bytes,
+    content_type: str,
+    url: str,
+    http: HttpClient,
+    ocr: OCR | None = None,
+    *,
+    pdf_executor: PdfExecutor = "auto",
+    pdf_workers: int | None = None,
 ) -> str:
     if is_pdf(data, content_type):
         if not data.startswith(b"%PDF"):
             raise ValueError(f"Expected PDF content from {url}")
-        return await pdf_to_markdown(data, ocr)
+        return await pdf_to_markdown(
+            data, ocr, executor=pdf_executor, max_workers=pdf_workers
+        )
     if _is_image_bytes(data):
         if ocr is None:
             raise ValueError("Image needs OCR but no OCR model is configured")

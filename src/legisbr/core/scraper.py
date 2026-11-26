@@ -1,13 +1,16 @@
-"""Bounded listing → fetch → save pipeline shared by every scraper."""
+"""Bounded listing → fetch → save/stream pipeline shared by every scraper."""
 
 from __future__ import annotations
 
 import asyncio
+import bisect
+import hashlib
 import inspect
 import logging
+import math
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 from urllib.parse import urljoin
@@ -22,19 +25,123 @@ from legisbr.core.document import DocRef, Document, clean_title
 from legisbr.core.http import HttpClient
 from legisbr.core.images import ImageCache
 from legisbr.core.ocr import OCR, usage_scope
+from legisbr.core.pdf import PdfExecutor
 from legisbr.core.query import (
     Query,
     SearchCapabilities,
     UnsupportedQueryError,
     match_type_entry,
     matches_query,
+    normalize_search_text,
 )
-from legisbr.core.store import Store
+from legisbr.core.sink import DocumentSink, ErrorRecord, NullSink
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_VALID_SITUATION = "Não consta revogação expressa"
 DEFAULT_INVALID_SITUATION = "Revogada"
+
+
+def _resume_digest(ref_url: str, ref_title: str) -> bytes:
+    """Compact 16-byte blake2b resume key owned solely by ``BaseScraper``."""
+    payload = ref_url.encode("utf-8") + b"\x00" + clean_title(ref_title).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=16).digest()
+
+
+class LatencyHistogram:
+    """Deterministic fixed log-bucket latency histogram (O(1) memory, zero RNG)."""
+
+    BOUNDS: ClassVar[tuple[float, ...]] = (
+        0.01,
+        0.025,
+        0.05,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        25.0,
+        60.0,
+        180.0,
+        600.0,
+        math.inf,
+    )
+
+    def __init__(self) -> None:
+        self.counts: list[int] = [0] * len(self.BOUNDS)
+        self.count: int = 0
+        self.total: float = 0.0
+        self.min_val: float | None = None
+        self.max_val: float | None = None
+
+    def observe(self, value: float) -> None:
+        v = max(0.0, float(value))
+        idx = bisect.bisect_left(self.BOUNDS, v)
+        if idx >= len(self.counts):
+            idx = len(self.counts) - 1
+        self.counts[idx] += 1
+        self.count += 1
+        self.total += v
+        if self.min_val is None or v < self.min_val:
+            self.min_val = v
+        if self.max_val is None or v > self.max_val:
+            self.max_val = v
+
+    def merge(self, other: LatencyHistogram) -> None:
+        if other.count == 0:
+            return
+        for i, count in enumerate(other.counts):
+            self.counts[i] += count
+        self.count += other.count
+        self.total += other.total
+        if other.min_val is not None and (
+            self.min_val is None or other.min_val < self.min_val
+        ):
+            self.min_val = other.min_val
+        if other.max_val is not None and (
+            self.max_val is None or other.max_val > self.max_val
+        ):
+            self.max_val = other.max_val
+
+    def quantile(self, q: float) -> float | None:
+        if self.count == 0:
+            return None
+        if q <= 0.0:
+            return self.min_val
+        if q >= 1.0:
+            return self.max_val
+        target = q * self.count
+        cumulative = 0
+        lower = 0.0
+        for bound, bucket_count in zip(self.BOUNDS, self.counts, strict=True):
+            if cumulative + bucket_count >= target and bucket_count > 0:
+                upper = self.max_val if math.isinf(bound) else bound
+                assert upper is not None
+                low = max(lower, self.min_val if self.min_val is not None else 0.0)
+                high = min(upper, self.max_val if self.max_val is not None else upper)
+                if high <= low:
+                    return low
+                frac = (target - cumulative) / bucket_count
+                return low + frac * (high - low)
+            cumulative += bucket_count
+            lower = bound
+        return self.max_val
+
+
+class _StreamDone:
+    __slots__ = ()
+
+
+_STREAM_DONE = _StreamDone()
+
+
+class _StreamError:
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
 
 
 @dataclass
@@ -45,19 +152,15 @@ class RunResult:
     listed: int = 0
     seconds: float = 0.0
     listing_seconds: float = 0.0
-    fetch_seconds: list[float] = field(default_factory=list, repr=False)
+    fetch_histogram: LatencyHistogram = field(
+        default_factory=LatencyHistogram, repr=False
+    )
 
     def stats(self) -> dict:
         """Performance summary stored with the run (see `main.py stats`)."""
-        times = sorted(self.fetch_seconds)
-
-        def quantile(q: float) -> float | None:
-            return (
-                round(times[min(len(times) - 1, int(len(times) * q))], 2)
-                if times
-                else None
-            )
-
+        p50 = self.fetch_histogram.quantile(0.5)
+        p95 = self.fetch_histogram.quantile(0.95)
+        pmax = self.fetch_histogram.max_val
         return {
             "seconds": round(self.seconds, 1),
             "listing_seconds": round(self.listing_seconds, 1),
@@ -68,9 +171,9 @@ class RunResult:
             "docs_per_minute": round(self.docs * 60 / self.seconds, 1)
             if self.seconds
             else 0.0,
-            "fetch_p50": quantile(0.5),
-            "fetch_p95": quantile(0.95),
-            "fetch_max": quantile(1.0),
+            "fetch_p50": round(p50, 2) if p50 is not None else None,
+            "fetch_p95": round(p95, 2) if p95 is not None else None,
+            "fetch_max": round(pmax, 2) if pmax is not None else None,
         }
 
 
@@ -85,23 +188,31 @@ class BaseScraper:
     def __init__(
         self,
         *,
-        store: Store,
+        store: DocumentSink | None = None,
         http: HttpClient,
         years: range,
         ocr: OCR | None = None,
         workers: int = 16,
         overwrite: bool = False,
         image_cache: ImageCache | None = None,
+        on_error: Callable[[ErrorRecord], Awaitable[None] | None] | None = None,
+        pdf_executor: PdfExecutor = "auto",
+        pdf_workers: int | None = None,
     ) -> None:
         if workers < 1:
             raise ValueError("workers must be positive")
-        self.store, self.http, self.ocr = (store, http, ocr)
+        self.store: DocumentSink = (
+            store if store is not None else NullSink(on_error=on_error)
+        )
+        self.http, self.ocr = (http, ocr)
         self.image_cache = (
             image_cache
             if image_cache is not None
             else getattr(http, "image_cache", None) or ImageCache()
         )
         self.years, self.workers, self.overwrite = (years, workers, overwrite)
+        self.pdf_executor: PdfExecutor = pdf_executor
+        self.pdf_workers = pdf_workers
         self._stack = AsyncExitStack()
         self._run_id: int | None = None
         self._result = RunResult()
@@ -232,16 +343,33 @@ class BaseScraper:
         message = str(exc)
         if exc.__cause__ is not None:
             message += f" (caused by {type(exc.__cause__).__name__}: {exc.__cause__})"
-        await self.store.record_error(
-            run_id=self._run_id,
+        record = ErrorRecord(
             message=message,
+            run_id=self._run_id,
             year=ref.get("year"),
-            type=ref.get("type", ""),
-            situation=ref.get("situation", ""),
-            title=ref.get("title", ""),
-            url=ref.get("document_url", ""),
+            type=str(ref.get("type", "") or ""),
+            situation=str(ref.get("situation", "") or ""),
+            title=str(ref.get("title", "") or ""),
+            url=str(ref.get("document_url", "") or ""),
         )
+        await self.store.record_error(record)
         logger.error(f"{self.name}: {ref.get('title', 'listing')}: {message}")
+
+    async def _load_existing_keys(self) -> set[bytes]:
+        if self.overwrite:
+            return set()
+        keys: set[bytes] = set()
+        async for ref_url, ref_title in self.store.iter_keys():
+            keys.add(_resume_digest(ref_url, ref_title))
+        return keys
+
+    def _run_stats(self) -> dict[str, Any]:
+        return {
+            **self._result.stats(),
+            "years": f"{self.years.start}-{self.years.stop - 1}",
+            "workers": self.workers,
+            "http": dict(self.http.stats),
+        }
 
     async def run(self) -> RunResult:
         self._result = RunResult()
@@ -252,39 +380,153 @@ class BaseScraper:
         try:
             await self.setup()
             # Overwrite re-scrapes everything; each save replaces the old row.
-            await self._scrape(set() if self.overwrite else await self.store.keys())
+            await self._scrape(await self._load_existing_keys())
         except Exception as exc:
             await self.error({}, exc)
         finally:
             self._result.seconds = time.perf_counter() - started
-            stats = {
-                **self._result.stats(),
-                "years": f"{self.years.start}-{self.years.stop - 1}",
-                "workers": self.workers,
-                "http": dict(self.http.stats),
-            }
             try:
                 await self.store.finish_run(
                     self._run_id,
                     self._result.docs,
                     self._result.errors,
                     self.ocr.usage_for(scope) if self.ocr else {},
-                    stats,
+                    self._run_stats(),
                 )
             finally:
                 usage_scope.reset(token)
         return self._result
 
-    async def _scrape(self, keys: set[tuple[str, str]]) -> None:
+    @asynccontextmanager
+    async def stream(
+        self,
+        *,
+        types: Sequence[str] | None = None,
+        limit: int | None = None,
+        drop_raw: bool = False,
+        run_setup: bool = True,
+    ) -> AsyncIterator[AsyncIterator[Document]]:
+        """PEP 789-safe bounded async streaming pipeline with deterministic cleanup."""
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative or None")
+        self._result = RunResult()
+        started = time.perf_counter()
+        self._run_id = await self.store.start_run(self.name)
+        scope = f"{self.name}:{self._run_id}"
+        token = usage_scope.set(scope)
+        output: asyncio.Queue[
+            tuple[Document, str, str, float] | _StreamDone | _StreamError
+        ] = asyncio.Queue(maxsize=max(1, self.workers * 2))
+        keys: set[bytes] = set()
+
+        async def _background() -> None:
+            try:
+                if limit == 0:
+                    await output.put(_STREAM_DONE)
+                    return
+                if run_setup:
+                    await self.setup()
+                if not self.overwrite:
+                    async for ref_url, ref_title in self.store.iter_keys():
+                        keys.add(_resume_digest(ref_url, ref_title))
+                await self._scrape(keys, types=types, output=output)
+                await output.put(_STREAM_DONE)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                await output.put(_StreamError(exc))
+
+        bg_task = asyncio.create_task(_background())
+        save_to_store = not isinstance(self.store, NullSink)
+
+        async def _iter_docs() -> AsyncIterator[Document]:
+            yielded = 0
+            while True:
+                item = await output.get()
+                if isinstance(item, _StreamDone):
+                    return
+                if isinstance(item, _StreamError):
+                    raise item.exc
+                doc, ref_url, ref_title, elapsed = item
+                if save_to_store:
+                    await self.store.save(doc, ref_url=ref_url, ref_title=ref_title)
+                elif drop_raw:
+                    doc.raw = None
+                self._result.docs += 1
+                self._result.fetch_histogram.observe(elapsed)
+                keys.add(_resume_digest(ref_url, ref_title))
+                yield doc
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    return
+
+        try:
+            yield _iter_docs()
+        finally:
+            if not bg_task.done():
+                bg_task.cancel()
+            try:
+                await bg_task
+            except asyncio.CancelledError:
+                pass
+            self._result.seconds = time.perf_counter() - started
+            try:
+                await self.store.finish_run(
+                    self._run_id,
+                    self._result.docs,
+                    self._result.errors,
+                    self.ocr.usage_for(scope) if self.ocr else {},
+                    self._run_stats(),
+                )
+            finally:
+                usage_scope.reset(token)
+
+    async def _iter_year_refs(
+        self, year: int | None, types: Sequence[str] | None
+    ) -> AsyncIterator[DocRef]:
+        if types is None:
+            async for ref in self.list_documents(year):
+                yield ref
+            return
+        wanted = {normalize_search_text(t) for t in types}
+        uses_list_type = (
+            type(self).list_documents is BaseScraper.list_documents
+            and isinstance(self.types, dict)
+            and bool(self.types)
+        )
+        if uses_list_type:
+            for name, value in self.types.items():
+                if normalize_search_text(name) not in wanted:
+                    continue
+                try:
+                    async for ref in self.list_type(year, name, value):
+                        yield ref
+                except Exception as exc:
+                    await self.error({"year": year, "type": name}, exc)
+            return
+        async for ref in self.list_documents(year):
+            if normalize_search_text(str(ref.get("type") or "")) in wanted:
+                yield ref
+
+    async def _scrape(
+        self,
+        keys: set[bytes],
+        *,
+        types: Sequence[str] | None = None,
+        output: asyncio.Queue[
+            tuple[Document, str, str, float] | _StreamDone | _StreamError
+        ]
+        | None = None,
+    ) -> None:
         queue: asyncio.Queue[DocRef | None] = asyncio.Queue(maxsize=self.workers * 2)
-        pending: set[tuple[str, str]] = set()
+        pending: set[bytes] = set()
         started = time.perf_counter()
 
         async def produce() -> None:
             # One queue for all years, so workers never wait at a year boundary.
             for year in [None] if self.yearless else self.years:
                 try:
-                    async for ref in self.list_documents(year):
+                    async for ref in self._iter_year_refs(year, types):
                         ref = dict(ref)
                         ref.setdefault("year", year)
                         if ref["year"] is None:
@@ -293,11 +535,11 @@ class BaseScraper:
                         if self.yearless and ref["year"] not in self.years:
                             continue
                         ref["title"] = clean_title(ref["title"])
-                        key = (ref["document_url"], ref["title"])
-                        if key in keys or key in pending:
+                        digest = _resume_digest(ref["document_url"], ref["title"])
+                        if digest in keys or digest in pending:
                             self._result.skipped += 1
                             continue
-                        pending.add(key)
+                        pending.add(digest)
                         self._result.listed += 1
                         await queue.put(ref)
                 except Exception as exc:
@@ -308,23 +550,26 @@ class BaseScraper:
 
         async def consume() -> None:
             while (ref := (await queue.get())) is not None:
-                key = (ref["document_url"], ref["title"])
+                ref_url, ref_title = ref["document_url"], ref["title"]
+                digest = _resume_digest(ref_url, ref_title)
                 fetch_started = time.perf_counter()
                 try:
                     doc = await self.fetch(dict(ref))
                     if doc is None:
                         raise ValueError("Fetch produced no document")
-                    await self.store.save(doc, ref_url=key[0], ref_title=key[1])
-                    self._result.docs += 1
-                    self._result.fetch_seconds.append(
-                        time.perf_counter() - fetch_started
-                    )
-                    keys.add(key)
-                    del doc
+                    elapsed = time.perf_counter() - fetch_started
+                    if output is not None:
+                        await output.put((doc, ref_url, ref_title, elapsed))
+                    else:
+                        await self.store.save(doc, ref_url=ref_url, ref_title=ref_title)
+                        self._result.docs += 1
+                        self._result.fetch_histogram.observe(elapsed)
+                        keys.add(digest)
+                        del doc
                 except Exception as exc:
                     await self.error(ref, exc)
                 finally:
-                    pending.discard(key)
+                    pending.discard(digest)
                     queue.task_done()
 
         async with asyncio.TaskGroup() as group:
@@ -373,6 +618,8 @@ class BaseScraper:
             url,
             self.http,
             self.ocr,
+            pdf_executor=self.pdf_executor,
+            pdf_workers=self.pdf_workers,
         )
         return (markdown, response.content, ext)
 
