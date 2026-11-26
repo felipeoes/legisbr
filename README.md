@@ -1,114 +1,298 @@
-# Brazilian Legislation Scraper
+# `legisbr` — Brazilian Legislation Scraper, Archive & MCP Server
 
-Async scrapers for Brazilian federal legislation, all 27 state jurisdictions, CONAMA, and ICMBio. Documents are validated, stored in SQLite, and exported as JSON or JSONL. PDFs and HTML become Markdown with embedded images; scanned documents can use LLM OCR.
+[![PyPI](https://img.shields.io/pypi/v/legisbr.svg)](https://pypi.org/project/legisbr/)
+[![Python](https://img.shields.io/pypi/pyversions/legisbr.svg)](https://pypi.org/project/legisbr/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/felipeoes/brazilian-legislation-scraper/actions/workflows/ci.yml/badge.svg)](https://github.com/felipeoes/brazilian-legislation-scraper/actions/workflows/ci.yml)
 
-This project does not scrape leisestaduais.com.br.
+High-performance, async Python library, CLI, and MCP server covering **30 official Brazilian legislation portals** — Federal legislation (Câmara dos Deputados), all **27 state jurisdictions**, CONAMA, and ICMBio.
 
-## Install
+- **Pure HTTP & Zero Browser Overhead:** Zero Playwright, zero Chromium downloads — fast, headless, container-friendly scraping directly against official portals.
+- **100% Permissive MIT Core (~82 MB installed):** Pure-Rust `pdf_oxide` + `pypdf` + `html-to-markdown` + `mammoth`. Zero AGPL/GPL dependencies in core (`PyMuPDF` and `unidecode` completely removed).
+- **Python 3.11–3.14:** Typed (`py.typed`), lazy PEP 562 imports (~28 ms `legisbr.sources()`, ~55 ms `legisbr list` CLI startup with zero heavy imports), zero import-time `.env` or logging side effects.
+- **Stream, Search, Index & Export:** Zero-disk async streaming (`legisbr.Client`), native on-demand norm search, SQLite Schema v2 with Portuguese diacritic-insensitive FTS5, streaming ZSTD Parquet export, read-only multi-archive `ArchiveIndex`, and an optional MCP server for AI agents.
 
-Requires Python 3.14 or newer and [uv](https://docs.astral.sh/uv/).
+> This project queries official government portals directly and **does not scrape `leisestaduais.com.br`**.
+
+---
+
+## Quickstart
+
+Requires **Python 3.11+**.
 
 ```bash
-uv sync --group dev
-uv run playwright install chromium
-cp .env.example .env
+# Install the core package
+pip install legisbr
+
+# Or try the CLI immediately with uvx
+uvx legisbr list
 ```
 
-Most sources are scraped over plain HTTP. Chromium is launched lazily, only by the few sources that still need a rendered page.
+### Optional Extras
 
-## Usage
+| Extra | Install | Purpose |
+| --- | --- | --- |
+| `ocr` | `pip install "legisbr[ocr]"` | Scanned PDF OCR via PydanticAI (OpenAI default) |
+| `ocr-openai` | `pip install "legisbr[ocr-openai]"` | OpenAI / OpenAI-compatible OCR provider |
+| `ocr-anthropic` | `pip install "legisbr[ocr-anthropic]"` | Anthropic Claude OCR provider |
+| `ocr-google` | `pip install "legisbr[ocr-google]"` | Google Gemini OCR provider |
+| `ocr-bedrock` | `pip install "legisbr[ocr-bedrock]"` | AWS Bedrock OCR provider |
+| `proxy` | `pip install "legisbr[proxy]"` | SOCKS/HTTP proxy rotation (`aiohttp-socks`, used for Paraná) |
+| `parquet` | `pip install "legisbr[parquet]"` | Fixed-schema streaming ZSTD Parquet export (`pyarrow`) |
+| `mcp` | `pip install "legisbr[mcp]"` | Model Context Protocol server (`mcp`) for AI agents |
+| `all` | `pip install "legisbr[all]"` | All optional extras combined (zero GPL/AGPL/LGPL) |
+
+---
+
+## Python Library API
+
+### 1. Zero-Disk Async Streaming
+
+`Client.scrape()` streams validated `Document` objects through a PEP 789-safe async context manager with **zero disk writes** unless a `Store` (or custom `DocumentSink`) is passed:
+
+```python
+import asyncio
+import legisbr
+
+
+async def main() -> None:
+    async with legisbr.Client() as client:
+        async with client.scrape("SP", years=2024, limit=10) as docs:
+            async for doc in docs:
+                print(doc.year, doc.title, len(doc.text_markdown))
+
+
+asyncio.run(main())
+```
+
+### 2. Low-Memory / Headless Preset
+
+Ideal for containers, CI runners, and small VMs (`workers <= 4`, thread-based PDF extraction, 2 MB image cache, `doc.raw` dropped when streaming without a `Store`):
+
+```python
+async with legisbr.Client(low_memory=True) as client:
+    async with client.scrape("AC", years=2024, limit=5) as docs:
+        async for doc in docs:
+            print(doc.title)
+```
+
+### 3. On-Demand Targeted Norm Search
+
+Search portals with native server-side filters (no full-year crawl required when `strict_native=True`), then fetch only the norms you need:
+
+```python
+async with legisbr.Client() as client:
+    refs = [
+        ref
+        async for ref in client.search_refs(
+            "Camara",
+            years=2021,
+            number="14133",
+            strict_native=True,
+        )
+    ]
+    if refs:
+        doc = await client.fetch_ref("Camara", refs[0])
+        print(doc.title, doc.document_url)
+```
+
+### 4. Local SQLite Archive, FTS5 Search & Parquet Export
+
+Persist into SQLite Schema v2 with automatic Portuguese diacritic-insensitive FTS5 indexing (inline base64 images are automatically stripped before indexing), stream fixed-schema ZSTD Parquet, and query across multiple jurisdictions read-only with `ArchiveIndex`:
+
+```python
+from pathlib import Path
+import legisbr
+
+
+async def archive_and_query() -> None:
+    data_dir = Path("outputs/legislation")
+    store = legisbr.Store(
+        data_dir / "SAO_PAULO" / "documents.db",
+        source="SAO_PAULO",
+        save_raw=False,  # 80-95% disk savings (skips raw PDF/HTML copies)
+        fts=True,
+    )
+
+    async with legisbr.Client() as client:
+        async with client.scrape("SP", years=2024, limit=25, store=store) as docs:
+            async for _ in docs:
+                pass
+
+    # Fixed-schema ZSTD Parquet (HuggingFace-ready single file or per-year)
+    async with store:
+        await store.export(data_dir / "sp_2024.parquet", fmt="parquet", single_file=True)
+
+    # Read-only cross-jurisdiction BM25 search (auto-falls back to immutable=1 on RO mounts)
+    index = legisbr.ArchiveIndex(data_dir)
+    for hit in await index.query("administracao publica", year=2024, limit=5):
+        print(f"[{hit.source}] {hit.title}: {hit.snippet}")
+```
+
+---
+
+## CLI Usage
+
+Both `legisbr` and `python -m legisbr` expose the full CLI:
 
 ```bash
-uv run main.py list
-uv run main.py run -s Acre Conama --year 2024
-uv run main.py run -s PB PI RR
-uv run main.py run --all
-uv run main.py run --all --jobs 8
-uv run main.py stats
-uv run main.py run -s RS --year 2024 --overwrite
-uv run main.py run -s Pernambuco --year 2024 --verbose
-uv run main.py export -s Acre --format jsonl --out exports/acre
-uv run main.py export -s Acre --format json
-uv run main.py import-json -s Acre
+# List all 30 registered sources and capabilities (zero heavy imports)
+legisbr list
+legisbr list --json
+
+# Scrape into SQLite (single scraper in-process; multiple scrapers in parallel processes)
+legisbr run -s SP --year 2024 --no-raw --fts
+legisbr run -s Acre Conama --years 2022:2024 --low-memory
+legisbr run --all --jobs 8
+
+# On-demand live search (add --fetch to convert matching norms to Markdown/JSON)
+legisbr search -s Camara --year 2021 --number 14133 --strict-native --fetch
+
+# Build/rebuild FTS5 indexes on existing archives and run instant local queries
+legisbr index --all
+legisbr query "licenciamento ambiental" --year 2024 --limit 20
+
+# Export archives to ZSTD Parquet, JSONL, or JSON
+legisbr export -s SP --format parquet --single-file --out exports/sp.parquet
+legisbr export -s Acre --format jsonl --out exports/acre
+
+# Import legacy JSON archives and inspect run performance stats
+legisbr import-json -s Acre
+legisbr stats
+
+# Start the optional MCP server over your local archive directory
+legisbr mcp serve --data-dir ./outputs/legislation
 ```
 
-Names, class names, and the aliases shown by `list` are case insensitive. Omit `--year` to scrape the registered date range. A run returns exit code 1 if any listing, document, or cleanup fails; errors are recorded in SQLite. With no command, the CLI prints usage and exits 2.
+Names, codes, and aliases shown by `legisbr list` are case-insensitive. A `run` exits `1` if any listing, document fetch, or cleanup fails (all errors are recorded in SQLite `errors`).
 
-When several scrapers are selected, each runs in its own process, so CPU-heavy parsing in one source never stalls another. `--jobs` limits how many run at once (default: all selected, up to the CPU count). Each child has its own OCR limit (`LLM_CONCURRENCY`) and PDF worker pool. A single scraper runs in-process.
+---
 
-`stats` prints a Markdown table of each archive's latest run. It covers wall time, listing time, documents per minute, time per document fetch (p50/p95/max, including rate-limit waits), HTTP requests, retries and megabytes, browser navigations, and LLM requests. The numbers come from `runs.stats`.
+## MCP Server (Claude Desktop / Claude Code / Agents)
 
-Resume checks use the original listing URL and title, even when the fetched document has a different URL or publication year. `--overwrite` re-scrapes the selected years and replaces each stored document as it is saved; nothing is deleted up front, so documents removed from the source stay in the archive. Acre, Rio de Janeiro, and ICMBio enumerate their yearless listings once and filter by each document's year. Amapá's eLegis filters by the year of the originating bill, so `--year Y` lists norms from bills filed in Y and files each under its publication year; `--all` covers every norm once. Other sources list years in order through one shared worker queue. Constitutions retain their promulgation year.
+Install with `legisbr[mcp]` (or run directly via `uvx`) to give AI assistants instant, read-only BM25 search over local Brazilian legislation archives.
+
+Tools exposed:
+- `list_sources` — all 30 jurisdictions with local archive coverage and search capabilities.
+- `search_legislation` — BM25 full-text search returning metadata + highlighted snippets (never dumps giant bodies).
+- `get_legislation` — fetches full norm Markdown by `(source, doc_id)` with `max_chars` truncation safety.
+- `live_search_norms` / `live_fetch_norm` — disabled by default; opt in with `--allow-live-fetch` (enforces `strict_native=True` so agents cannot accidentally trigger multi-minute crawls).
+
+Example Claude Desktop / Claude Code MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "legisbr": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "legisbr[mcp]",
+        "legisbr",
+        "mcp",
+        "serve",
+        "--data-dir",
+        "/path/to/outputs/legislation"
+      ]
+    }
+  }
+}
+```
+
+For remote HTTP clients, pass `--transport streamable-http --host 127.0.0.1 --port 8000`.
+
+---
+
+## 30-Source Coverage & Capabilities
+
+| Code | Archive Name | Scope | Start | PDF | OCR | Native Search | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `camara` | `LEGISLACAO_FEDERAL` | Federal | 1808 | Yes | No | year, type, number, text, situation | 100 rps |
+| `conama` | `CONAMA` | Environment | 1984 | Yes | Yes | year | — |
+| `icmbio` | `ICMBIO` | Environment | 2016 | Yes | No | client filter | cookies disabled |
+| `ac` | `ACRE` | State | 1963 | No | No | fast catalog | `insecure_tls` (missing intermediate CA) |
+| `al` | `ALAGOAS` | State | 1942 | Yes | Yes | year | 5 rps |
+| `am` | `AMAZONAS` | State | 1956 | No | No | year, type | 50 rps |
+| `ap` | `AMAPA` | State | 1991 | No | No | year, type | `--year` filters bill filing year |
+| `ba` | `BAHIA` | State | 1891 | No | No | year | 1 rps, `insecure_tls` (legacy TLS 1.2 RSA) |
+| `ce` | `CEARA` | State | 1968 | No | Yes | heavy setup (no strict native) | prefetches catalog in `setup()` |
+| `df` | `DISTRITO_FEDERAL` | State | 1922 | Yes | Yes | year | 100 rps, 100 workers |
+| `es` | `ESPIRITO_SANTO` | State | 1958 | Yes | Yes | year | 50 rps |
+| `go` | `GOIAS` | State | 1887 | Yes | Yes | year | 100 rps |
+| `ma` | `MARANHAO` | State | 1906 | Yes | Yes | year, type | — |
+| `mg` | `MINAS_GERAIS` | State | 1831 | Yes | Yes | year, type, number, text | — |
+| `ms` | `MATO_GROSSO_DO_SUL` | State | 1979 | No | No | year, type | — |
+| `mt` | `MATO_GROSSO` | State | 2017 | No | Yes | year | 5 rps |
+| `pa` | `PARA` | State | 1990 | Yes | Yes | year, type | 5 rps |
+| `pb` | `PARAIBA` | State | 1924 | Yes | Yes | year, type, number, text (SAPL) | 1 rps, 2 workers |
+| `pe` | `PERNAMBUCO` | State | 1835 | No | No | year | — |
+| `pi` | `PIAUI` | State | 1922 | Yes | Yes | year, type, number, text (SAPL) | — |
+| `pr` | `PARANA` | State | 2025 | No | No | year, type, number, direct ID | 0.3 rps, 35m 403-pause, optional `[proxy]` |
+| `rj` | `RIO_DE_JANEIRO` | State | 1891 | No | No | type (yearless) | 300s request timeout, 3 retries |
+| `rn` | `RIO_GRANDE_DO_NORTE` | State | 1971 | Yes | Yes | year | — |
+| `ro` | `RONDONIA` | State | 1981 | Yes | Yes | year, type | — |
+| `rr` | `RORAIMA` | State | 1991 | Yes | Yes | year, type, number, text (SAPL) | — |
+| `rs` | `RIO_GRANDE_DO_SUL` | State | 1830 | Yes | Yes | year | — |
+| `sc` | `SANTA_CATARINA` | State | 1946 | No | No | year, type | — |
+| `se` | `SERGIPE` | State | 1940 | Yes | Yes | year, type | — |
+| `sp` | `SAO_PAULO` | State | 1835 | Yes | Yes | year, type, number, situation | — |
+| `to` | `TOCANTINS` | State | 1989 | Yes | Yes | year, type | — |
+
+---
+
+## Performance & Compatibility
+
+- **Rust PDF Pipeline (`pdf_oxide` + `pypdf`):** ~19.5× faster than `pymupdf4llm` on real Brazilian legislation PDFs with legal line-break restoration (`Art.`, `§`, Roman incisos). Uses a bounded `spawn` process pool (`pdf_executor="auto"`) to keep event-loop latency <50 ms, with automatic fallback to bounded `asyncio.to_thread` in restricted containers without `/dev/shm`.
+- **Single-Flight `ImageCache` & `<img` Fast-Path:** Skips HTML DOM parsing on text-only laws and deduplicates concurrent coat-of-arms/header fetches in memory (bounded LRU, default 16 MiB).
+- **GCRA `burst=1` Rate Limiter:** Zero-dependency lock-free slot reservation preserving strict inter-arrival spacing (critical for portals like Paraná at 0.3 rps).
+- **Storage & Memory Efficiency:** `save_raw=False` / `--no-raw` cuts archive disk usage by 80–95%; `BaseScraper` deduplicates resume keys with 16-byte `blake2b` digests and tracks latency in a deterministic O(1)-memory log-bucket histogram.
+- **Platform Support:** Linux, macOS, and Windows on **Python 3.11–3.14**. Note: `pdf_oxide` Linux wheels target `manylinux_2_28` / musl 1.2+, so AWS Lambda deployments should use **Python 3.12+ (Amazon Linux 2023)** rather than Amazon Linux 2 (Python 3.11).
+
+---
 
 ## Configuration
 
-All project settings are read in `src/config.py`, including `.env`.
+Library code never auto-loads `.env` or mutates `os.environ`. The CLI loads `Settings.from_env(env_file=Path(".env"))` explicitly:
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `SAVE_DIR` | Root of scraper archives | `outputs/legislation` |
-| `STATE_LEGISLATION_SAVE_DIR` | Optional state archive root | `SAVE_DIR` |
-| `SPECIFIC_LEGISLATION_SAVE_DIR` | Optional CONAMA/ICMBio archive root | `SAVE_DIR` |
-| `LOG_DIR` | Per-scraper runtime logs | `logs/legislation` |
-| `LLM_MODEL` | PydanticAI model string, or comma-separated fallback models | Empty: OCR disabled |
-| `LLM_PDF_INPUT` | Send PDF chunks instead of rendered PNG pages | `false` |
+| `SAVE_DIR` | Root directory for SQLite archives | `outputs/legislation` |
+| `STATE_LEGISLATION_SAVE_DIR` | Optional override root for state archives | `SAVE_DIR` |
+| `SPECIFIC_LEGISLATION_SAVE_DIR` | Optional override root for CONAMA / ICMBio | `SAVE_DIR` |
+| `LOG_DIR` | Optional directory for per-scraper CLI log files | Empty (stderr only) |
+| `LLM_MODEL` | PydanticAI model string or comma-separated fallback list (requires `legisbr[ocr-*]`) | Empty (OCR disabled) |
+| `LLM_PDF_INPUT` | Send sliced PDF batches instead of 150 DPI rendered PNG pages | `false` |
 | `LLM_BATCH_SIZE` | Pages per OCR request | `5` |
 | `LLM_CONCURRENCY` | Maximum concurrent OCR batches per scraper process | `8` |
-| `PDF_WORKERS` | PDF text-extraction processes per scraper process (multi-scraper runs set it from `--jobs`) | `min(8, CPUs)` |
-| `PROXY_FILE_PATH` | Optional newline-separated proxy list (`scheme://host:port`), used by Paraná only. Each proxy gets Paraná's own rate (0.3 rps), so load is proxies × 0.3 rps. Build it with `uv run scripts/check_proxies.py proxies.txt proxies.parana.txt --count 20`, which keeps working proxies with distinct exit IPs; the file is re-read every 60 s, so rerunning the script mid-run refreshes the pool | Empty |
-| `PROXY_ENDPOINT` | Optional proxy-list endpoint | Empty |
+| `PDF_WORKERS` | Worker processes for PDF extraction (`0` forces thread mode) | `min(8, CPUs)` |
+| `PROXY_FILE_PATH` | Optional newline-separated proxy list for Paraná (`legisbr[proxy]`) | Empty |
+| `PROXY_ENDPOINT` | Optional proxy-list HTTP endpoint for Paraná (`legisbr[proxy]`) | Empty |
 
-For example, set `LLM_MODEL=openai:gpt-4.1-mini` and `OPENAI_API_KEY`. OpenAI-compatible services also use `OPENAI_BASE_URL`. Other model strings use their standard provider credentials, such as `AWS_*`, `AWS_BEARER_TOKEN_BEDROCK`, `ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`. Installed PydanticAI provider extras cover OpenAI, Bedrock, Anthropic, and Google. Model selection and whether PDF input is supported depend on the provider.
+Provider credentials follow PydanticAI's standard environment variables (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `AWS_*` / `AWS_BEARER_TOKEN_BEDROCK`).
 
-Each scraper process has one OCR agent and semaphore. A failed OCR batch rejects the whole document; successful blank batches are allowed. A PDF whose text layer is unreadable goes to OCR when a model is configured; without a model the noisy text is kept. Unreadable means mostly odd-shaped tokens and few common Portuguese words, as in old scans with a noisy OCR layer. On the 2012 archives this sends 13 of about 11,700 PDFs, 111 pages, to OCR. Usage per model is stored in `runs.llm_usage`.
+---
 
-## Storage and export
+## Legal & Ethical Notice
 
-Each scraper writes `<archive root>/<SCRAPER>/documents.db` with `documents`, `errors`, and `runs` tables. SQLite uses WAL and atomic transactions. Raw artifacts live under `YEAR/docs/` with fixed-length content-addressed filenames and are written by atomic replacement. `file_path` is relative to the scraper's archive directory, so archives can be moved. Rows written by older versions may hold absolute paths. Replacing a document removes its previous raw file, and a failed write removes the file it just wrote. The store never deletes files it did not write, and an interrupted write never replaces a previous document's raw content.
+- **Public Domain Status:** Official Brazilian laws, decrees, resolutions, and normative acts are excluded from copyright protection under **Lei nº 9.610/1998, art. 8º, I** (*"Não são objeto de proteção como direitos autorais: os textos de tratados ou convenções, leis, decretos, regulamentos, decisões judiciais e demais atos oficiais"*).
+- **Official Portals Only:** `legisbr` fetches exclusively from official government portals with conservative per-source rate limits and never scrapes `leisestaduais.com.br` or private editorial consolidations.
+- **No Legal Advice:** Extracted text reflects the official source portal at scrape time and is provided as-is for research, indexing, and engineering use; always verify authoritative texts before legal reliance.
 
-`export` streams records to `YEAR/data.jsonl` or `YEAR/data.json`. It includes document metadata, `text_markdown`, source-specific extra fields, `file_path`, and the resume key (`ref_url`, `ref_title`) so `import-json` can restore it; raw bytes and listing-only keys starting with `_` are excluded. The default export directory is `<archive root>/<SCRAPER>/export`. With multiple scrapers and `--out`, each scraper gets a separate subdirectory.
-
-`import-json` reads `YEAR/data.json` (a list, or the legacy `{"summary", "documents"}` file) and `YEAR/shards/*.json` from the selected scraper's archive directory. It validates each record, preserves existing `file_path` values, and never deletes its inputs. Invalid records are skipped, recorded in the `errors` table, and make the command exit 1; unreadable files fail loudly. Rerunning safely replaces duplicate keys. Legacy Câmara, DF, and Ceará archives were keyed by the fetched URL, not the listing URL that resume uses, so re-scrape those instead of importing them. The same applies to archives made before the Amapá, Pará, São Paulo, Sergipe, and Rio de Janeiro rewrites, whose sources or titles changed.
-
-## Architecture
-
-```text
-main.py                      CLI, one process per scraper, run stats
-src/config.py                Environment settings
-src/registry.py              30 scraper registrations and runtime defaults
-src/core/document.py         Validated Document model and listing metadata type
-src/core/store.py            SQLite, resume keys, errors, summaries, import/export
-src/core/http.py             Buffered responses, rate limiting, retries
-src/core/browser.py          Lazy, bounded Playwright page pool
-src/core/ocr.py               Shared PydanticAI OCR
-src/core/convert.py           HTML/PDF conversion and content helpers
-src/core/scraper.py           Bounded listing → fetch → save pipeline
-src/core/sapl.py              Shared SAPL API scraper
-src/core/images.py           Image inlining
-src/core/proxy.py            Proxy rotation
-src/scrapers/states/<uf>.py   State-specific listing and document extraction
-src/scrapers/federal/         Câmara dos Deputados
-src/scrapers/environment/     CONAMA and ICMBio
-```
-
-Scrapers implement `list_type(year, name, value)` (called once per type, so one failing type doesn't stop the others) or override `list_documents(year)`, both async generators of lightweight metadata, and `fetch(ref)` returning a `Document`. Constructors only accept dependencies and set attributes. The base run loop owns persistence, error reporting, and resume; fetch workers never collect whole archives in memory. One queue capped at twice the worker count serves all years. Stateful pagination remains sequential; stateless page requests use bounded batches. HTTP requests and browser navigation share the scraper's rate limiter. Browser pools never exceed their configured page limit.
-
-Digital PDFs use pymupdf4llm, then PyMuPDF plain text, then optional OCR. Text extraction runs in a pool of worker processes, because pymupdf4llm holds the GIL. A crashed worker fails only its own document. Word documents convert to HTML with mammoth. File types are detected from content (`%PDF`, DOCX zip, OLE2, HTML) before names or headers; legacy Word `.doc` files fail with a clear error, since no converter is bundled. HTML uses the lxml parser and html-to-markdown, with image sources inlined as base64 data URIs. Spacer images under 100 bytes are dropped. Responses decode as browsers do: the declared charset (header, BOM or `<meta>`), otherwise UTF-8 when valid and windows-1252 when not; ISO-8859-1 labels also mean windows-1252.
+---
 
 ## Development
 
 ```bash
-uv run ruff check src main.py tests
-uv run ruff format src main.py tests
-uv run pytest tests -m "not integration" -n 4
+uv sync --all-extras --group dev
+uv run ruff check src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+uv run ruff format --check src/legisbr tests scripts/check_proxies.py scripts/check_licenses.py
+uv run pytest tests -m "not integration" -n auto --timeout=60
 uv run pytest tests -m integration
 uv run pre-commit run --all-files
 ```
 
-Pre-commit runs whitespace, large-file, Ruff, and offline pytest checks with a 60-second per-test timeout. Integration tests make real network requests and may require Chromium. Unit tests inject buffered responses and fake browser/OCR dependencies through normal constructors.
-
-To add a scraper, subclass `BaseScraper` or `SAPLBaseScraper`, implement listing and fetch, and register a `ScraperSpec`. Keep persistence in the base class. Add parser fixtures and a fetch test that returns a validated `Document`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the 10-minute broken-scraper fix guide and PR checklist, and [SECURITY.md](SECURITY.md) for our TLS and disclosure policy.
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

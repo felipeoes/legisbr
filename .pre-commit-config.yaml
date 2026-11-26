@@ -9,15 +9,17 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.7
     hooks:
-      - id: ruff
-        args: [ --fix ]
+      - id: ruff-check
+        args: [--fix]
+        files: ^(src/legisbr/|tests/|scripts/check_(proxies|licenses)\.py$)
       - id: ruff-format
+        files: ^(src/legisbr/|tests/|scripts/check_(proxies|licenses)\.py$)
 
   - repo: local
     hooks:
       - id: pytest
         name: pytest
-        entry: uv run pytest tests/ -q --timeout=60 --tb=short -m "not integration"
+        entry: uv run pytest tests -q -n auto --timeout=60 --tb=short -m "not integration"
         language: system
         pass_filenames: false
         always_run: true
