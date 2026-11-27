@@ -283,6 +283,40 @@ class TestFetch:
         assert "Art. 2º Texto em tabela de layout antiga." in doc.text_markdown
 
     @pytest.mark.asyncio
+    async def test_preserves_multi_column_data_table_containing_emptycellstyle(self):
+        scraper = _make_scraper()
+        body_html = """
+        <p>Art. 1º Ficam estabelecidas as alíquotas conforme tabela abaixo:</p>
+        <table>
+          <tr><th>Código</th><th>Descrição</th><th>Alíquota</th></tr>
+          <tr><td>01</td><td><p class="EMPTYCELLSTYLE">&nbsp;</p></td><td>12%</td></tr>
+          <tr><td>02</td><td>Produto B</td><td>18%</td></tr>
+        </table>
+        <table>
+          <tr><td><p class="EMPTYCELLSTYLE">&nbsp;</p></td><td><p>Art. 2º Texto em wrapper de 1 linha.</p></td></tr>
+        </table>
+        """
+        raw = _make_doc_soup(body_html=body_html)
+        scraper.http.request = AsyncMock(return_value=make_mock_response(raw))
+        doc = await scraper.fetch(
+            {
+                "title": "LEI Nº 12.610 DE 2012",
+                "type": "Lei Ordinária",
+                "year": 2012,
+                "situation": "Não consta revogação expressa",
+                "_html_link": "/documentos/lei-12610",
+            }
+        )
+        assert doc is not None
+        assert re.search(r"\|\s*01\s*\|\s*\|\s*12%\s*\|", doc.text_markdown)
+        assert re.search(r"\|\s*02\s*\|\s*Produto B\s*\|\s*18%\s*\|", doc.text_markdown)
+        assert "Art. 2º Texto em wrapper de 1 linha." in doc.text_markdown
+        assert not any(
+            line.startswith("|") and "Art. 2º" in line
+            for line in doc.text_markdown.splitlines()
+        )
+
+    @pytest.mark.asyncio
     async def test_strip_revogado_preserves_article_numbers_and_avoids_partial_false_positives(
         self,
     ):

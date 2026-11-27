@@ -195,6 +195,67 @@ async def test_stream_limit_and_store_persistence(tmp_path: Path):
             assert [doc async for doc in docs] == []
 
 
+async def test_stream_deduplicates_ref_buffered_in_output():
+    """Duplicate refs emitted while doc 1 sits buffered in output must not be re-fetched."""
+    first_fetched = asyncio.Event()
+    emit_duplicate = asyncio.Event()
+    fetch_counts: dict[str, int] = {}
+
+    class DuplicateEmittingScraper(BaseScraper):
+        name = "DUP_STREAM"
+        base_url = "https://example.org"
+
+        async def list_documents(self, year):
+            dup_ref = {
+                "year": year,
+                "type": "Lei",
+                "title": "Lei nº 1/2024",
+                "document_url": "https://example.org/lei/1",
+            }
+            yield dup_ref
+            # Wait until worker finished fetching dup_ref, placed it into `output`,
+            # and cleared `pending` while the consumer has NOT pulled from `output` yet.
+            await emit_duplicate.wait()
+            yield dict(dup_ref)
+            yield {
+                "year": year,
+                "type": "Lei",
+                "title": "Lei nº 2/2024",
+                "document_url": "https://example.org/lei/2",
+            }
+
+        async def fetch(self, ref):
+            url = ref["document_url"]
+            fetch_counts[url] = fetch_counts.get(url, 0) + 1
+            if url.endswith("/1"):
+                first_fetched.set()
+            return document(
+                title=ref["title"],
+                year=ref["year"],
+                type=ref["type"],
+                document_url=url,
+            )
+
+    scraper = DuplicateEmittingScraper(
+        http=HttpClient(), years=range(2024, 2025), workers=1
+    )
+    async with scraper.stream() as docs:
+        # Let worker fetch ref 1, put it into output, and run finally: pending.discard().
+        await asyncio.wait_for(first_fetched.wait(), timeout=2)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Emit duplicate ref 1 + ref 2 before consumer reads anything from `docs`.
+        emit_duplicate.set()
+        got = [doc async for doc in docs]
+
+    assert [d.title for d in got] == ["Lei nº 1/2024", "Lei nº 2/2024"]
+    assert fetch_counts == {
+        "https://example.org/lei/1": 1,
+        "https://example.org/lei/2": 1,
+    }
+    assert scraper._result.skipped == 1
+
+
 async def test_client_scrape_null_sink_on_error_and_low_memory(
     tmp_path: Path, monkeypatch
 ):
@@ -345,6 +406,87 @@ async def test_client_search_refs_strict_native_rejects_ce_without_setup(monkeyp
                 )
             ]
     setup_spy.assert_not_awaited()
+
+
+async def test_client_search_refs_runs_df_setup_and_skips_sapl_and_heavy_fetch_setup(
+    monkeypatch,
+):
+    from legisbr.scrapers.states.df import DFSinjScraper
+    from legisbr.scrapers.states.pb import ParaibaAlpbScraper
+
+    df_setup = AsyncMock()
+    df_fetch_page = AsyncMock(
+        return_value=(
+            [
+                {
+                    "title": "Lei nº 7.400/2024",
+                    "type": "Lei",
+                    "situation": "Vigente",
+                    "document_url": "https://www.sinj.df.gov.br/sinj/Norma/1",
+                }
+            ],
+            1,
+        )
+    )
+    monkeypatch.setattr(DFSinjScraper, "setup", df_setup)
+    monkeypatch.setattr(DFSinjScraper, "_fetch_search_page", df_fetch_page)
+
+    pb_setup = AsyncMock()
+    monkeypatch.setattr(ParaibaAlpbScraper, "setup", pb_setup)
+
+    ce_setup = AsyncMock()
+    ce_fetch = AsyncMock(return_value=document(title="Lei CE 1/2024", year=2024))
+    monkeypatch.setattr("legisbr.scrapers.states.ce.CearaAleceScraper.setup", ce_setup)
+    monkeypatch.setattr("legisbr.scrapers.states.ce.CearaAleceScraper.fetch", ce_fetch)
+
+    async with Client() as client:
+        # DF relies on BaseScraper.search_refs -> list_documents, so setup() MUST run.
+        df_refs = [
+            ref
+            async for ref in client.search_refs(
+                "df", years=2024, strict_native=True, limit=5
+            )
+        ]
+        assert len(df_refs) == 1
+        assert df_refs[0]["title"] == "Lei nº 7.400/2024"
+        df_setup.assert_awaited_once()
+
+        # Subsequent search_refs reuses cached setup.
+        _ = [ref async for ref in client.search_refs("df", years=2024, limit=5)]
+        df_setup.assert_awaited_once()
+
+        # SAPL overrides search_refs() directly, so setup() (assuntonorma) is skipped
+        # even for non-native queries (strict_native=False).
+        pb_http = client._get_http_client(get_spec("pb"))
+        pb_http.request = AsyncMock(
+            return_value=Response(
+                "https://sapl.al.pb.leg.br/api/norma/normajuridica/",
+                200,
+                {"Content-Type": "application/json"},
+                b'{"pagination": {"total_pages": 1}, "results": []}',
+            )
+        )
+        pb_refs = [
+            ref
+            async for ref in client.search_refs(
+                "pb", years=2024, situation="Revogada", strict_native=False, limit=5
+            )
+        ]
+        assert pb_refs == []
+        pb_setup.assert_not_awaited()
+
+        # fetch_ref skips heavy_setup sources like CE.
+        doc = await client.fetch_ref(
+            "ce",
+            {
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "title": "Lei CE 1/2024",
+                "document_url": "https://www2.al.ce.gov.br/legislativo/lei.htm",
+            },
+        )
+        assert doc.title == "Lei CE 1/2024"
+        ce_setup.assert_not_awaited()
 
 
 async def test_top_level_convenience_scrape_and_search_refs(monkeypatch):

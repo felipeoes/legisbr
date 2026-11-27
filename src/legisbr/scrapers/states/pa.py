@@ -7,6 +7,7 @@ from urllib.parse import urlencode, urljoin
 from bs4 import BeautifulSoup
 
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 # Ids of the site's "Tipo de Norma" filter. tipo=12 ("Emendas Constitucionais
@@ -39,6 +40,7 @@ class ParaAlepaScraper(BaseScraper):
     situations = {}
     name = "PARA"
     base_url = "https://bancodeleis.alepa.pa.gov.br"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def _search_url(self, year: int, norm_type_id: int, page: int) -> str:
         query = urlencode({"ano": year, "tipo": norm_type_id, "p": page})

@@ -343,6 +343,94 @@ class TestHtmlConversionFixes:
         )
         assert "Art. 1º Denomina" in soup3.get_text()
 
+        # Operative clauses without "art." (Artigo 1º, § 1º, Parágrafo único, I -) must NOT be deleted!
+        for clause in (
+            "Artigo 1º Denomina José Facundo Filho a rodovia estadual.",
+            "§ 1º Denomina José Facundo Filho a rodovia estadual.",
+            "Parágrafo único. Denomina José Facundo Filho a rodovia estadual.",
+            "I - Denomina José Facundo Filho a rodovia estadual.",
+        ):
+            soup_op = BeautifulSoup(f"<div><p>{clause}</p></div>", "lxml")
+            remove_summary_element(
+                soup_op, "Denomina José Facundo Filho a rodovia estadual."
+            )
+            assert clause in soup_op.get_text(), f"Deleted operative clause: {clause}"
+
+        # Large container containing the summary + non-article body text must NOT be deleted.
+        big_html = (
+            "<div><p>Resumo curto da norma estadual.</p>"
+            "<p>" + ("Disposição detalhada sem abreviação. " * 15) + "</p></div>"
+        )
+        soup_big = BeautifulSoup(big_html, "lxml")
+        remove_summary_element(soup_big, "Resumo curto da norma estadual.")
+        assert "Resumo curto" not in soup_big.get_text()
+        assert "Disposição detalhada" in soup_big.get_text()
+
+    @pytest.mark.asyncio
+    async def test_pre_blocks_and_text_plain_preserve_newlines(self):
+        from unittest.mock import AsyncMock
+
+        from legisbr.core.convert import bytes_to_markdown, html_to_markdown
+
+        html = (
+            "<p>Soft\nwrapped prose.</p>"
+            "<pre>COL_A   COL_B\n100     200\n300     400</pre>"
+        )
+        md = await html_to_markdown(html, "https://x.org", AsyncMock())
+        assert "Soft wrapped prose." in md
+        assert "COL_A   COL_B\n100     200\n300     400" in md
+
+        plain_bytes = b"Art. 1\xba Primeira linha.\r\nArt. 2\xba Segunda linha.\nArt. 3\xba Terceira linha."
+        plain_md = await bytes_to_markdown(
+            plain_bytes,
+            "text/plain; charset=windows-1252",
+            "https://x.org/norma.txt",
+            None,  # type: ignore[arg-type]
+        )
+        assert (
+            plain_md
+            == "Art. 1º Primeira linha.\nArt. 2º Segunda linha.\nArt. 3º Terceira linha."
+        )
+
+        # Plain text starting with "BM" or "RIFF....WAVE" must not be misdetected as images.
+        bm_md = await bytes_to_markdown(
+            b"BM25 texto normativo\nSegunda linha.",
+            "text/plain; charset=utf-8",
+            "https://x.org/bm.txt",
+            None,  # type: ignore[arg-type]
+        )
+        assert bm_md == "BM25 texto normativo\nSegunda linha."
+
+    @pytest.mark.asyncio
+    async def test_mixed_div_and_table_list_strikethrough_normalization(self):
+        from unittest.mock import AsyncMock
+
+        from bs4 import BeautifulSoup
+
+        from legisbr.core.convert import clean_norm_soup, html_to_markdown
+
+        raw = (
+            '<div style="text-decoration:line-through">Direct text<p>Inner para</p></div>'
+            '<table style="text-decoration:line-through">'
+            "<thead><tr><th>Col A</th><th>Col B</th></tr></thead>"
+            "<tbody><tr><td>Val 1</td><td>Val 2</td></tr></tbody>"
+            "</table>"
+            '<ul style="text-decoration:line-through"><li>Item 1</li><li>Item 2</li></ul>'
+        )
+        soup = clean_norm_soup(BeautifulSoup(raw, "lxml"), strip_styles=True)
+        # Never wrap <table> or <ul> in <s>.
+        assert (
+            soup.find("table") is not None
+            and soup.find("table").find_parent("s") is None
+        )
+        assert soup.find("ul") is not None and soup.find("ul").find_parent("s") is None
+        md = await html_to_markdown(str(soup), "https://x.org", AsyncMock())
+        assert "~~Direct text~~" in md
+        assert "~~Inner para~~" in md
+        assert "| ~~Col A~~ | ~~Col B~~ |" in md
+        assert "| ~~Val 1~~ | ~~Val 2~~ |" in md
+        assert "~~Item 1~~" in md and "~~Item 2~~" in md
+
 
 _VALID_DOC_KWARGS = dict(
     year=2024,

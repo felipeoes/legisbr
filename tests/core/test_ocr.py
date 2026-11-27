@@ -188,3 +188,51 @@ def test_ocr_dpi_validation_and_batch_rendering() -> None:
     assert parts[0].data.startswith(b"\x89PNG\r\n\x1a\n")
     width, _ = struct.unpack(">II", parts[0].data[16:24])
     assert 800 <= width <= 900
+
+
+async def test_ocr_images_sniffs_mime_types_and_transcodes_bmp_and_tiff() -> None:
+    from PIL import Image
+    from pydantic_ai.messages import BinaryContent
+
+    def encode(fmt: str) -> bytes:
+        img = Image.new("RGB", (16, 16), (120, 80, 40))
+        buf = io.BytesIO()
+        img.save(buf, format=fmt)
+        return buf.getvalue()
+
+    samples = [
+        ("PNG", "image/png", encode("PNG")),
+        ("JPEG", "image/jpeg", encode("JPEG")),
+        ("GIF", "image/gif", encode("GIF")),
+        ("WEBP", "image/webp", encode("WEBP")),
+        ("BMP", "image/png", encode("BMP")),
+        ("TIFF", "image/png", encode("TIFF")),
+    ]
+    seen_parts: list[BinaryContent] = []
+
+    async def respond(messages, info):
+        for msg in messages:
+            for part in getattr(msg, "parts", ()):
+                content = getattr(part, "content", None)
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, BinaryContent):
+                            seen_parts.append(item)
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"text_markdown": "ok"})]
+        )
+
+    ocr = OCR("test", batch_size=10, concurrency=1)
+    with ocr.agent.override(model=FunctionModel(respond)):
+        result = await ocr.images([raw for _, _, raw in samples])
+
+    assert result == "ok"
+    assert [p.media_type for p in seen_parts] == [exp for _, exp, _ in samples]
+    # BMP and TIFF were re-encoded to valid PNG bytes.
+    assert seen_parts[4].data.startswith(b"\x89PNG\r\n\x1a\n")
+    assert seen_parts[5].data.startswith(b"\x89PNG\r\n\x1a\n")
+
+    # Non-image payload raises OCRError.
+    with ocr.agent.override(model=FunctionModel(respond)):
+        with pytest.raises(OCRError):
+            await ocr.images([b"not an image payload"])

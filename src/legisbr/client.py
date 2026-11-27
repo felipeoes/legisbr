@@ -337,8 +337,11 @@ class Client:
                 f"{spec.name} does not natively support {query!r} "
                 f"(capabilities={spec.capabilities!r})"
             )
-        # Native / fast-catalog searches skip heavy setup() (e.g. SAPL assuntonorma).
-        needs_setup = not spec.capabilities.supports_query(query)
+        # Native search_refs() overrides (Camara, SAPL, SP, MG, PR) query portals
+        # directly without setup() (e.g. skipping SAPL's assuntonorma preload).
+        # Scrapers using BaseScraper.search_refs() delegate to list_documents() /
+        # list_type(), so session setup() (e.g. DF's ASP.NET cookie) must still run.
+        needs_setup = spec.load_cls().search_refs is BaseScraper.search_refs
         scraper = await self._get_scraper(spec, ensure_setup=needs_setup)
         async for ref in scraper.search_refs(
             query,
@@ -350,7 +353,11 @@ class Client:
     async def fetch_ref(self, source: str, ref: DocRef) -> Document:
         """Fetch and convert a single document reference, reusing cached scraper setup."""
         spec = get_spec(source)
-        scraper = await self._get_scraper(spec, ensure_setup=True, need_ocr=True)
+        scraper = await self._get_scraper(
+            spec,
+            ensure_setup=not spec.capabilities.heavy_setup,
+            need_ocr=True,
+        )
         doc = await scraper.fetch(dict(ref))
         if doc is None:
             raise ValueError("Fetch produced no document")

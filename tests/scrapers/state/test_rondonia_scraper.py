@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import (
     ScraperClassTests,
     SituationsConstantTests,
     TypesConstantTests,
 )
 
+from legisbr.core.query import Query
+from legisbr.core.scraper import BaseScraper
 from legisbr.scrapers.states.ro import SITUATIONS, TYPES, RondoniaCotelScraper
 
 
@@ -20,8 +22,9 @@ def _make_scraper(**kwargs) -> RondoniaCotelScraper:
 
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
-    EXPECTED_COUNT = 4
+    EXPECTED_COUNT = 5
     REQUIRED_KEYS = {
+        "Constituição Estadual",
         "Decreto-Lei",
         "Lei Complementar",
         "Lei Ordinária",
@@ -80,3 +83,52 @@ def _make_valid_row(
     detail_href: str = "/COTEL/Livros/detalhes.aspx?id=42",
 ) -> str:
     return f'<tr><td><div><a href="{detail_href}">{title}</a><a href="/COTEL/Livros/Files/{pdf_filename}">{pdf_filename}</a><span id="ementadocLabel">{summary}</span><span id="coddocLabel">{doc_id}</span></div></td></tr>'
+
+
+class TestSearchRefsAndConstitution:
+    async def test_search_refs_narrows_to_requested_type_only(self):
+        assert RondoniaCotelScraper.list_documents is BaseScraper.list_documents
+        scraper = _make_scraper(years=range(1981, 2026))
+        html = f'<html><body><table id="ContentPlaceHolder1_DataList1"><tbody>{_make_valid_row(title="Lei Ordinária 1/2024")}</tbody></table></body></html>'
+        scraper.http.request.side_effect = [make_mock_response(html)]
+
+        refs = [
+            ref
+            async for ref in scraper.search_refs(
+                Query(years=2024, type="Lei Ordinária"), strict_native=True
+            )
+        ]
+        assert len(refs) == 1
+        assert refs[0]["type"] == "Lei Ordinária"
+        scraper.http.request.assert_awaited_once_with(
+            "http://ditel.casacivil.ro.gov.br/COTEL/Livros/listleiord.aspx?ano=2024"
+        )
+
+    async def test_constitution_emitted_once_per_run_and_searchable_by_1989(self):
+        scraper = _make_scraper(years=range(2024, 2026))
+        y2024 = [
+            ref
+            async for ref in scraper.list_type(
+                2024, "Constituição Estadual", TYPES["Constituição Estadual"]
+            )
+        ]
+        y2025 = [
+            ref
+            async for ref in scraper.list_type(
+                2025, "Constituição Estadual", TYPES["Constituição Estadual"]
+            )
+        ]
+        assert len(y2024) == 1 and y2024[0]["year"] == 1989
+        assert y2025 == []
+
+        # Even on a full-range scraper (like Client), searching 1989 finds the Constitution without HTTP calls.
+        full_scraper = _make_scraper(years=range(1981, 2026))
+        found = [
+            ref
+            async for ref in full_scraper.search_refs(
+                Query(years=1989, type="Constituição Estadual"), strict_native=True
+            )
+        ]
+        assert len(found) == 1
+        assert found[0]["document_url"].endswith("/Livros/CE1989-2014.pdf")
+        full_scraper.http.request.assert_not_awaited()

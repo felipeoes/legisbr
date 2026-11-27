@@ -838,7 +838,10 @@ class Store:
                     data = dict(row)
                     extra = json.loads(data.pop("extra"))
                     if not data.get("source"):
-                        data.pop("source", None)
+                        if self.source:
+                            data["source"] = self.source
+                        else:
+                            data.pop("source", None)
                     if fmt == "json" and not first:
                         output.write(",\n")
                     output.write(json.dumps({**extra, **data}, ensure_ascii=False))

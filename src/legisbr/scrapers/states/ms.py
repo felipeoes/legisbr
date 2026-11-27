@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup, Tag
 
 from legisbr.core.convert import clean_norm_soup, wrap_html
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
@@ -52,7 +53,6 @@ _TOOLBAR_TOKENS = ("sair", "editar", "excluir", "novo anexo")
 _NON_IMAGE_ATTACH_RE = re.compile(
     r"\.(?:docx?|xlsx?|pdf|rtf|zip|rar|odt|ods|txt)(?:$|[?#])", re.IGNORECASE
 )
-_ORDINAL_ONLY_RE = re.compile(r"^[ºª°]+$")
 
 
 class MSAlemsScraper(BaseScraper):
@@ -74,6 +74,7 @@ class MSAlemsScraper(BaseScraper):
     situations = SITUATIONS
     name = "MATO_GROSSO_DO_SUL"
     base_url = "https://aacpdappls.net.ms.gov.br"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -325,7 +326,12 @@ class MSAlemsScraper(BaseScraper):
                 continue
             # Only remove the top Domino separator before the disclaimer/body.
             prev_text = "".join(
-                s.strip() for s in hr.find_all_previous(string=True) if s.strip()
+                s.strip()
+                for s in hr.find_all_previous(string=True)
+                if s.strip()
+                and body in s.parents
+                and (s.parent.name if isinstance(s.parent, Tag) else "")
+                not in ("style", "script", "title")
             )
             if len(prev_text) < 50:
                 hr.decompose()
@@ -444,11 +450,6 @@ class MSAlemsScraper(BaseScraper):
             remove_style_tags=True,
             remove_script_tags=True,
         )
-        for s_tag in list(body.find_all("s")):
-            if not s_tag.decomposed and _ORDINAL_ONLY_RE.match(
-                s_tag.get_text(strip=True)
-            ):
-                s_tag.unwrap()
         html_string = wrap_html(body.decode_contents())
         text_markdown = await self.markdown(html=html_string, base_url=url)
         return Document(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from collections import defaultdict
 from collections.abc import Sequence
 from contextvars import ContextVar
@@ -18,6 +19,7 @@ from tenacity import (
 )
 
 from legisbr.core.convert import clean_md_tag
+from legisbr.core.images import _detect_image_mime
 from legisbr.core.pdf import pdf_page_count, render_pdf_batch, slice_pdf_pages
 
 if TYPE_CHECKING:
@@ -125,19 +127,34 @@ class OCR:
             for model, usage in self._scoped_usage.get(scope, {}).items()
         }
 
+    @staticmethod
+    def _transcode_to_png(data: bytes) -> bytes:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as img:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+
+    async def _prepare_image_part(self, raw: bytes) -> BinaryContent:
+        mime = _detect_image_mime(raw)
+        if mime in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+            return self._binary_content(data=raw, media_type=mime)
+        if mime in {"image/bmp", "image/tiff"}:
+            png_bytes = await asyncio.to_thread(self._transcode_to_png, raw)
+            return self._binary_content(data=png_bytes, media_type="image/png")
+        raise ValueError(
+            f"Unsupported or unrecognized image format: {mime or 'unknown'}"
+        )
+
     async def images(self, pngs: Sequence[bytes]) -> str:
         texts = []
         try:
             for offset in range(0, len(pngs), self.batch_size):
+                batch_raw = pngs[offset : offset + self.batch_size]
+                parts = [await self._prepare_image_part(raw) for raw in batch_raw]
                 async with self.sem:
-                    texts.append(
-                        await self._run(
-                            [
-                                self._binary_content(data=png, media_type="image/png")
-                                for png in pngs[offset : offset + self.batch_size]
-                            ]
-                        )
-                    )
+                    texts.append(await self._run(parts))
         except Exception as exc:
             raise OCRError("Image OCR failed") from exc
         return "\n\n".join(texts)

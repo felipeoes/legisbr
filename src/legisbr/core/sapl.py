@@ -293,7 +293,7 @@ class SAPLBaseScraper(BaseScraper):
     def _extract_expected_norm_number(expected_title: str) -> str | None:
         """Return the primary norm number (digits only) from *expected_title* if present."""
         match = re.search(
-            r"(?:n[º°o°.]*\s*)?(\d{1,3}(?:\.\d{3})+|\d{1,5})(?:\s*/|\s*,|\s+de\b|$)",
+            r"(?:n[º°o°.]*\s*)?(\d{1,3}(?:\.\d{3})+|\d{1,6})(?:\s*/|\s*,|\s+de\b|$)",
             expected_title,
             re.IGNORECASE,
         )
@@ -311,7 +311,7 @@ class SAPLBaseScraper(BaseScraper):
             return False
         numbers = [
             re.sub(r"\D", "", m).lstrip("0") or "0"
-            for m in re.findall(r"\b\d{1,3}(?:\.\d{3})+|\b\d{1,4}\b", compact)
+            for m in re.findall(r"\b\d{1,3}(?:\.\d{3})+|\b\d{1,6}\b", compact)
         ]
         # Ignore 4-digit years (18xx-20xx) unless expected_number itself is that year.
         non_year = [
@@ -361,7 +361,7 @@ class SAPLBaseScraper(BaseScraper):
         numbered = [
             idx
             for idx in title_candidates
-            if re.search("\\b\\d{1,4}\\b", compact_lines[idx])
+            if re.search(r"\b\d{1,6}\b", compact_lines[idx])
         ]
         if numbered:
             return numbered[-1]

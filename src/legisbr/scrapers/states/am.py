@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 from legisbr.core.convert import clean_norm_soup
 from legisbr.core.document import Document
 from legisbr.core.http import HttpError
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 _PT_MONTHS = {
@@ -63,6 +64,7 @@ class LegislaAMScraper(BaseScraper):
     types = TYPES
     situations = {}
     base_url = "https://legisla.imprensaoficial.am.gov.br"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def _format_search_url(self, norm_type_id: str, year: int, page: int) -> str:
         """Format url for search request"""

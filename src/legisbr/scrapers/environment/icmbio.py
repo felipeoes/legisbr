@@ -9,6 +9,7 @@ from urllib.parse import urljoin
 
 from legisbr.core.convert import clean_norm_soup, valid_markdown
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class ICMBioScraper(BaseScraper):
     types = TYPES
     situations = SITUATIONS
     base_url = "https://app.powerbi.com/view?r=eyJrIjoiMGQ0ODRhY2QtYThmNy00NmYwLWFkOGYtOWJmZDU0ODZlZWUzIiwidCI6ImMxNGUyYjU2LWM1YmMtNDNiZC1hZDljLTQwOGNmNmNjMzU2MCJ9"
+    capabilities = SearchCapabilities(native_year=False)
 
     @staticmethod
     def _build_query_payload(restart_tokens: list | None = None) -> dict:

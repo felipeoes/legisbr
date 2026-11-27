@@ -177,8 +177,38 @@ class HttpClient:
         self.image_cache = image_cache if image_cache is not None else ImageCache()
         self._default_session: aiohttp.ClientSession | None = None
         self._proxy_sessions: dict[str, aiohttp.ClientSession] = {}
+        self._inflight_proxies: dict[str, int] = {}
         self._session_lock = asyncio.Lock()
         self.stats = {"requests": 0, "retries": 0, "bytes": 0}
+
+    async def _prune_retired_proxies(self, current_proxy: str | None = None) -> None:
+        """Close and drop cached sessions/limiters for proxies rotated out of ProxyService."""
+        if not self.proxy_service or not (self._proxy_sessions or self._proxy_limiters):
+            return
+        if not getattr(self.proxy_service, "_loaded", True):
+            return
+        raw_proxies = getattr(self.proxy_service, "proxies", None)
+        if raw_proxies is None:
+            return
+        active = {p if "://" in p else f"http://{p}" for p in raw_proxies}
+        if current_proxy:
+            active.add(current_proxy)
+        in_flight = {p for p, count in self._inflight_proxies.items() if count > 0}
+        keep = active | in_flight
+
+        for stale in [p for p in self._proxy_limiters if p not in keep]:
+            self._proxy_limiters.pop(stale, None)
+
+        retired_sessions: list[aiohttp.ClientSession] = []
+        async with self._session_lock:
+            for stale in [p for p in self._proxy_sessions if p not in keep]:
+                session = self._proxy_sessions.pop(stale, None)
+                if session is not None and not session.closed:
+                    retired_sessions.append(session)
+        if retired_sessions:
+            await asyncio.gather(
+                *(s.close() for s in retired_sessions), return_exceptions=True
+            )
 
     async def _ensure_session(self, proxy: str | None = None) -> aiohttp.ClientSession:
         async with self._session_lock:
@@ -236,6 +266,8 @@ class HttpClient:
                     if self.proxy_service and use_proxy
                     else None
                 )
+                if self.proxy_service and use_proxy:
+                    await self._prune_retired_proxies(proxy)
                 retry_errors: tuple[type[BaseException], ...] = (
                     aiohttp.ClientError,
                     asyncio.IncompleteReadError,
@@ -261,6 +293,10 @@ class HttpClient:
                         await asyncio.sleep(pause)
                         await self.limiter.acquire()
                 session = await self._ensure_session(proxy)
+                if proxy:
+                    self._inflight_proxies[proxy] = (
+                        self._inflight_proxies.get(proxy, 0) + 1
+                    )
                 try:
                     request_timeout = aiohttp.ClientTimeout(
                         total=timeout, connect=self._proxy_timeout if proxy else None
@@ -307,6 +343,13 @@ class HttpClient:
                             proxy, _PROXY_REST, type(exc).__name__
                         )
                     raise _RetryableError(url, None, str(exc)) from exc
+                finally:
+                    if proxy:
+                        remaining = self._inflight_proxies.get(proxy, 1) - 1
+                        if remaining <= 0:
+                            self._inflight_proxies.pop(proxy, None)
+                        else:
+                            self._inflight_proxies[proxy] = remaining
         raise AssertionError("Retry loop did not execute")
 
     async def close(self) -> None:
@@ -317,6 +360,8 @@ class HttpClient:
             *(s.close() for s in sessions), return_exceptions=True
         )
         self._proxy_sessions.clear()
+        self._proxy_limiters.clear()
+        self._inflight_proxies.clear()
         self._default_session = None
         if self.proxy_service:
             await self.proxy_service.cleanup()

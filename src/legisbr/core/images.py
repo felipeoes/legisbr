@@ -27,6 +27,14 @@ _SPACER = _SpacerType()
 CacheEntry: TypeAlias = tuple[str, str] | _SpacerType
 
 
+class _InflightFetch:
+    __slots__ = ("task", "waiters")
+
+    def __init__(self, task: asyncio.Task[CacheEntry | None]) -> None:
+        self.task = task
+        self.waiters = 0
+
+
 class ImageCache:
     """Single-flight, memory-bounded LRU cache for inlined base64 images."""
 
@@ -42,7 +50,7 @@ class ImageCache:
         self.max_bytes = max_bytes
         self._entries: OrderedDict[str, tuple[CacheEntry, int]] = OrderedDict()
         self._bytes = 0
-        self._inflight: dict[str, asyncio.Task[CacheEntry | None]] = {}
+        self._inflight: dict[str, _InflightFetch] = {}
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -82,8 +90,8 @@ class ImageCache:
             self._entries.move_to_end(url)
             return cached[0]
 
-        task = self._inflight.get(url)
-        if task is None:
+        inflight = self._inflight.get(url)
+        if inflight is None:
 
             async def _load() -> CacheEntry | None:
                 try:
@@ -92,12 +100,31 @@ class ImageCache:
                         self._put(url, entry)
                     return entry
                 finally:
+                    if self._inflight.get(url) is inflight:
+                        self._inflight.pop(url, None)
+
+            inflight = _InflightFetch(asyncio.create_task(_load()))
+            self._inflight[url] = inflight
+
+        inflight.waiters += 1
+        try:
+            return await asyncio.shield(inflight.task)
+        except asyncio.CancelledError:
+            inflight.waiters -= 1
+            if inflight.waiters == 0 and not inflight.task.done():
+                if self._inflight.get(url) is inflight:
                     self._inflight.pop(url, None)
-
-            task = asyncio.create_task(_load())
-            self._inflight[url] = task
-
-        return await asyncio.shield(task)
+                inflight.task.cancel()
+                try:
+                    await inflight.task
+                except asyncio.CancelledError:
+                    pass
+            raise
+        except BaseException:
+            inflight.waiters -= 1
+            raise
+        else:
+            inflight.waiters -= 1
 
 
 async def _fetch_and_encode(
@@ -168,7 +195,7 @@ async def inline_images_in_html(
         src = _get_image_source(img_tag)
         if not src:
             return
-        full_url = src if src.startswith("http") else urljoin(base_url, src)
+        full_url = urljoin(base_url, src)
         if cache is not None:
             entry = await cache.get_or_fetch(full_url, _bounded_fetch)
         else:
@@ -246,21 +273,22 @@ def _is_fetchable_source(source: str) -> bool:
 
 def _detect_image_mime(data: bytes) -> str | None:
     """Detect image MIME type strictly from magic bytes, or ``None`` if not an image."""
-    if data[:8].startswith(b"\x89PNG\r\n\x1a\n"):
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
-    if data[:2] == b"\xff\xd8":
+    if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
-    if data[:4] == b"GIF8":
+    if data[:6] in (b"GIF87a", b"GIF89a"):
         return "image/gif"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
-    if data[:2] == b"BM":
+    if len(data) >= 14 and data[:2] == b"BM" and data[6:10] == b"\x00\x00\x00\x00":
         return "image/bmp"
     if data[:4] in (b"II*\x00", b"MM\x00*"):
         return "image/tiff"
     head = data[:512].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
-    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
-        return "image/svg+xml"
+    if b"<html" not in head and b"<!doctype html" not in head:
+        if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
+            return "image/svg+xml"
     return None
 
 

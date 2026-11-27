@@ -454,7 +454,6 @@ class BaseScraper:
                     doc.raw = None
                 self._result.docs += 1
                 self._result.fetch_histogram.observe(elapsed)
-                keys.add(_resume_digest(ref_url, ref_title))
                 yield doc
                 yielded += 1
                 if limit is not None and yielded >= limit:
@@ -560,6 +559,7 @@ class BaseScraper:
                     elapsed = time.perf_counter() - fetch_started
                     if output is not None:
                         await output.put((doc, ref_url, ref_title, elapsed))
+                        keys.add(digest)
                     else:
                         await self.store.save(doc, ref_url=ref_url, ref_title=ref_title)
                         self._result.docs += 1

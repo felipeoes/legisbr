@@ -480,10 +480,19 @@ def test_registry_capabilities_match_sources_and_stay_lazy():
     assert len(infos) == 30
     assert all(isinstance(info.capabilities, SearchCapabilities) for info in infos)
 
-    for code in ("camara", "pb", "pi", "rr", "sp", "mg", "ac", "pr", "ce"):
-        spec = get_spec(code)
-        assert spec.capabilities == spec.load_cls().capabilities
+    for spec in SCRAPERS:
+        cls = spec.load_cls()
+        assert spec.capabilities == cls.capabilities, (
+            f"Capabilities mismatch for {spec.code}: "
+            f"registry={spec.capabilities!r} vs class={cls.capabilities!r}"
+        )
         assert spec.info().capabilities == spec.capabilities
+        if spec.capabilities.native_type and cls.search_refs is BaseScraper.search_refs:
+            assert cls.list_documents is BaseScraper.list_documents, (
+                f"{spec.code} declares native_type=True without overriding search_refs "
+                "but overrides list_documents(), bypassing list_type() narrowing"
+            )
+            assert isinstance(cls.types, dict) and bool(cls.types)
 
     assert get_spec("camara").capabilities.native_text is True
     assert get_spec("ac").capabilities.fast_catalog is True
@@ -501,3 +510,28 @@ def test_registry_capabilities_match_sources_and_stay_lazy():
         "print(f'ok {dt:.2f}ms')"
     )
     subprocess.run([sys.executable, "-c", code], check=True, timeout=30)
+
+
+async def test_icmbio_strict_native_rejects_year_filter_and_am_accepts_year_type():
+    from legisbr.scrapers.environment.icmbio import ICMBioScraper
+    from legisbr.scrapers.states.am import LegislaAMScraper
+
+    icmbio = make_scraper(ICMBioScraper)
+    icmbio.http.request = AsyncMock()
+    with pytest.raises(UnsupportedQueryError):
+        [ref async for ref in icmbio.search_refs(Query(years=2024), strict_native=True)]
+    icmbio.http.request.assert_not_awaited()
+
+    am = make_scraper(LegislaAMScraper)
+    am.http.request = AsyncMock(
+        return_value=make_mock_response("<html><body><ul></ul></body></html>")
+    )
+    refs = [
+        ref
+        async for ref in am.search_refs(
+            Query(years=2024, type="Lei Ordinária"), strict_native=True
+        )
+    ]
+    assert refs == []
+    am.http.request.assert_awaited_once()
+    assert "/diario_am/12/2024?page=1" in am.http.request.await_args.args[0]

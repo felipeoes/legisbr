@@ -701,3 +701,44 @@ async def test_archive_index_immutable_fallback_on_operational_error(
     assert len(hits) == 1 and hits[0].source == "ACRE"
     assert any("mode=ro" in uri for uri in seen_uris)
     assert any("immutable=1" in uri for uri in seen_uris)
+
+
+@pytest.mark.parametrize(
+    ("error_msg", "error_code"),
+    [
+        ("database is locked", sqlite3.SQLITE_BUSY),
+        ("database table is locked", sqlite3.SQLITE_LOCKED),
+        ("database is locked", None),
+    ],
+    ids=["sqlite-busy", "sqlite-locked", "busy-message-only"],
+)
+async def test_archive_index_busy_or_locked_never_falls_back_to_immutable(
+    monkeypatch, tmp_path, error_msg, error_code
+):
+    from legisbr.core import archive as archive_mod
+
+    db_path = tmp_path / "ACRE" / "documents.db"
+    async with Store(db_path, fts=True, source="ACRE") as store:
+        await store.save(make_doc(title="Lei Concorrente"))
+
+    seen_calls: list[tuple[str, dict]] = []
+
+    def busy_connect(database, *args, **kwargs):
+        seen_calls.append((str(database), dict(kwargs)))
+        exc = sqlite3.OperationalError(error_msg)
+        if error_code is not None:
+            exc.sqlite_errorcode = error_code  # type: ignore[attr-defined]
+        raise exc
+
+    monkeypatch.setattr(archive_mod.sqlite3, "connect", busy_connect)
+
+    index = ArchiveIndex(databases={"ACRE": db_path})
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await index.query("administracao")
+
+    assert len(seen_calls) == 1
+    uri, kwargs = seen_calls[0]
+    assert uri.startswith("file:///")
+    assert "mode=ro" in uri
+    assert "immutable=1" not in uri
+    assert kwargs.get("timeout") == 5.0

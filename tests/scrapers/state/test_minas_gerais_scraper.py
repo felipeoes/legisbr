@@ -351,3 +351,30 @@ def test_normalizes_efeitos_cessados_situation():
     assert scraper._normalize_situation_value("EFEITOS CESSADOS") == "Efeitos cessados"
     soup = _make_detail_soup(situation="EFEITOS CESSADOS")
     assert scraper._infer_situation("Decreto nº 1/2012", soup) == "Efeitos cessados"
+
+
+async def test_almg_link_followed_by_compartilhar_preserves_intervening_articles():
+    scraper = _make_scraper()
+    span = BeautifulSoup(
+        '<span class="textNorma">'
+        "<p>Art. 1º Consulte https://www.almg.gov.br/consulte/legislacao/lei-123 para referência.</p>"
+        "<p>Art. 2º Este artigo intermediário deve ser preservado integralmente na norma estadual.</p>"
+        "<p>Art. 3º O órgão deverá Compartilhar os dados públicos com os municípios.</p>"
+        "<p>(https://www.almg.gov.br/share?utm_source=WhatsApp&amp;utm_medium=BtnCompartilhar)</p>"
+        "</span>",
+        "lxml",
+    ).find("span")
+    doc = await scraper._convert_mg_content(
+        span,
+        "https://www.almg.gov.br/legislacao-mineira/texto/LEI/123/2024/original",
+        b"raw",
+        "Lei nº 123",
+        "Lei",
+        {"title": "Lei nº 123", "type": "Lei", "situation": DEFAULT_VALID_SITUATION},
+        2024,
+    )
+    assert "Art. 1º" in doc.text_markdown
+    assert "https://www.almg.gov.br/consulte/legislacao/lei-123" in doc.text_markdown
+    assert "Art. 2º Este artigo intermediário deve ser preservado" in doc.text_markdown
+    assert "Art. 3º O órgão deverá Compartilhar" in doc.text_markdown
+    assert "BtnCompartilhar" not in doc.text_markdown

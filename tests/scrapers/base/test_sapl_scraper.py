@@ -238,3 +238,31 @@ class TestCleanSaplPdfMarkdownKeepsTheLaw:
         assert not cleaned.startswith("Lei:")
         assert "Dispõe sobre utilidade pública." in cleaned
         assert "Art. 1º" in cleaned
+
+    def test_five_digit_unformatted_norm_number_does_not_conflict_with_day(self):
+        scraper = _make_scraper()
+        assert (
+            scraper._conflicts_with_expected_number(
+                "LEI Nº 13500, DE 15 DE MAIO DE 2024", "13500"
+            )
+            is False
+        )
+        assert (
+            scraper._select_best_title_candidate(
+                ["ESTADO DA PARAÍBA", "LEI Nº 13500"],
+                [1],
+                expected_title="Lei Ordinária nº 13500",
+            )
+            == 1
+        )
+        text = (
+            "DIÁRIO OFICIAL DO ESTADO\n"
+            "TEXTO DE ATO ANTERIOR\n"
+            "LEI Nº 13500, DE 15 DE MAIO DE 2024\n"
+            f"{BODY}"
+        )
+        cleaned = scraper._clean_sapl_pdf_markdown(
+            text, "Lei Ordinária nº 13500, de 15 de maio de 2024"
+        )
+        assert cleaned.startswith("LEI Nº 13500, DE 15 DE MAIO DE 2024")
+        assert "TEXTO DE ATO ANTERIOR" not in cleaned

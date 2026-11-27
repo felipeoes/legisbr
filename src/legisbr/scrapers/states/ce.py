@@ -25,6 +25,21 @@ from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 logger = logging.getLogger(__name__)
 
 _MD_BASE64_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(data:image/[^;]+;base64,([^)]+)\)")
+_CEARA_DISCLAIMER_RE = re.compile(
+    r"O\s+texto\s+desta\s+Lei\b.*?n[aã]o\s+substitui",
+    re.IGNORECASE | re.DOTALL,
+)
+_CEARA_ARTICLE_RE = re.compile(r"\b(?:art\.?\s*\d|art\.|artigo\b)", re.IGNORECASE)
+_CEARA_BLOCK_DESCENDANTS = (
+    "p",
+    "div",
+    "table",
+    "ul",
+    "ol",
+    "section",
+    "article",
+    "body",
+)
 
 TYPES = {
     "Ato Deliberativo": "ato-deliberativo",
@@ -260,12 +275,25 @@ class CearaAleceScraper(BaseScraper):
         for a in soup.find_all("a"):
             if a.get_text(strip=True).upper() == "VOLTAR":
                 a.decompose()
-        for node in list(
-            soup.find_all(string=re.compile(r"O\s+texto\s+desta\s+Lei", re.IGNORECASE))
+        for tag in list(
+            soup.find_all(["p", "span", "font", "small", "em", "i", "b", "strong"])
         ):
+            if tag.decomposed or tag.find(_CEARA_BLOCK_DESCENDANTS):
+                continue
+            txt = " ".join(tag.get_text(" ", strip=True).split())
+            if (
+                len(txt) < 300
+                and _CEARA_DISCLAIMER_RE.search(txt)
+                and not _CEARA_ARTICLE_RE.search(txt)
+            ):
+                tag.decompose()
+        for node in list(soup.find_all(string=_CEARA_DISCLAIMER_RE)):
             parent = node.parent
-            if parent and not parent.decomposed:
-                parent.decompose()
+            if parent is None or parent.decomposed:
+                continue
+            txt = " ".join(str(node).split())
+            if len(txt) < 300 and not _CEARA_ARTICLE_RE.search(txt):
+                node.extract()
         sections = soup.find_all("div", class_=re.compile("^Section\\d+$"))
         if sections:
             container = BeautifulSoup("<div></div>", "lxml").div
@@ -377,7 +405,7 @@ class CearaAleceScraper(BaseScraper):
                 src = _get_image_source(img)
                 if not src:
                     continue
-                full_url = src if src.startswith("http") else urljoin(base_url, src)
+                full_url = urljoin(base_url, src)
                 try:
                     data = (await self.http.request(full_url)).content
                 except Exception as exc:

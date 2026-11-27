@@ -331,3 +331,22 @@ async def test_document_sink_protocol_error_record_and_null_sink(caplog):
     await async_sink.record_error(sample_err)
     assert sync_seen == [sample_err]
     assert async_seen == [sample_err]
+
+
+async def test_json_and_jsonl_export_fall_back_to_store_source_when_empty(tmp_path):
+    db_path = tmp_path / "ACRE" / "documents.db"
+    async with Store(db_path, source="ACRE") as store:
+        await store.save(document(title="Lei 1"))
+        # Simulate a v1-migrated row where the per-row source column is empty.
+        with store.connection:
+            store.connection.execute("UPDATE documents SET source = ''")
+        for fmt in ("json", "jsonl"):
+            out_dir = tmp_path / f"out_{fmt}"
+            assert await store.export(out_dir, fmt=fmt, single_file=True) == 1
+            text = (out_dir / f"data.{fmt}").read_text(encoding="utf-8")
+            rows = (
+                json.loads(text)
+                if fmt == "json"
+                else [json.loads(line) for line in text.splitlines()]
+            )
+            assert rows[0]["source"] == "ACRE"

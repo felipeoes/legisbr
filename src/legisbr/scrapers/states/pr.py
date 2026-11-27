@@ -58,6 +58,7 @@ _RE_ANEXOS_LABEL = re.compile(
 _RE_DISCLAIMER = re.compile(
     r"Este\s+texto\s+n[aã]o\s+substitui\s+o\s+publicado", re.IGNORECASE
 )
+_RE_TOTAL_PAGES = re.compile(r"P[áa]gina\s+\d+\s+de\s+(\d+)", re.IGNORECASE)
 _RE_TOTAL_RECORDS = re.compile("Total de (\\d+) registros")
 _RE_COD_ATO = re.compile(r"codAto=(\d+)")
 _RE_SITE_ERROR = re.compile(r'class="msg_aviso">([^<]*)')
@@ -224,6 +225,16 @@ class ParanaCVScraper(BaseScraper):
                 return int(matches[-1])
         return 0
 
+    @staticmethod
+    def _parse_search_pagination(soup: BeautifulSoup) -> tuple[int, int | None]:
+        """Return ``(total_pages, total_records)`` parsed from ``barra_paginacao``."""
+        text = soup.get_text(" ", strip=True)
+        pages_match = _RE_TOTAL_PAGES.search(text)
+        records_match = _RE_TOTAL_RECORDS.search(text)
+        total_records = int(records_match.group(1)) if records_match else None
+        total_pages = int(pages_match.group(1)) if pages_match else 1
+        return (max(1, total_pages), total_records)
+
     async def search_refs(
         self,
         query: Query,
@@ -256,49 +267,70 @@ class ParanaCVScraper(BaseScraper):
         yielded = 0
         seen: set[str] = set()
         for year in target_years:
-            payload = {
+            base_payload = {
                 "codTipoAto": type_id,
                 "numeroAto": str(query.number or ""),
                 "anoAto": "" if year is None else str(year),
                 "isPaginado": "true",
                 "site": "1",
             }
-            try:
-                response = await self.http.request(
-                    search_url, method="POST", data=payload
-                )
-                soup = response.soup()
-                if error := _RE_SITE_ERROR.search(str(soup)):
-                    raise ValueError(f"Paraná search failed: {error.group(1).strip()}")
-                rows = self._parse_results_table(soup)
-            except Exception as exc:
-                await self._report_search_error(
-                    {"year": year, "document_url": search_url}, exc, on_error
-                )
-                continue
-            for row in rows:
-                if row["id"] in seen:
-                    continue
-                seen.add(row["id"])
-                ref: DocRef = {
-                    **row,
-                    "title": clean_title(row["title"]),
-                    "year": self._infer_row_year(row, year),
-                    "type": type_name
-                    or infer_type_from_title(row["title"], TYPES)
-                    or "Lei",
-                    "situation": DEFAULT_VALID_SITUATION,
-                    "document_url": urljoin(
-                        self.base_url,
-                        f"/legislacao/pesquisarAto.do?action=exibir&codAto={row['id']}",
-                    ),
-                }
-                if not matches_query(ref, query):
-                    continue
-                yield ref
-                yielded += 1
-                if query.limit is not None and yielded >= query.limit:
-                    return
+            page = 1
+            total_pages = 1
+            total_records: int | None = None
+            while page <= total_pages:
+                if page == 1:
+                    page_url = search_url
+                    payload = base_payload
+                else:
+                    page_url = (
+                        f"{search_url}&indice={page}&totalRegistros={total_records}"
+                        if total_records is not None
+                        else f"{search_url}&indice={page}"
+                    )
+                    payload = {**base_payload, "paginaAtual": str(page)}
+                try:
+                    response = await self.http.request(
+                        page_url, method="POST", data=payload
+                    )
+                    soup = response.soup()
+                    if error := _RE_SITE_ERROR.search(str(soup)):
+                        raise ValueError(
+                            f"Paraná search failed: {error.group(1).strip()}"
+                        )
+                    rows = self._parse_results_table(soup)
+                    if page == 1:
+                        total_pages, total_records = self._parse_search_pagination(soup)
+                except Exception as exc:
+                    await self._report_search_error(
+                        {"year": year, "document_url": page_url}, exc, on_error
+                    )
+                    break
+                if not rows:
+                    break
+                for row in rows:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    ref: DocRef = {
+                        **row,
+                        "title": clean_title(row["title"]),
+                        "year": self._infer_row_year(row, year),
+                        "type": type_name
+                        or infer_type_from_title(row["title"], TYPES)
+                        or "Lei",
+                        "situation": DEFAULT_VALID_SITUATION,
+                        "document_url": urljoin(
+                            self.base_url,
+                            f"/legislacao/pesquisarAto.do?action=exibir&codAto={row['id']}",
+                        ),
+                    }
+                    if not matches_query(ref, query):
+                        continue
+                    yield ref
+                    yielded += 1
+                    if query.limit is not None and yielded >= query.limit:
+                        return
+                page += 1
 
     @staticmethod
     def _total(soup: BeautifulSoup) -> int:

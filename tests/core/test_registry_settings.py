@@ -38,6 +38,7 @@ def test_all_30_sources_resolve_cleanly_and_match_classes():
         assert cls is spec.cls
         assert cls.name == spec.name
         assert cls.__name__ == spec.cls_name
+        assert cls.capabilities == spec.capabilities
 
 
 def test_database_path_routes_by_scope(tmp_path: Path):

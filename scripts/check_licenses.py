@@ -32,16 +32,11 @@ CORE_ALLOWLIST: frozenset[str] = frozenset(
     }
 )
 
-# Copyleft families forbidden across ALL extras (`--mode extras`).
-# Weak file-level MPL-2.0 (e.g. certifi, tqdm pulled by OCR SDKs) is allowed in extras.
-FORBIDDEN_COPYLEFT: tuple[str, ...] = (
-    "AGPL",
-    "GPL",
-    "LGPL",
-    "SSPL",
-    "EUPL",
-    "CPAL",
-)
+# Permissive + weak file-level copyleft (MPL-2.0) allowlist enforced for extras (`--mode extras`).
+# Weak file-level MPL-2.0 (e.g. certifi, tqdm pulled by OCR SDKs) and CNRI-Python
+# (regex pulled by tiktoken) are permitted in optional extras; all copyleft and
+# proprietary/unknown licenses are rejected.
+EXTRAS_ALLOWLIST: frozenset[str] = CORE_ALLOWLIST | {"MPL-2.0", "CNRI-Python"}
 
 # Documented manual overrides for distributions whose PyPI metadata omits a
 # specific SPDX license identifier.
@@ -51,6 +46,10 @@ MANUAL_OVERRIDES: dict[str, str] = {
     "cobble": "BSD-2-Clause",
     # PyPI wheel bundles `LICENSE` (Apache-2.0) while omitting PEP 639 / core metadata `License` fields.
     "mistralai": "Apache-2.0",
+    # PyPI wheel sets generic `License: BSD`; bundled LICENSE is BSD-3-Clause.
+    "nodeenv": "BSD-3-Clause",
+    # PyPI wheel sets generic `License: BSD`; bundled LICENSE.txt is BSD-2-Clause.
+    "pyasn1-modules": "BSD-2-Clause",
     # PyPI wheel sets freeform `License: BSD-3-Clause, Apache-2.0, dependency licenses`.
     # pypdfium2 is dual-licensed Apache-2.0 OR BSD-3-Clause, and all bundled PDFium
     # BUILD_LICENSES are permissive (Apache-2.0, BSD-2/3-Clause, MIT, Zlib, IJG, Unicode-3.0, FTL).
@@ -289,54 +288,29 @@ def _strip_outer_parens(expr: str) -> str:
     return expr
 
 
-def _is_copyleft(atom: str) -> bool:
-    upper = atom.upper()
-    if any(
-        upper == family
-        or upper.startswith(f"{family}-")
-        or upper.startswith(f"{family}V")
-        for family in FORBIDDEN_COPYLEFT
-    ):
-        return True
-    return bool(_COPYLEFT_TEXT_RE.search(atom))
+def _is_allowed_by(expr: str, allowlist: frozenset[str]) -> bool:
+    """True iff `expr` is satisfied strictly by `allowlist`."""
+    expr = _strip_outer_parens(expr)
+    if not expr or expr == "UNKNOWN":
+        return False
+    or_branches = _split_top_level(expr, "OR")
+    if len(or_branches) > 1:
+        return any(_is_allowed_by(branch, allowlist) for branch in or_branches)
+    and_branches = _split_top_level(expr, "AND")
+    if len(and_branches) > 1:
+        return all(_is_allowed_by(branch, allowlist) for branch in and_branches)
+    atom = _normalize_atom(expr)
+    return atom in allowlist
 
 
 def is_allowed_core(expr: str) -> bool:
     """True iff `expr` is satisfied strictly by CORE_ALLOWLIST."""
-    expr = _strip_outer_parens(expr)
-    if not expr or expr == "UNKNOWN":
-        return False
-    or_branches = _split_top_level(expr, "OR")
-    if len(or_branches) > 1:
-        return any(is_allowed_core(branch) for branch in or_branches)
-    and_branches = _split_top_level(expr, "AND")
-    if len(and_branches) > 1:
-        return all(is_allowed_core(branch) for branch in and_branches)
-    atom = _normalize_atom(expr)
-    return atom in CORE_ALLOWLIST
+    return _is_allowed_by(expr, CORE_ALLOWLIST)
 
 
 def is_allowed_extras(expr: str) -> bool:
-    """True iff `expr` has a non-copyleft licensing option (allows weak MPL-2.0)."""
-    expr = _strip_outer_parens(expr)
-    if not expr or expr == "UNKNOWN":
-        return False
-    or_branches = _split_top_level(expr, "OR")
-    if len(or_branches) > 1:
-        # Reject dual copyleft + proprietary commercial licenses (e.g. PyMuPDF).
-        def branch_ok(branch: str) -> bool:
-            if "commercial" in branch.lower() or "proprietary" in branch.lower():
-                return False
-            return is_allowed_extras(branch)
-
-        return any(branch_ok(branch) for branch in or_branches)
-    and_branches = _split_top_level(expr, "AND")
-    if len(and_branches) > 1:
-        return all(is_allowed_extras(branch) for branch in and_branches)
-    atom = _normalize_atom(expr)
-    if "commercial" in atom.lower() or "proprietary" in atom.lower():
-        return False
-    return not _is_copyleft(atom)
+    """True iff `expr` is satisfied strictly by EXTRAS_ALLOWLIST (permissive + MPL-2.0)."""
+    return _is_allowed_by(expr, EXTRAS_ALLOWLIST)
 
 
 def audit_environment(
@@ -364,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
         "--mode",
         choices=("core", "extras"),
         default="core",
-        help="core: strict permissive allowlist; extras: forbid copyleft (allow MPL-2.0)",
+        help="core: strict permissive allowlist; extras: permissive + MPL-2.0 allowlist",
     )
     parser.add_argument(
         "--exclude",

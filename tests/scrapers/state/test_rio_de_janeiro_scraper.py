@@ -373,3 +373,38 @@ class TestFetch:
             "lxml",
         )
         assert scraper._detect_situation(s_vig) == "Não consta revogação expressa"
+
+    async def test_top_of_page_metadata_table_does_not_wipe_norm_and_trailing_text_removed(
+        self,
+    ):
+        scraper = _make_scraper()
+        body = (
+            '<html><body><div class="pagina_central"><div id="divConteudo">'
+            "<table><tr><td>Autoria</td><td>DEPUTADO FULANO</td></tr></table>"
+            "<table><tr><td>Situação</td><td>Em Vigor</td></tr></table>"
+            "<p>LEI Nº 9999, DE 10 DE MAIO DE 2024</p>"
+            "<p>Art. 1º Fica instituído o programa estadual de proteção à biodiversidade no RJ.</p>"
+            "<p>Art. 2º Esta Lei entra em vigor na data de sua publicação.</p>"
+            "<b>Ficha Técnica</b>"
+            "Texto solto de rodapé que não está dentro de tag alguma."
+            "<br>Mais texto solto após quebra de linha."
+            "</div></div></body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(body)]
+        doc = await scraper.fetch(
+            {
+                "year": 2024,
+                "type": "Lei Ordinária",
+                "title": "Lei Ordinária 9999/2024",
+                "date": "2024",
+                "summary": "",
+                "situation": "Não consta revogação expressa",
+                "_html_link": "https://www3.alerj.rj.gov.br/lotus_notes/default.asp?id=53&url=x",
+                "document_url": "http://alerjln1.alerj.rj.gov.br/contlei.nsf/abc/9999",
+            }
+        )
+        assert "Art. 1º Fica instituído o programa estadual" in doc.text_markdown
+        assert "Art. 2º Esta Lei entra em vigor" in doc.text_markdown
+        assert "Ficha Técnica" not in doc.text_markdown
+        assert "Texto solto de rodapé" not in doc.text_markdown
+        assert "Mais texto solto" not in doc.text_markdown

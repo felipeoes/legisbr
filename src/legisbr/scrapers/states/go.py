@@ -428,12 +428,9 @@ class LegislaGoias(BaseScraper):
         if not doc_info.get("text_markdown"):
             if pdf_link:
                 return await self._process_pdf_link(pdf_link, doc_id, doc_info)
-            else:
-                raise ValueError(
-                    html_reason or "No usable inline HTML content or PDF fallback"
-                )
-            if not doc_info:
-                raise ValueError("PDF processing failed (fallback)")
+            raise ValueError(
+                html_reason or "No usable inline HTML content or PDF fallback"
+            )
         error_msg = "doesn't work properly without JavaScript enabled"
         if error_msg.lower() in doc_info["text_markdown"].lower():
             logger.warning(f"Invalid doc ID: {doc_id}. Year: {doc_detail['ano']}")

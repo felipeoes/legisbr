@@ -373,6 +373,78 @@ class TestFetchOverHttp:
         )
         assert "não substitui" not in doc.text_markdown
 
+    async def test_static_preserves_operative_article_matching_o_texto_desta_lei(self):
+        scraper = _make_scraper()
+        page_html = (
+            '<html><body><div class="Section1">'
+            f"<p>{_TEXT}</p>"
+            "<p>Art. 5º O texto desta Lei entra em vigor na data de sua publicação.</p>"
+            "<p>Art. 6º O texto desta Lei não substitui a legislação federal aplicável.</p>"
+            "<p><span>O\r\ntexto desta Lei não substitui o publicado no Diário Oficial.</span></p>"
+            "</div></body></html>"
+        ).encode()
+        scraper.http.request = AsyncMock(return_value=make_mock_response(page_html))
+        doc = await scraper.fetch(
+            _ref(
+                type="Lei Ordinária",
+                document_url="https://www2.al.ce.gov.br/legislativo/legislacao5/leis2012/15141.htm",
+                _html_link="15141.htm",
+            )
+        )
+        assert (
+            "Art. 5º O texto desta Lei entra em vigor na data de sua publicação."
+            in doc.text_markdown
+        )
+        assert (
+            "Art. 6º O texto desta Lei não substitui a legislação federal aplicável."
+            in doc.text_markdown
+        )
+        assert "publicado no Diário Oficial" not in doc.text_markdown
+
+    async def test_static_does_not_delete_container_div_with_disclaimer(self):
+        scraper = _make_scraper()
+        page_html = (
+            '<html><body><div class="Section1">'
+            "O texto desta Lei não substitui o publicado no Diário Oficial."
+            f"<p>{_TEXT}</p>"
+            "</div></body></html>"
+        ).encode()
+        scraper.http.request = AsyncMock(return_value=make_mock_response(page_html))
+        doc = await scraper.fetch(
+            _ref(
+                type="Lei Ordinária",
+                document_url="https://www2.al.ce.gov.br/legislativo/legislacao5/leis2012/15142.htm",
+                _html_link="15142.htm",
+            )
+        )
+        assert "Art. 1º" in doc.text_markdown
+        assert "não substitui" not in doc.text_markdown
+
+    async def test_ocr_embedded_images_resolves_relative_http_prefixed_filename(self):
+        ocr = AsyncMock()
+        ocr.images = AsyncMock(return_value=_TEXT)
+        scraper = _make_scraper(ocr=ocr)
+        html = b'<html><body><div class="Section1"><img src="http_scan.png"></div></body></html>'
+        scan = b"\x89PNG\r\n\x1a\n" + b"\xff" * 256
+        scraper.http.request = AsyncMock(
+            side_effect=[
+                make_mock_response(html),
+                make_mock_response(scan, content_type="image/png"),
+            ]
+        )
+        doc = await scraper.fetch(
+            _ref(
+                type="Lei Complementar",
+                document_url="https://www2.al.ce.gov.br/legislativo/ementario/lc120.htm",
+                _html_link="lc120.htm",
+            )
+        )
+        assert doc is not None
+        assert (
+            scraper.http.request.await_args_list[1].args[0]
+            == "https://www2.al.ce.gov.br/legislativo/ementario/http_scan.png"
+        )
+
     async def test_image_only_static_page_without_ocr_fails_visibly(self):
         scraper = _make_scraper(ocr=None)
         html = b'<html><body><div class="Section1"><img src="page1.png"></div></body></html>'

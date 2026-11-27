@@ -30,10 +30,6 @@ TYPES = {
     "Lei Delegada": "TIP044",
     "Lei Ordinária": "TIP043",
 }
-_EMENTA_STRUCTURAL_RE = re.compile(
-    "((?:LEI|DECRETO|EMENDA|RESOLU[ÇC][ÃA]O|CONSTITUIÇÃO|EMENTÁRIO|PORTARIA|ATO)[^\\n]*)\\n+[\\s\\S]+?(?=\\nO GOVERNADOR\\b)",
-    re.IGNORECASE | re.DOTALL,
-)
 _DISCLAIMER_LINE_RE = re.compile(
     r"\n?[ \t]*(?:\*{1,3}[ \t]*)?Est[ea]\s+texto\s+n[aã]o\s+substitui[^\n]*",
     re.IGNORECASE,
@@ -126,7 +122,7 @@ class AlagoasSefazScraper(BaseScraper):
                 norm_type = self._infer_type_from_title(full_filename.replace("_", " "))
                 if norm_type:
                     title = f"{norm_type} {number} de {year}".strip()
-            if year < 2000:
+            if year < 2000 and ext == ".pdf":
                 if self.ocr:
                     text_markdown = await self.ocr.pdf(pdf_bytes)
                 else:
@@ -134,14 +130,26 @@ class AlagoasSefazScraper(BaseScraper):
                         f"ALAGOAS | {year} | No OCR service configured for pre-2000 scanned PDF — trying digital text extraction."
                     )
                     text_markdown = await bytes_to_markdown(
-                        pdf_bytes, "", self.base_url, self.http, self.ocr
+                        pdf_bytes,
+                        "",
+                        self.base_url,
+                        self.http,
+                        self.ocr,
+                        pdf_executor=self.pdf_executor,
+                        pdf_workers=self.pdf_workers,
                     )
             else:
                 text_markdown = await bytes_to_markdown(
-                    pdf_bytes, "", self.base_url, self.http, self.ocr
+                    pdf_bytes,
+                    "",
+                    self.base_url,
+                    self.http,
+                    self.ocr,
+                    pdf_executor=self.pdf_executor,
+                    pdf_workers=self.pdf_workers,
                 )
         except Exception as e:
-            raise ValueError(f"Error processing document: {e}")
+            raise ValueError(f"Error processing document: {e}") from e
         if not text_markdown:
             raise ValueError("Empty markdown extracted from document")
         valid, reason = valid_markdown(text_markdown)

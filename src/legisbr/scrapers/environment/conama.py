@@ -283,7 +283,13 @@ class ConamaScraper(BaseScraper):
         else:
             body = resp.content
             text_markdown = await bytes_to_markdown(
-                body, "", self.base_url, self.http, self.ocr
+                body,
+                "",
+                self.base_url,
+                self.http,
+                self.ocr,
+                pdf_executor=self.pdf_executor,
+                pdf_workers=self.pdf_workers,
             )
             text_markdown = self._clean_pdf_markdown(text_markdown)
             raw = body

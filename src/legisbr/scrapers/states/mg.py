@@ -115,8 +115,8 @@ _SUBSTANTIVE_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ALMG_SHARE_URL_PATTERN = re.compile(
-    "https?://www\\.alm[ag]\\.gov\\.br/.*?(?:utm[\\s_]*source|utm_medium|utm_campaign|BtnCompartilhar|Compartilhar|WhatsApp).*?(?=(?:\\)|</p>|<br\\s*/?>|$))",
-    re.IGNORECASE | re.DOTALL,
+    r"""https?://www\.alm[ag]\.gov\.br/[^\s"'<>()]*(?:utm[ _]*source|utm_medium|utm_campaign|BtnCompartilhar|Compartilhar|WhatsApp)[^\s"'<>()]*""",
+    re.IGNORECASE,
 )
 _TIMESTAMPED_SHARE_LINK_PATTERN = re.compile(
     "(\\(\\s*trecho\\s+a\\s+partir\\s+de\\s+\\d{1,2}:\\d{2}:\\d{2}s?)\\s*https?://.*?(\\)\\s*:?)",

@@ -5,15 +5,18 @@ from urllib.parse import urljoin
 from bs4 import Tag
 
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 TYPES = {
+    "Constituição Estadual": "CE1989-2014.pdf",
     "Decreto-Lei": "declei",
     "Lei Complementar": "leicomp",
     "Lei Ordinária": "leiord",
     "Decreto Numerado": "decnum",
 }
 SITUATIONS = []
+_CONSTITUTION_YEAR = 1989
 
 
 class RondoniaCotelScraper(BaseScraper):
@@ -28,6 +31,7 @@ class RondoniaCotelScraper(BaseScraper):
     situations = SITUATIONS
     name = "RONDONIA"
     base_url = "http://ditel.casacivil.ro.gov.br/COTEL"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def _format_search_url(self, norm_type_id: str, year: int) -> str:
         """Format url for search request"""
@@ -106,23 +110,25 @@ class RondoniaCotelScraper(BaseScraper):
         """Get document data."""
         return await self.fetch_pdf(doc_info)
 
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        if year == self.years.start:
-            url = f"{self.base_url}/Livros/CE1989-2014.pdf"
-            yield {
-                "year": 1989,
-                "type": "Constituição Estadual",
-                "title": "Constituição do Estado de Rondônia",
-                "document_url": url,
-                "_pdf_link": url,
-                "situation": DEFAULT_VALID_SITUATION,
-            }
-        async for ref in super().list_documents(year):
-            yield ref
-
     async def list_type(
         self, year: int, norm_type: str, norm_type_id: str
     ) -> AsyncIterator[dict]:
+        if norm_type == "Constituição Estadual":
+            if year == _CONSTITUTION_YEAR or (
+                bool(self.years)
+                and _CONSTITUTION_YEAR not in self.years
+                and year == self.years.start
+            ):
+                url = f"{self.base_url}/Livros/{norm_type_id}"
+                yield {
+                    "year": _CONSTITUTION_YEAR,
+                    "type": norm_type,
+                    "title": "Constituição do Estado de Rondônia",
+                    "document_url": url,
+                    "_pdf_link": url,
+                    "situation": DEFAULT_VALID_SITUATION,
+                }
+            return
         for ref in await self._get_docs_links(
             self._format_search_url(norm_type_id, year)
         ):

@@ -18,6 +18,7 @@ from legisbr.core.convert import (
     wrap_html,
 )
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 TYPES = {
@@ -47,6 +48,7 @@ class RJAlerjScraper(BaseScraper):
     name = "RIO_DE_JANEIRO"
     yearless = True
     base_url = "http://alerjln1.alerj.rj.gov.br/contlei.nsf"
+    capabilities = SearchCapabilities(native_year=False, native_type=True)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -409,6 +411,34 @@ class RJAlerjScraper(BaseScraper):
             return True
         return False
 
+    _SUBSTANTIVE_BODY_RE = re.compile(
+        r"(?:\bart\.?\s*1(?![\d.])|\bartigo\s+1(?![\d.])"
+        r"|\bo\s+governador\b|\ba\s+assembleia\b"
+        r"|\bdecreta\s*:|\bresolve\s*:|\bfa[çc]o\s+saber\b)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _has_substantive_body_before(
+        cls, content_root: BeautifulSoup | Tag, tag: Tag
+    ) -> bool:
+        """Return True when *tag* is preceded by substantive norm body inside *content_root*."""
+        parts: list[str] = []
+        for node in tag.find_all_previous(string=True):
+            if content_root not in node.parents:
+                continue
+            parent = node.parent
+            if isinstance(parent, Tag) and parent.name in {"script", "style"}:
+                continue
+            text = node.strip()
+            if text:
+                parts.append(text)
+        parts.reverse()
+        preceding = " ".join(parts)
+        if len(preceding) >= 300:
+            return True
+        return len(preceding) >= 60 and bool(cls._SUBSTANTIVE_BODY_RE.search(preceding))
+
     def _strip_domino_footer_sections(self, content_root: BeautifulSoup | Tag) -> None:
         """Truncate Domino footer metadata starting at _Section2, Ficha Técnica, or footer tables."""
         cutoff_tag: Tag | None = None
@@ -418,7 +448,11 @@ class RJAlerjScraper(BaseScraper):
             if tag.name == "a" and tag.get("name") == "_Section2":
                 cutoff_tag = tag
                 break
-            if tag.name == "table" and self._is_footer_metadata_table(tag):
+            if (
+                tag.name == "table"
+                and self._is_footer_metadata_table(tag)
+                and self._has_substantive_body_before(content_root, tag)
+            ):
                 cutoff_tag = tag
                 break
             if tag.name in {"b", "strong", "font", "div", "p"}:
@@ -427,10 +461,18 @@ class RJAlerjScraper(BaseScraper):
                     cutoff_tag = tag
                     break
         if cutoff_tag is not None:
-            for following in list(cutoff_tag.find_all_next()):
-                if not following.decomposed:
-                    following.decompose()
-            cutoff_tag.decompose()
+            node: Tag | None = cutoff_tag
+            while node is not None and node is not content_root:
+                for sibling in list(node.next_siblings):
+                    if isinstance(sibling, Tag):
+                        if not sibling.decomposed:
+                            sibling.decompose()
+                    else:
+                        sibling.extract()
+                parent = node.parent
+                node = parent if isinstance(parent, Tag) else None
+            if not cutoff_tag.decomposed:
+                cutoff_tag.decompose()
 
     @staticmethod
     def _clean_extracted_markdown(text_markdown: str) -> str:

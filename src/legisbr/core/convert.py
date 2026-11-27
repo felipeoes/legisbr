@@ -9,14 +9,14 @@ import string
 import zipfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from html_to_markdown import ConversionOptions, PreprocessingOptions
 from html_to_markdown import convert as html_to_md
 
 from legisbr.core.http import HttpClient, Response
-from legisbr.core.images import ImageCache, inline_images_in_html
+from legisbr.core.images import ImageCache, _detect_image_mime, inline_images_in_html
 from legisbr.core.pdf import (
     PdfExecutor,
     _pdf_text_layer,
@@ -84,15 +84,6 @@ _DISCLAIMER_RE = re.compile(
     re.IGNORECASE,
 )
 _CLEAN_NORM_EMPTY_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "div", "span", "b"]
-_IMAGE_MAGIC_BYTES: list[bytes] = [
-    b"\x89PNG",
-    b"\xff\xd8",
-    b"GIF8",
-    b"II*\x00",
-    b"MM\x00*",
-    b"BM",
-    b"RIFF",
-]
 
 
 def is_pdf(body: bytes, content_type: str = "") -> bool:
@@ -101,11 +92,9 @@ def is_pdf(body: bytes, content_type: str = "") -> bool:
 
 
 def _is_image_bytes(raw: bytes) -> bool:
-    """Return True if *raw* starts with a known image-format magic sequence."""
-    for magic in _IMAGE_MAGIC_BYTES:
-        if raw[: len(magic)] == magic:
-            return True
-    return False
+    """Return True if *raw* starts with a strict raster image magic sequence."""
+    mime = _detect_image_mime(raw)
+    return mime is not None and mime != "image/svg+xml"
 
 
 def detect_extension(content_type: str, filename: str | None = None) -> str:
@@ -163,11 +152,53 @@ _LINE_THROUGH_DECL_RE = re.compile(
 _STRIKETHROUGH_HINT_RE = re.compile(r"<(?:s|del|strike)\b|line-through", re.IGNORECASE)
 _STRIKE_TAGS = frozenset({"s", "del", "strike"})
 _BLOCK_STRIKE_TAGS = frozenset(
-    {"p", "div", "li", "td", "th", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"}
+    {
+        "p",
+        "div",
+        "li",
+        "td",
+        "th",
+        "dt",
+        "dd",
+        "caption",
+        "blockquote",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+    }
+)
+_TABLE_LIST_CONTAINERS = frozenset(
+    {"table", "thead", "tbody", "tfoot", "tr", "ul", "ol", "dl"}
+)
+_STRUCTURAL_STRIKE_TAGS = (
+    _BLOCK_STRIKE_TAGS
+    | _TABLE_LIST_CONTAINERS
+    | frozenset(
+        {
+            "section",
+            "article",
+            "main",
+            "header",
+            "footer",
+            "aside",
+            "nav",
+            "form",
+            "figure",
+            "figcaption",
+        }
+    )
 )
 _ORDINAL_ONLY_RE = re.compile(r"^[ºª°]+$")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([.,;:])")
-_ARTICLE_START_RE = re.compile(r"^art\.\s*\d", re.IGNORECASE)
+_OPERATIVE_CLAUSE_START_RE = re.compile(
+    r"^(?:art(?:igo|\.)?\s*\d|§|par[aá]grafo\b|[ivxlcdm]+\s*[-–—])",
+    re.IGNORECASE,
+)
+_PRE_BLOCK_RE = re.compile(r"(<pre\b[^>]*>)(.*?)(</pre>)", re.IGNORECASE | re.DOTALL)
+_PRE_NEWLINE_SENTINEL = "\ue000LEGISBR_PRE_NL\ue000"
 
 
 def _from_cp1252(match: re.Match[str]) -> str:
@@ -278,33 +309,89 @@ def _wrap_children_in_strike(tag: Tag) -> None:
     tag.append(strike)
 
 
+def _has_visible_text(nodes: list[Any]) -> bool:
+    for node in nodes:
+        if isinstance(node, Comment):
+            continue
+        if isinstance(node, NavigableString):
+            if str(node).strip():
+                return True
+        elif isinstance(node, Tag) and node.get_text(strip=True):
+            return True
+    return False
+
+
+def _wrap_inline_run_in_strike(nodes: list[Any]) -> None:
+    if not nodes or not _has_visible_text(nodes):
+        return
+    strike = Tag(name="s")
+    nodes[0].insert_before(strike)
+    for node in nodes:
+        strike.append(node.extract())
+
+
+def _apply_strikethrough(tag: Tag) -> None:
+    """Apply ``<s>`` safely without wrapping tables/lists or dropping mixed direct text."""
+    _strip_line_through_style(tag)
+    if tag.name in _STRIKE_TAGS or tag.find_parent(_STRIKE_TAGS):
+        return
+    if not tag.get_text(strip=True):
+        return
+
+    if tag.name in _TABLE_LIST_CONTAINERS:
+        for child in list(tag.children):
+            if isinstance(child, Tag):
+                _apply_strikethrough(child)
+        return
+
+    if tag.name in _STRUCTURAL_STRIKE_TAGS:
+        if not tag.find(_STRUCTURAL_STRIKE_TAGS):
+            _wrap_children_in_strike(tag)
+            return
+        inline_run: list[Any] = []
+        for child in list(tag.contents):
+            is_structural_child = isinstance(child, Tag) and (
+                child.name in _STRUCTURAL_STRIKE_TAGS
+                or child.find(_STRUCTURAL_STRIKE_TAGS) is not None
+            )
+            if is_structural_child:
+                _wrap_inline_run_in_strike(inline_run)
+                inline_run.clear()
+                _apply_strikethrough(child)
+            else:
+                inline_run.append(child)
+        _wrap_inline_run_in_strike(inline_run)
+        return
+
+    if tag.find(_STRUCTURAL_STRIKE_TAGS):
+        inline_run = []
+        for child in list(tag.contents):
+            is_structural_child = isinstance(child, Tag) and (
+                child.name in _STRUCTURAL_STRIKE_TAGS
+                or child.find(_STRUCTURAL_STRIKE_TAGS) is not None
+            )
+            if is_structural_child:
+                _wrap_inline_run_in_strike(inline_run)
+                inline_run.clear()
+                _apply_strikethrough(child)
+            else:
+                inline_run.append(child)
+        _wrap_inline_run_in_strike(inline_run)
+        return
+
+    if tag.name in {"span", "font"}:
+        tag.name = "s"
+    else:
+        tag.wrap(Tag(name="s"))
+
+
 def _normalize_strikethrough_soup(soup: BeautifulSoup | Tag) -> None:
     """Normalize CSS line-through, nested strikethroughs, and ordinal-only ``<s>`` tags."""
     # 1. Convert CSS text-decoration: line-through elements into <s>.
     for tag in list(soup.find_all(style=_LINE_THROUGH_RE)):
         if tag.decomposed:
             continue
-        _strip_line_through_style(tag)
-        if tag.name in _STRIKE_TAGS or tag.find_parent(_STRIKE_TAGS):
-            continue
-        if not tag.get_text(strip=True):
-            continue
-        if tag.name in {"span", "font"}:
-            tag.name = "s"
-        elif tag.name in _BLOCK_STRIKE_TAGS:
-            if not tag.find(_BLOCK_STRIKE_TAGS):
-                _wrap_children_in_strike(tag)
-            else:
-                for block in tag.find_all(_BLOCK_STRIKE_TAGS):
-                    if (
-                        block.find(_BLOCK_STRIKE_TAGS)
-                        or not block.get_text(strip=True)
-                        or block.find_parent(_STRIKE_TAGS)
-                    ):
-                        continue
-                    _wrap_children_in_strike(block)
-        else:
-            tag.wrap(Tag(name="s"))
+        _apply_strikethrough(tag)
 
     # 2. Collapse nested <s>/<del>/<strike> tags so revoked norms never emit ``~~~~`` fences.
     for tag in list(soup.find_all(_STRIKE_TAGS)):
@@ -428,6 +515,19 @@ async def html_to_markdown(
         soup = BeautifulSoup(html, "lxml")
         _normalize_strikethrough_soup(soup)
         html = str(soup)
+    has_pre = bool(_PRE_BLOCK_RE.search(html))
+    if has_pre:
+        html = _PRE_BLOCK_RE.sub(
+            lambda m: (
+                m.group(1)
+                + m.group(2)
+                .replace("\r\n", "\n")
+                .replace("\r", "\n")
+                .replace("\n", _PRE_NEWLINE_SENTINEL)
+                + m.group(3)
+            ),
+            html,
+        )
     result = await asyncio.to_thread(
         html_to_md,
         html,
@@ -441,7 +541,10 @@ async def html_to_markdown(
             strip_newlines=True,
         ),
     )
-    return clean_markdown(result.content or "")
+    content = result.content or ""
+    if has_pre:
+        content = content.replace(_PRE_NEWLINE_SENTINEL, "\n")
+    return clean_markdown(content)
 
 
 async def bytes_to_markdown(
@@ -479,6 +582,9 @@ async def bytes_to_markdown(
         # shortcut: no pure-Python Word 97 converter; add one if .doc norms become common.
         raise ValueError(f"Legacy Word/Office (OLE2) file is not supported: {url}")
     response = Response(url, 200, {"Content-Type": content_type}, data)
+    if sniffed is None and response.content_type == "text/plain":
+        text = response.text.replace("\r\n", "\n").replace("\r", "\n")
+        return clean_markdown(text)
     return await html_to_markdown(response.text, url, fetch_image, cache=image_cache)
 
 
@@ -521,7 +627,7 @@ def remove_summary_from_markdown(md: str, summary: str) -> str:
 
 
 def remove_summary_element(container: BeautifulSoup | Tag, summary: str) -> None:
-    """Remove the smallest summary container without deleting articles."""
+    """Remove the smallest dedicated summary container without deleting operative clauses."""
     normalized = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", " ".join(summary.split())).casefold()
     if not normalized:
         return
@@ -532,12 +638,11 @@ def remove_summary_element(container: BeautifulSoup | Tag, summary: str) -> None
         ).casefold()
         if normalized not in text:
             continue
-        is_dedicated_ementa = (
-            len(text) <= len(normalized) * 1.25
-            and len(text) < 600
-            and not _ARTICLE_START_RE.match(text)
-        )
-        if "art." in text and not (is_dedicated_ementa and "art." in normalized):
+        if len(text) > len(normalized) * 1.25 or len(text) >= 600:
+            continue
+        if _OPERATIVE_CLAUSE_START_RE.match(text):
+            continue
+        if "art." in text and "art." not in normalized:
             continue
         candidates.append((len(text), tag))
     if candidates:

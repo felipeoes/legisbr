@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup, Tag
 
 from legisbr.core.convert import calc_pages
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class MaranhaoAlemaScraper(BaseScraper):
     types = TYPES
     situations = SITUATIONS
     base_url = "https://legislacao.al.ma.leg.br"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
     _TOTAL_RESULTS_RE = re.compile("(\\d+)\\s+registro\\(s\\)\\s+encontrado\\(s\\)")
     _USER_INPUT_FIELDS = {
         "in_tipo_doc_focus",

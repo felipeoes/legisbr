@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 from bs4 import BeautifulSoup, Tag
 
 from legisbr.core.convert import (
+    bytes_to_markdown,
     calc_pages,
     clean_norm_soup,
     infer_type_from_title,
@@ -223,6 +224,10 @@ _FEDERAL_TYPE_PREFIX_RE = re.compile(
     "(.+?)(?:\\s+(?:n[º°o]|n\\.|número)\\s*[\\dA-Za-z]|\\s+\\d|\\s+de\\s)",
     re.IGNORECASE,
 )
+_OPERATIVE_CLAUSE_START_RE = re.compile(
+    r"^(?:art\.?\s*\d|artigo\b|§|par[aá]grafo\b|o\s+presidente\b|a\s+presidenta\b|o\s+congresso\b|fa[çc]o\s+saber\b|decreta\s*:)",
+    re.IGNORECASE,
+)
 ORDERING = "data%3AASC"
 YEAR_START = 1808
 EXPORT_MAX_DOCS = 300
@@ -425,14 +430,6 @@ class CamaraDepScraper(BaseScraper):
         situation = doc.get("situation", "") or "Não Informado"
         metadata_url = doc.get("metadata_url", "")
         soup = (await self.http.request(metadata_url)).soup()
-        if not soup:
-            reason = soup.reason
-            status = soup.status
-            detail = f"HTTP {status} — {reason}" if status else reason
-            logger.error(
-                f"Could not fetch metadata page: {title} | {detail} | {metadata_url}"
-            )
-            raise ValueError(f"Could not fetch page HTML: {detail}")
         not_found = any(
             (
                 heading.get_text(" ", strip=True) == "Not Found"
@@ -513,7 +510,27 @@ class CamaraDepScraper(BaseScraper):
             resp_or_failed = await self.http.request(document_text_link)
             html_bytes = resp_or_failed.content
             if html_bytes.startswith(b"%PDF"):
-                return await self.fetch_pdf({**doc, "year": year, "type": doc_type})
+                text_markdown = await bytes_to_markdown(
+                    html_bytes,
+                    resp_or_failed.content_type or "application/pdf",
+                    document_text_link,
+                    self.http,
+                    self.ocr,
+                    pdf_executor=self.pdf_executor,
+                    pdf_workers=self.pdf_workers,
+                )
+                return Document(
+                    year=year,
+                    title=title,
+                    type=doc_type,
+                    summary=summary,
+                    situation=situation,
+                    metadata_url=metadata_url,
+                    text_markdown=text_markdown.strip(),
+                    document_url=document_text_link,
+                    raw=html_bytes,
+                    raw_ext=".pdf",
+                )
             html_text = resp_or_failed.text
             soup = BeautifulSoup(html_text, "lxml")
             texto_div = soup.find("div", class_="texto")
@@ -552,9 +569,15 @@ class CamaraDepScraper(BaseScraper):
                     nxt = ementa.find_next_sibling()
                     if isinstance(nxt, Tag) and nxt.name == "p":
                         nxt_text = " ".join(nxt.get_text(" ", strip=True).split())
-                        if not summary or (
-                            " ".join(summary.split()).casefold() in nxt_text.casefold()
+                        is_safe_ementa = (
+                            len(nxt_text) < 600
                             and "art." not in nxt_text.casefold()
+                            and not _OPERATIVE_CLAUSE_START_RE.match(nxt_text)
+                        )
+                        if is_safe_ementa and (
+                            not summary
+                            or " ".join(summary.split()).casefold()
+                            in nxt_text.casefold()
                         ):
                             nxt.decompose()
                 ementa.decompose()
@@ -590,7 +613,7 @@ class CamaraDepScraper(BaseScraper):
             )
         except Exception as e:
             logger.error(f"Error converting document to markdown: {title} - {e}")
-            raise ValueError(str(e))
+            raise ValueError(str(e)) from e
 
     def _infer_norm_type(self, title: str) -> str:
         """Infer norm type from metadata/document URL slug or title prefix."""
@@ -773,6 +796,11 @@ class CamaraDepScraper(BaseScraper):
                     *(_fetch_facet(tipo_id, cnt) for tipo_id, cnt in facets),
                     return_exceptions=True,
                 )
+                for res in results:
+                    if isinstance(res, BaseException) and not isinstance(
+                        res, Exception
+                    ):
+                        raise res
                 raw_docs = []
                 for (tipo_id, _cnt), res in zip(facets, results, strict=True):
                     if isinstance(res, Exception):

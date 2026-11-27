@@ -597,7 +597,13 @@ class DFSinjScraper(BaseScraper):
                 self._extract_pdf_pages, pdf_bytes, page_numbers
             )
             text_markdown = await bytes_to_markdown(
-                pdf_slice, "", self.base_url, self.http, self.ocr
+                pdf_slice,
+                "",
+                self.base_url,
+                self.http,
+                self.ocr,
+                pdf_executor=self.pdf_executor,
+                pdf_workers=self.pdf_workers,
             )
             text_markdown = self._clean_pdf_fallback_text(text_markdown, doc)
             valid, _ = valid_markdown(text_markdown)
@@ -748,7 +754,13 @@ class DFSinjScraper(BaseScraper):
             if not is_pdf(body, ""):
                 return _ATTEMPT_FAILED
             text_markdown = await bytes_to_markdown(
-                body, "", text_url, self.http, self.ocr
+                body,
+                "",
+                text_url,
+                self.http,
+                self.ocr,
+                pdf_executor=self.pdf_executor,
+                pdf_workers=self.pdf_workers,
             )
             text_markdown = self._clean_extracted_text(text_markdown, doc)
             usable, _ = self._check_markdown(text_markdown)
@@ -781,7 +793,13 @@ class DFSinjScraper(BaseScraper):
     ) -> dict | None:
         """Attempts 3b+4 (PDF): direct PDF conversion then diary fallback."""
         text_markdown = await bytes_to_markdown(
-            body, "", fallback_url, self.http, self.ocr
+            body,
+            "",
+            fallback_url,
+            self.http,
+            self.ocr,
+            pdf_executor=self.pdf_executor,
+            pdf_workers=self.pdf_workers,
         )
         text_markdown = self._clean_extracted_text(text_markdown, doc)
         usable, reason = self._check_markdown(text_markdown)
@@ -831,7 +849,13 @@ class DFSinjScraper(BaseScraper):
             doc["raw_ext"] = content_ext
             return Document(**doc)
         text_markdown = await bytes_to_markdown(
-            body, "", fallback_url, self.http, self.ocr
+            body,
+            "",
+            fallback_url,
+            self.http,
+            self.ocr,
+            pdf_executor=self.pdf_executor,
+            pdf_workers=self.pdf_workers,
         )
         usable, reason = self._check_markdown(text_markdown)
         if not usable:
@@ -881,7 +905,7 @@ class DFSinjScraper(BaseScraper):
             )
         except Exception as exc:
             logger.error(f"Error getting document data for {fallback_url}: {exc}")
-            raise ValueError(str(exc))
+            raise ValueError(str(exc)) from exc
 
     async def list_documents(self, year: int) -> AsyncIterator[dict]:
         first, total = await self._fetch_search_page(self._build_payload(year))

@@ -116,36 +116,32 @@ class BahiaLegislaScraper(BaseScraper):
         return rows
 
     def _clean_layout_tables(self, soup: Tag) -> None:
-        """Unwrap MS Word layout tables while preserving genuine multi-column data tables."""
+        """Remove empty EMPTYCELLSTYLE spacers and unwrap single-cell/1-row layout tables."""
+        for p in list(soup.find_all("p", class_="EMPTYCELLSTYLE")):
+            if not p.decomposed and not p.get_text(strip=True) and not p.find("img"):
+                p.decompose()
         for table in list(soup.find_all("table")):
             if table.decomposed:
                 continue
-            has_empty_cell_style = table.find("p", class_="EMPTYCELLSTYLE") is not None
             rows = self._direct_rows(table)
-            max_cols = max(
-                (
-                    len(
-                        [
-                            c
-                            for c in tr.children
-                            if isinstance(c, Tag) and c.name in ("td", "th")
-                        ]
-                    )
-                    for tr in rows
-                ),
-                default=0,
-            )
-            is_single_cell_wrapper = len(rows) == 1 and max_cols <= 1
-            if not has_empty_cell_style and not is_single_cell_wrapper:
+            if len(rows) != 1:
                 continue
-            for p in list(table.find_all("p", class_="EMPTYCELLSTYLE")):
-                if not p.decomposed:
-                    p.decompose()
-            for tr in rows:
-                for cell in list(tr.children):
-                    if isinstance(cell, Tag) and cell.name in ("td", "th"):
-                        cell.name = "div"
-                tr.name = "div"
+            cells = [
+                c
+                for c in rows[0].children
+                if isinstance(c, Tag) and c.name in ("td", "th")
+            ]
+            non_empty_cells = [
+                c for c in cells if c.get_text(strip=True) or c.find("img")
+            ]
+            if len(non_empty_cells) > 1:
+                continue
+            for cell in cells:
+                if cell in non_empty_cells:
+                    cell.name = "div"
+                else:
+                    cell.decompose()
+            rows[0].name = "div"
             for child in list(table.children):
                 if isinstance(child, Tag) and child.name in ("tbody", "thead", "tfoot"):
                     child.name = "div"

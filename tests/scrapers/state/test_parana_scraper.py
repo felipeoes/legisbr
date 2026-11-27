@@ -268,3 +268,81 @@ class TestListType:
         scraper.http.request.side_effect = [make_mock_response("<html></html>")]
         with pytest.raises(ValueError, match="Unrecognized Paraná listing"):
             [ref async for ref in scraper.list_type(2025, "Lei", 1)]
+
+
+class TestSearchRefsPagination:
+    @staticmethod
+    def _make_paginated_search_html(
+        codes: list[int], *, page: int, total_pages: int, total_records: int
+    ) -> str:
+        rows = "".join(
+            f"""<tr class="list_cor_sim">
+              <td><a href="JavaScript:exibir('/legislacao/pesquisarAto.do?action=exibir&amp;codAto={code}');">Ver</a></td>
+              <td>Lei {code} - 01 de janeiro de 2024</td>
+              <td>Dispõe sobre assunto {code}.</td>
+              <td>01/01/2024</td>
+            </tr>"""
+            for code in codes
+        )
+        return (
+            f"<html><body>"
+            f'<table id="barra_paginacao"><tr><td>Página {page} de {total_pages} : (Total de {total_records} registros)</td></tr></table>'
+            f'<table id="list_tabela">{rows}</table>'
+            f"</body></html>"
+        )
+
+    async def test_search_refs_paginates_across_multiple_pages_and_deduplicates(self):
+        from legisbr.core.query import Query
+
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [
+            make_mock_response(
+                self._make_paginated_search_html(
+                    [101, 102], page=1, total_pages=3, total_records=5
+                )
+            ),
+            make_mock_response(
+                self._make_paginated_search_html(
+                    [102, 103], page=2, total_pages=3, total_records=5
+                )
+            ),
+            make_mock_response(
+                self._make_paginated_search_html(
+                    [104, 105], page=3, total_pages=3, total_records=5
+                )
+            ),
+        ]
+        refs = [
+            ref
+            async for ref in scraper.search_refs(
+                Query(years=2024, type="Lei"), strict_native=True
+            )
+        ]
+        assert [ref["id"] for ref in refs] == ["101", "102", "103", "104", "105"]
+        assert scraper.http.request.await_count == 3
+        calls = scraper.http.request.await_args_list
+        assert "indice=" not in calls[0].args[0]
+        assert "indice=2&totalRegistros=5" in calls[1].args[0]
+        assert calls[1].kwargs["data"]["paginaAtual"] == "2"
+        assert "indice=3&totalRegistros=5" in calls[2].args[0]
+        assert calls[2].kwargs["data"]["paginaAtual"] == "3"
+
+    async def test_search_refs_stops_early_on_limit(self):
+        from legisbr.core.query import Query
+
+        scraper = _make_scraper()
+        scraper.http.request.side_effect = [
+            make_mock_response(
+                self._make_paginated_search_html(
+                    [101, 102], page=1, total_pages=3, total_records=5
+                )
+            ),
+        ]
+        refs = [
+            ref
+            async for ref in scraper.search_refs(
+                Query(years=2024, type="Lei", limit=2), strict_native=True
+            )
+        ]
+        assert [ref["id"] for ref in refs] == ["101", "102"]
+        assert scraper.http.request.await_count == 1

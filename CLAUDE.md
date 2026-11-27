@@ -23,7 +23,7 @@ uv run pytest tests -m integration
 uv run pre-commit run --all-files
 ```
 
-`legisbr run` requires `-s` or `--all` and supports `--year`, `--years START:END`, `--overwrite`, `--no-raw`, `--fts`, `--low-memory`, `--pdf-executor auto|process|thread`, `-v`, `--log-file`, and `--jobs`. Several scrapers run as one child process each (`sys.executable -m legisbr run ...`; `--jobs` bounds concurrency, default all up to CPU count; each child gets `LLM_CONCURRENCY` and scaled `PDF_WORKERS`); a single scraper runs in-process. Any scraper or cleanup failure returns exit 1. `legisbr stats` prints each archive's last run (`runs.stats`) as a Markdown table. Pre-commit excludes integration tests and enforces a 60-second per-test timeout.
+`legisbr run` requires `-s` or `--all` and supports `--year`, `--years START:END`, `--overwrite`, `--no-raw`, `--fts`, `--low-memory`, `--pdf-executor auto|process|thread`, `-v`, `--log-file`, and `--jobs`. Several scrapers run as one child process each (`sys.executable -m legisbr run ...`; `--jobs` bounds concurrency, default all up to CPU count; each child gets scaled `PDF_WORKERS`); a single scraper runs in-process. Any scraper or cleanup failure returns exit 1. `legisbr stats` prints each archive's last run (`runs.stats`) as a Markdown table. Pre-commit excludes integration tests and enforces a 60-second per-test timeout.
 
 ## Architecture
 

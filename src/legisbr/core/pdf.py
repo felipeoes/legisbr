@@ -1177,7 +1177,10 @@ def _select_substantive_images(
             if n_pages >= 2:
                 if im.sha256 and len(sha_pages.get(im.sha256, ())) >= 2:
                     continue
-                if len(bbox_pages.get(im.nbbox, ())) >= 2:
+                nbbox_freq = len(bbox_pages.get(im.nbbox, ()))
+                if nbbox_freq >= 2 and (
+                    im.vis_text_overlaps >= 5 or nbbox_freq >= max(3, n_pages // 2)
+                ):
                     continue
             if n_pages == 1 and im.total_vis_text > 0:
                 cx = (im.nbbox[0] + im.nbbox[2]) * 0.5
@@ -1221,10 +1224,17 @@ def _encode_page_images(
                 encoded.append((im.top, f"![image](data:image/jpeg;base64,{b64})"))
             else:
                 bmp = obj.get_bitmap()
-                pil_img = bmp.to_pil()
-                buf = io.BytesIO()
-                pil_img.save(buf, format="PNG", optimize=True)
-                png_bytes = buf.getvalue()
+                pil_img = None
+                try:
+                    pil_img = bmp.to_pil()
+                    buf = io.BytesIO()
+                    pil_img.save(buf, format="PNG", optimize=True)
+                    png_bytes = buf.getvalue()
+                finally:
+                    if pil_img is not None:
+                        pil_img.close()
+                    bmp.warn_on_close = False
+                    bmp.close()
                 if len(png_bytes) < 100:
                     continue
                 b64 = base64.b64encode(png_bytes).decode("ascii")
@@ -1428,23 +1438,41 @@ def _extract_pdf_core(
             if not doc_readable:
                 return _ExtractionResult(markdown=None)
 
-        # Stage 2: for digital PDFs, inspect remaining pages for ruled lines & substantive image hashes.
-        if not scanned:
+        # Stage 2:
+        # - For digital PDFs, inspect remaining pages for ruled lines & substantive image hashes.
+        # - For scanned PDFs with check_readable=True, also inspect non-sampled pages
+        #   (without hashing images) when any sampled page has un-OCR'd 1-bit coverage or
+        #   modest text (< 400 chars), or the page itself has < 400 chars, so >10p scanned
+        #   PDFs do not skip non-sampled un-OCR'd 1-bit CCITT pages.
+        inspect_all_scanned = (
+            scanned
+            and check_readable
+            and any(
+                pa.bpp1_unocrd_coverage > 0.0 or pa.text_len < 400
+                for pa in analyses
+                if pa.page_index in sample_set
+            )
+        )
+        if not scanned or (scanned and check_readable):
+            hash_images = embed_images and not scanned
             for pa in analyses:
-                if pa.page_index not in inspected_objects:
-                    page = doc[pa.page_index]
-                    try:
-                        _populate_page_objects(
-                            page,
-                            pa,
-                            collect_image_hashes=embed_images,
-                            image_size_limit=image_size_limit,
-                        )
-                    finally:
-                        page.close()
-                    inspected_objects.add(pa.page_index)
-                    if yield_between_pages:
-                        time.sleep(0)
+                if pa.page_index in inspected_objects:
+                    continue
+                if scanned and not inspect_all_scanned and pa.text_len >= 400:
+                    continue
+                page = doc[pa.page_index]
+                try:
+                    _populate_page_objects(
+                        page,
+                        pa,
+                        collect_image_hashes=hash_images,
+                        image_size_limit=image_size_limit,
+                    )
+                finally:
+                    page.close()
+                inspected_objects.add(pa.page_index)
+                if yield_between_pages:
+                    time.sleep(0)
 
         # Per-page coverage & CMap-gibberish audit across ALL pages.
         bad_pages: list[int] = []
@@ -1607,10 +1635,17 @@ def render_pdf_batch(
             page = doc[i]
             try:
                 bitmap = page.render(scale=scale)
-                pil_image = bitmap.to_pil()
-                buf = io.BytesIO()
-                pil_image.save(buf, format="PNG", compress_level=1)
-                pngs.append(buf.getvalue())
+                pil_image = None
+                try:
+                    pil_image = bitmap.to_pil()
+                    buf = io.BytesIO()
+                    pil_image.save(buf, format="PNG", compress_level=1)
+                    pngs.append(buf.getvalue())
+                finally:
+                    if pil_image is not None:
+                        pil_image.close()
+                    bitmap.warn_on_close = False
+                    bitmap.close()
             finally:
                 page.close()
         return pngs
@@ -1654,6 +1689,7 @@ class PdfRunner:
         self.executor_mode: PdfExecutor = executor
         self.max_workers = max_workers
         self._pool: ProcessPoolExecutor | None = None
+        self._pool_started = False
         self._process_unavailable = False
         self._thread_sems: weakref.WeakKeyDictionary[
             asyncio.AbstractEventLoop, asyncio.Semaphore
@@ -1676,6 +1712,7 @@ class PdfRunner:
         if self._pool is None:
             mp_ctx = multiprocessing.get_context("spawn")
             self._pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx)
+            self._pool_started = False
         return self._pool
 
     async def run(self, function: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
@@ -1705,19 +1742,38 @@ class PdfRunner:
         loop = asyncio.get_running_loop()
         try:
             if kwargs:
-                return await loop.run_in_executor(
+                result = await loop.run_in_executor(
                     pool, _apply_kwargs, function, args, kwargs
                 )
-            return await loop.run_in_executor(pool, function, *args)
+            else:
+                result = await loop.run_in_executor(pool, function, *args)
+            self._pool_started = True
+            return result
+        except (PermissionError, OSError) as exc:
+            if self.executor_mode != "auto" or self._pool_started:
+                raise
+            if self._pool is pool:
+                self._pool = None
+                self._pool_started = False
+            pool.shutdown(wait=False, cancel_futures=True)
+            self._process_unavailable = True
+            logger.warning(
+                "PDF ProcessPoolExecutor unavailable (%s); falling back to thread mode",
+                exc,
+            )
+            async with self._get_thread_sem():
+                return await asyncio.to_thread(function, *args, **kwargs)
         except BrokenProcessPool:
             if self._pool is pool:
                 self._pool = None
+                self._pool_started = False
                 pool.shutdown(wait=False, cancel_futures=True)
             raise
 
     def shutdown(self, *, wait: bool = False) -> None:
         pool = self._pool
         self._pool = None
+        self._pool_started = False
         if pool is not None:
             pool.shutdown(wait=wait, cancel_futures=not wait)
 

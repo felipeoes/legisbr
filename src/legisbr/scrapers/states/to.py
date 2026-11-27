@@ -10,14 +10,20 @@ from bs4 import BeautifulSoup, Tag
 
 from legisbr.core.convert import bytes_to_markdown, calc_pages, valid_markdown
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 logger = logging.getLogger(__name__)
 
-TYPES = {"Lei Ordinária": "ordinaria", "Lei Complementar": "complementar"}
+TYPES = {
+    "Constituição Estadual": "/arquivos/documento_68367.PDF#dados",
+    "Lei Ordinária": "ordinaria",
+    "Lei Complementar": "complementar",
+}
 VALID_SITUATIONS = ["Não consta"]
 INVALID_SITUATIONS = []
 SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
+_CONSTITUTION_YEAR = 1989
 _RESULT_COUNT_RE = re.compile(r"(\d[\d.]*)\s+resultado", re.IGNORECASE)
 _PAGE_INFO_COUNT_RE = re.compile(r"\bde\s+(\d[\d.]*)", re.IGNORECASE)
 _PAGE_INFO_TOTAL_PAGES_RE = re.compile(r"p[aá]gina\s+\d+\s+de\s+(\d+)", re.IGNORECASE)
@@ -39,6 +45,7 @@ class TocantinsScraper(BaseScraper):
     situations = SITUATIONS
     name = "TOCANTINS"
     base_url = "https://www.al.to.leg.br"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -242,39 +249,6 @@ class TocantinsScraper(BaseScraper):
                 return int(digits)
         return None
 
-    @staticmethod
-    def _has_table_artifacts(text_markdown: str) -> bool:
-        """Detect html-to-markdown outputs that are mostly broken pipe tables."""
-        if not text_markdown:
-            return False
-        pipe_count = text_markdown.count("|")
-        pipe_lines = sum(
-            (1 for line in text_markdown.splitlines() if line.lstrip().startswith("|"))
-        )
-        return pipe_count >= 80 or pipe_lines >= 8
-
-    @staticmethod
-    def _normalize_table_markdown(text_markdown: str) -> str:
-        """Collapse broken markdown tables into plain text lines."""
-        cleaned_lines = []
-        for raw_line in text_markdown.splitlines():
-            line = raw_line.strip()
-            if not line:
-                cleaned_lines.append("")
-                continue
-            if re.fullmatch("\\|?(?:\\s*:?-{3,}:?\\s*\\|)+\\s*:?-{3,}:?\\s*\\|?", line):
-                continue
-            if "|" in line:
-                cells = [cell.strip() for cell in line.strip("|").split("|")]
-                cells = [cell for cell in cells if cell and set(cell) != {"-"}]
-                if cells:
-                    cleaned_lines.append(" ".join(cells))
-                continue
-            cleaned_lines.append(raw_line)
-        normalized = "\n".join(cleaned_lines)
-        normalized = re.sub("\\n{3,}", "\n\n", normalized)
-        return normalized.strip()
-
     def _parse_total_pages(self, soup: BeautifulSoup, first_page_size: int) -> int:
         """Compute total pages from the first listing page, failing visibly on markup breaks."""
         total_count = self._extract_total_count(soup)
@@ -342,8 +316,6 @@ class TocantinsScraper(BaseScraper):
                 pdf_executor=self.pdf_executor,
                 pdf_workers=self.pdf_workers,
             )
-            if text_markdown and self._has_table_artifacts(text_markdown):
-                text_markdown = self._normalize_table_markdown(text_markdown)
             valid, reason = valid_markdown(text_markdown)
             if not valid:
                 raise ValueError(f"Invalid markdown: {reason}")
@@ -358,25 +330,27 @@ class TocantinsScraper(BaseScraper):
             return Document(**doc_info)
         except Exception as e:
             logger.error(f"Error processing document {title}: {e}")
-            raise ValueError(f"Exception processing document: {e}")
-
-    async def list_documents(self, year: int) -> AsyncIterator[dict]:
-        if year == self.years.start:
-            url = f"{self.base_url}/arquivos/documento_68367.PDF#dados"
-            yield {
-                "year": 1989,
-                "type": "Constituição Estadual",
-                "title": "Constituição Estadual de Tocantins",
-                "document_url": url,
-                "_pdf_link": url,
-                "situation": DEFAULT_VALID_SITUATION,
-            }
-        async for ref in super().list_documents(year):
-            yield ref
+            raise ValueError(f"Exception processing document: {e}") from e
 
     async def list_type(
         self, year: int, norm_type: str, norm_type_id: str
     ) -> AsyncIterator[dict]:
+        if norm_type == "Constituição Estadual":
+            if year == _CONSTITUTION_YEAR or (
+                bool(self.years)
+                and _CONSTITUTION_YEAR not in self.years
+                and year == self.years.start
+            ):
+                url = f"{self.base_url}{norm_type_id}"
+                yield {
+                    "year": _CONSTITUTION_YEAR,
+                    "type": norm_type,
+                    "title": "Constituição Estadual de Tocantins",
+                    "document_url": url,
+                    "_pdf_link": url,
+                    "situation": DEFAULT_VALID_SITUATION,
+                }
+            return
         payload = self._format_search_payload(norm_type_id, year, 1)
         response = await self.http.request(self.search_url, method="POST", data=payload)
         soup = BeautifulSoup(response.content, "lxml")

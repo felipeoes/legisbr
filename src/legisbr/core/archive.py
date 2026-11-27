@@ -8,7 +8,6 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Self
-from urllib.parse import quote
 
 from legisbr.core.store import (
     SearchHit,
@@ -17,6 +16,34 @@ from legisbr.core.store import (
     _row_to_dict,
     _search_connection,
 )
+
+_IMMUTABLE_FALLBACK_CODES: frozenset[int] = frozenset(
+    {
+        sqlite3.SQLITE_PERM,
+        sqlite3.SQLITE_READONLY,
+        sqlite3.SQLITE_IOERR,
+        sqlite3.SQLITE_CANTOPEN,
+    }
+)
+_IMMUTABLE_FALLBACK_MESSAGES: tuple[str, ...] = (
+    "readonly",
+    "read-only",
+    "unable to open",
+    "permission denied",
+    "disk i/o error",
+    "i/o error",
+)
+
+
+def _should_fallback_immutable(exc: sqlite3.OperationalError) -> bool:
+    """Allow immutable=1 only on readonly/cantopen/perm/ioerr errors, never BUSY/LOCKED."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in _IMMUTABLE_FALLBACK_CODES
+    msg = str(exc).lower()
+    if "locked" in msg or "busy" in msg:
+        return False
+    return any(token in msg for token in _IMMUTABLE_FALLBACK_MESSAGES)
 
 
 def _source_name_for(path: Path) -> str:
@@ -28,22 +55,26 @@ def _source_name_for(path: Path) -> str:
 def _open_readonly(path: Path) -> tuple[sqlite3.Connection, bool]:
     """Open SQLite read-only, falling back to immutable=1 on read-only WAL mounts."""
     resolved = path.resolve()
-    encoded = quote(resolved.as_posix(), safe="/:")
-    uri_ro = f"file:{encoded}?mode=ro"
+    base_uri = resolved.as_uri()
+    uri_ro = f"{base_uri}?mode=ro"
     connection: sqlite3.Connection | None = None
     try:
-        connection = sqlite3.connect(uri_ro, uri=True, check_same_thread=False)
+        connection = sqlite3.connect(
+            uri_ro, uri=True, timeout=5.0, check_same_thread=False
+        )
         connection.row_factory = sqlite3.Row
         # WAL databases only try to create -shm/-wal on the first read query.
         connection.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
         return connection, False
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
         if connection is not None:
             connection.close()
-        if not resolved.exists():
+        if not resolved.exists() or not _should_fallback_immutable(exc):
             raise
-    uri_immutable = f"file:{encoded}?immutable=1"
-    connection = sqlite3.connect(uri_immutable, uri=True, check_same_thread=False)
+    uri_immutable = f"{base_uri}?immutable=1"
+    connection = sqlite3.connect(
+        uri_immutable, uri=True, timeout=5.0, check_same_thread=False
+    )
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()

@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 
 from legisbr.core.convert import strip_html_chrome
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import (
     DEFAULT_INVALID_SITUATION,
     DEFAULT_VALID_SITUATION,
@@ -44,8 +45,13 @@ _EXEC_CODES = {
     "PRV": "Provimento",
     "RES": "Resolução",
 }
-TYPES = {"Legislativo": "legislativo", "Executivo": "executivo"}
+TYPES = {
+    "Constituição Estadual": "/ato-normativo/legislativo/52785",
+    "Legislativo": "legislativo",
+    "Executivo": "executivo",
+}
 SITUATIONS: list[str] = []
+_CONSTITUTION_YEAR = 1989
 
 
 class SantaCatarinaScraper(BaseScraper):
@@ -58,6 +64,7 @@ class SantaCatarinaScraper(BaseScraper):
     situations = SITUATIONS
     name = "SANTA_CATARINA"
     base_url = "https://leis.alesc.sc.gov.br"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def _format_search_url(self, norm_type_id: str, year: int) -> str:
         return f"{self.base_url}/{norm_type_id}?ano={year}"
@@ -137,29 +144,31 @@ class SantaCatarinaScraper(BaseScraper):
         summary = self._extract_summary(soup)
         if summary and not doc_info.get("summary"):
             doc_info["summary"] = summary
-        doc_info["situation"] = self._extract_situation(soup)
         strip_html_chrome(soup)
+        doc_info["situation"] = self._extract_situation(soup)
         return await self.fetch_html(
             doc_info, str(soup), document_url, response.content, ".html"
         )
 
-    async def list_documents(self, year: int | None) -> AsyncIterator[dict]:
-        # The constitution is only linked from every page's footer; list it once.
-        if year == self.years.start:
-            yield {
-                "year": 1989,
-                "type": "Constituição Estadual",
-                "title": "Constituição do Estado de Santa Catarina",
-                "document_url": f"{self.base_url}/ato-normativo/legislativo/52785",
-                "situation": DEFAULT_VALID_SITUATION,
-                "constitution": True,
-            }
-        async for ref in super().list_documents(year):
-            yield ref
-
     async def list_type(
         self, year: int, norm_type: str, path: str
     ) -> AsyncIterator[dict]:
+        if norm_type == "Constituição Estadual":
+            # The constitution is only linked from every page's footer; list it once.
+            if year == _CONSTITUTION_YEAR or (
+                bool(self.years)
+                and _CONSTITUTION_YEAR not in self.years
+                and year == self.years.start
+            ):
+                yield {
+                    "year": _CONSTITUTION_YEAR,
+                    "type": norm_type,
+                    "title": "Constituição do Estado de Santa Catarina",
+                    "document_url": f"{self.base_url}{path}",
+                    "situation": DEFAULT_VALID_SITUATION,
+                    "constitution": True,
+                }
+            return
         seen = set()
         page = 1
         while True:

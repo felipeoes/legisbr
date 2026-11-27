@@ -346,3 +346,42 @@ async def test_gcra_rate_limiter_does_not_hold_lock_while_sleeping():
     with pytest.raises(asyncio.CancelledError):
         await waiter
     assert not limiter._lock.locked()
+
+
+async def test_rotated_proxies_prune_retired_sessions_and_limiters(tmp_path):
+    from legisbr.core.proxy import ProxyService
+
+    path = tmp_path / "proxies.txt"
+    path.write_text("http://a:1\nhttp://b:2\n", encoding="utf-8")
+    service = ProxyService({"file_path": str(path), "ttl": 0})
+    http = HttpClient(rps=1000, proxy_service=service)
+
+    fake_sessions: dict[str, MagicMock] = {}
+
+    async def make_session(proxy: str | None = None) -> MagicMock:
+        assert proxy is not None
+        if proxy not in fake_sessions:
+            sess = _session()
+            sess.closed = False
+            sess.close = AsyncMock()
+            fake_sessions[proxy] = sess
+            http._proxy_sessions[proxy] = sess
+        return fake_sessions[proxy]
+
+    http._ensure_session = AsyncMock(side_effect=make_session)
+
+    await http.request("https://example.org/1")
+    await http.request("https://example.org/2")
+    assert set(http._proxy_sessions) == {"http://a:1", "http://b:2"}
+    assert set(http._proxy_limiters) == {"http://a:1", "http://b:2"}
+
+    # Rotate out a:1 and b:2, replacing with c:3.
+    path.write_text("http://c:3\n", encoding="utf-8")
+    await http.request("https://example.org/3")
+
+    assert set(http._proxy_sessions) == {"http://c:3"}
+    assert set(http._proxy_limiters) == {"http://c:3"}
+    fake_sessions["http://a:1"].close.assert_awaited_once()
+    fake_sessions["http://b:2"].close.assert_awaited_once()
+    fake_sessions["http://c:3"].close.assert_not_awaited()
+    await http.close()

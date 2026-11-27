@@ -408,3 +408,105 @@ class TestPdfToMarkdownAndExecutors:
         finally:
             runner.shutdown(wait=True)
             shutdown_pdf_pool(wait=True)
+
+    async def test_distinct_multipage_annex_figures_sharing_bbox_are_kept(self):
+        import io as _io
+
+        import pypdf
+        from pdf_fixtures import (
+            _escape_pdf_text,
+            _make_helvetica_font,
+            _make_rgb_image_xobject,
+        )
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+        # 6-page PDF with 2 distinct annex maps (different colors -> different SHA-256)
+        # placed in the exact same layout frame on pages 2 and 4 with 0 overlapping text.
+        writer = pypdf.PdfWriter()
+        fig_a = _make_rgb_image_xobject(writer, 240, 180, color=(30, 100, 180))
+        fig_b = _make_rgb_image_xobject(writer, 240, 180, color=(180, 70, 40))
+        for i in range(6):
+            page = writer.add_blank_page(width=595, height=842)
+            font_ref = writer._add_object(_make_helvetica_font())
+            xobjs: dict = {}
+            ops = [
+                b"BT /F1 11 Tf 50 760 Td ("
+                + _escape_pdf_text(
+                    f"Art. {i + 1}º Disposição normativa da página {i + 1} sobre zoneamento ambiental estadual e ordenamento territorial."
+                )
+                + b") Tj ET",
+                b"BT /F1 11 Tf 50 120 Td ("
+                + _escape_pdf_text(
+                    f"Parágrafo único. O anexo cartográfico da página {i + 1} integra a presente legislação estadual."
+                )
+                + b") Tj ET",
+            ]
+            if i == 1:
+                xobjs[NameObject("/ImFig")] = fig_a
+                ops.append(b"q 360 0 0 220 110 380 cm /ImFig Do Q")
+            elif i == 3:
+                xobjs[NameObject("/ImFig")] = fig_b
+                ops.append(b"q 360 0 0 220 110 380 cm /ImFig Do Q")
+            resources = {
+                NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})
+            }
+            if xobjs:
+                resources[NameObject("/XObject")] = DictionaryObject(xobjs)
+            page[NameObject("/Resources")] = DictionaryObject(resources)
+            stream = DecodedStreamObject()
+            stream.set_data(b"\n".join(ops))
+            page[NameObject("/Contents")] = writer._add_object(stream)
+        buf = _io.BytesIO()
+        writer.write(buf)
+        pdf = buf.getvalue()
+
+        md = await pdf_to_markdown(pdf, executor="thread", embed_images=True)
+        imgs = pdf_mod._MD_BASE64_IMAGE_RE.findall(md)
+        assert len(imgs) == 2
+
+    async def test_over_10_page_scanned_pdf_inspects_non_sampled_1bit_ccitt_pages(self):
+        # 12-page Piauí-style 1-bit CCITT PDF where pages 5 and 11 are outside the
+        # 10-page sample set and every page has a >=50-char digital masthead.
+        pdf = make_1bit_ccitt_masthead_pdf(pages=12)
+        ocr = AsyncMock()
+        ocr.pdf.return_value = (
+            "Art. 1º Lei transcrita integralmente das 12 páginas do Piauí."
+        )
+        md = await pdf_to_markdown(pdf, ocr=ocr, executor="thread")
+        # All 12 pages (including non-sampled pages 5 & 11) must be flagged -> full PDF OCR.
+        ocr.pdf.assert_awaited_once_with(pdf)
+        assert "12 páginas" in md
+
+    async def test_auto_executor_falls_back_on_first_run_in_executor_oserror(
+        self, monkeypatch, caplog
+    ):
+        runner = PdfRunner(executor="auto", max_workers=2)
+        shutdown_called = False
+
+        class _LazyFailPool:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def shutdown(self, *args, **kwargs):
+                nonlocal shutdown_called
+                shutdown_called = True
+
+        loop = asyncio.get_running_loop()
+        real_run_in_executor = loop.run_in_executor
+
+        def fake_run_in_executor(executor, func, *args):
+            if isinstance(executor, _LazyFailPool):
+                raise PermissionError("SemLock denied on lazy worker spawn")
+            return real_run_in_executor(executor, func, *args)
+
+        monkeypatch.setattr(pdf_mod, "ProcessPoolExecutor", _LazyFailPool)
+        monkeypatch.setattr(loop, "run_in_executor", fake_run_in_executor)
+
+        pdf = make_digital_pdf("Art. 1º " + "Texto legal estadual. " * 10)
+        with caplog.at_level("WARNING", logger="legisbr.core.pdf"):
+            result = await runner.run(pdf_mod._pdf_text_layer, pdf, 0.1, True, True)
+        assert result is not None and "Art. 1º" in result
+        assert shutdown_called is True
+        assert runner._process_unavailable is True
+        assert runner._pool is None
+        assert "falling back to thread mode" in caplog.text

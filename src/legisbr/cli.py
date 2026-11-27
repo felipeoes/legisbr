@@ -184,7 +184,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     export.add_argument(
         "--single-file",
         action="store_true",
-        help="Write a single combined Parquet file (data.parquet) instead of per-year shards",
+        help=(
+            "Write a single combined file (data.parquet, data.jsonl, or data.json) "
+            "instead of per-year shards"
+        ),
     )
     export.add_argument("--out", type=Path)
 
@@ -327,7 +330,7 @@ async def run_scraper(
         low_memory = bool(getattr(args, "low_memory", False))
         workers = min(spec.workers, 4) if low_memory else spec.workers
         pdf_executor = "thread" if low_memory else getattr(args, "pdf_executor", "auto")
-        pdf_workers = 1 if low_memory else None
+        pdf_workers = 1 if low_memory else cfg.pdf_workers
         cache_mb = 2 if low_memory else 16
         proxy_config = cfg.build_proxy_config() if spec.needs_proxy else None
         http = HttpClient(

@@ -589,3 +589,42 @@ def test_mcp_serve_command_wires_to_run_mcp_server(tmp_path, monkeypatch):
         host="0.0.0.0",
         port=9000,
     )
+
+
+async def test_run_forwards_settings_pdf_workers_when_not_low_memory(
+    tmp_path, monkeypatch
+):
+    observed: dict = {}
+
+    class SpyScraper(BaseScraper):
+        name = "SPY_WORKERS"
+        base_url = "https://example.org"
+
+        async def list_documents(self, year):
+            yield {
+                "year": year,
+                "type": "Lei",
+                "title": f"Lei 1/{year}",
+                "document_url": f"https://example.org/{year}/1",
+            }
+
+        async def fetch(self, ref):
+            observed["pdf_workers"] = self.pdf_workers
+            observed["pdf_executor"] = self.pdf_executor
+            return document(title=ref["title"], year=ref["year"])
+
+    spec = ScraperSpec(
+        name="SPY_WORKERS",
+        cls_name="SpyScraper",
+        cls_path="tests.test_cli:SpyScraper",
+        code="spyw",
+        scope="state",
+        aliases=("spyw",),
+        start_year=2024,
+        _cls=SpyScraper,
+    )
+    monkeypatch.setattr(cli, "SCRAPERS", [spec])
+    cfg = Settings(llm_model="", save_dir=tmp_path, pdf_workers=6)
+    rc = await cli.async_main(["run", "-s", "spyw", "--year", "2024"], settings=cfg)
+    assert rc == 0
+    assert observed == {"pdf_workers": 6, "pdf_executor": "auto"}

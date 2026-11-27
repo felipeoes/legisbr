@@ -97,15 +97,15 @@ class _FakeClient:
     def __init__(self) -> None:
         self.search_calls: list[dict[str, Any]] = []
         self.fetch_calls: list[tuple[str, dict[str, Any]]] = []
-        self.entered = False
-        self.exited = False
+        self.enter_count = 0
+        self.exit_count = 0
 
     async def __aenter__(self) -> _FakeClient:
-        self.entered = True
+        self.enter_count += 1
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        self.exited = True
+        self.exit_count += 1
 
     async def search_refs(
         self,
@@ -137,7 +137,7 @@ class _FakeClient:
                 "year": years or 2024,
                 "type": type or "Lei",
                 "situation": "Vigente",
-                "document_url": f"https://live.example.org/{source}/{idx}",
+                "document_url": f"https://www2.camara.leg.br/legin/fed/lei/{years or 2024}/lei-{idx}.html",
             }
 
     async def fetch_ref(self, source: str, ref: dict[str, Any]) -> Document:
@@ -145,7 +145,9 @@ class _FakeClient:
         return _make_doc(
             year=int(ref.get("year", 2024)),
             title=str(ref.get("title", "Lei Live")),
-            document_url=str(ref.get("document_url", "https://live.example.org/1")),
+            document_url=str(
+                ref.get("document_url", "https://www2.camara.leg.br/legin/fed/lei/1")
+            ),
             text_markdown="Art. 1º " + ("Texto normativo oficial completo. " * 20),
             raw=b"%PDF-1.4 secret-raw-bytes",
             raw_ext=".pdf",
@@ -267,10 +269,19 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
     assert fake_client.search_calls == []
     assert fake_client.fetch_calls == []
 
-    # Enabled: live_search_norms enforces strict_native=True and caps limit <= 20.
+    # Enabled: live_search_norms enforces strict_native=True, caps limit <= 20,
+    # and reuses a single server-scoped Client across calls until closed.
+    factory_calls = 0
+
+    def _make_fake_client() -> _FakeClient:
+        nonlocal factory_calls
+        factory_calls += 1
+        return fake_client
+
     live_server = create_mcp_server(
-        tmp_path, allow_live_fetch=True, client_factory=lambda: fake_client
+        tmp_path, allow_live_fetch=True, client_factory=_make_fake_client
     )
+    assert factory_calls == 0
     refs = _extract_tool_result(
         await live_server.call_tool(
             "live_search_norms",
@@ -296,20 +307,213 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
         "limit": 20,
         "strict_native": True,
     }
-    assert fake_client.entered and fake_client.exited
+    assert factory_calls == 1
+    assert fake_client.enter_count == 1
+    assert fake_client.exit_count == 0
 
-    # live_fetch_norm returns model_dump excluding raw and enforces max_chars.
+    # live_fetch_norm reuses the same Client, excludes raw, and enforces max_chars.
     fetched = _extract_tool_result(
         await live_server.call_tool(
             "live_fetch_norm",
             {"source": "camara", "ref": refs[0], "max_chars": 80},
         )
     )
+    assert factory_calls == 1
+    assert fake_client.enter_count == 1
     assert len(fake_client.fetch_calls) == 1
+    assert "_ref_id" not in fake_client.fetch_calls[0][1]
     assert "raw" not in fetched and "raw_ext" not in fetched
     assert fetched["truncated"] is True
     assert len(fetched["text_markdown"]) == 80
     assert fetched["total_chars"] > 80
+
+    # Server-issued opaque ref handle works cleanly without repeating ref URLs.
+    by_handle = _extract_tool_result(
+        await live_server.call_tool(
+            "live_fetch_norm",
+            {
+                "source": "camara",
+                "ref": {"_ref_id": refs[0]["_ref_id"]},
+                "max_chars": 50,
+            },
+        )
+    )
+    assert len(fake_client.fetch_calls) == 2
+    assert by_handle["truncated"] is True
+    assert len(by_handle["text_markdown"]) == 50
+
+    await live_server.aclose()
+    assert fake_client.exit_count == 1
+
+
+@pytest.mark.parametrize(
+    ("source", "bad_ref"),
+    [
+        ("sp", {"document_url": "http://169.254.169.254/latest/meta-data/"}),
+        ("sp", {"text_url": "http://169.254.169.254/latest/meta-data/"}),
+        ("ac", {"document_url": "http://127.0.0.1:8080/internal"}),
+        ("camara", {"metadata_url": "http://localhost:9000/secret"}),
+        ("pb", {"_pdf_link": "http://10.0.0.1/admin.pdf"}),
+        ("ba", {"_html_link": "http://172.16.0.1/secret.html"}),
+        ("rj", {"_html_link": "http://192.168.1.1/router"}),
+        ("ms", {"_html_link": "http://[::1]/loopback"}),
+        ("sp", {"document_url": "http://[fe80::1]/linklocal"}),
+        ("sp", {"document_url": "http://[fc00::1]/ula"}),
+        ("ac", {"document_url": "file:///etc/passwd"}),
+        ("camara", {"document_url": "gopher://127.0.0.1:6379/_INFO"}),
+        ("sp", {"document_url": "//169.254.169.254/latest/meta-data/"}),
+        ("camara", {"document_url": "https://www2.camara.leg.br@127.0.0.1/hijack"}),
+        ("camara", {"document_url": "https://evil.example.com/norma/1"}),
+        ("camara", {"document_url": "https://www.al.sp.gov.br/norma/1"}),
+        ("sp", {"document_url": "https://www.al.sp.gov.br.evil.com/norma/1"}),
+    ],
+    ids=[
+        "metadata-ip-doc",
+        "metadata-ip-text-url",
+        "loopback-v4",
+        "localhost",
+        "rfc1918-10",
+        "rfc1918-172",
+        "rfc1918-192",
+        "loopback-v6",
+        "link-local-v6",
+        "ula-v6",
+        "file-scheme",
+        "gopher-scheme",
+        "protocol-relative",
+        "userinfo-bypass",
+        "external-domain",
+        "cross-source-domain",
+        "suffix-spoof",
+    ],
+)
+async def test_mcp_live_fetch_norm_blocks_ssrf_and_cross_domain_hijacks(
+    tmp_path, source, bad_ref
+):
+    fake_client = _FakeClient()
+    server = create_mcp_server(
+        tmp_path, allow_live_fetch=True, client_factory=lambda: fake_client
+    )
+    try:
+        with pytest.raises(Exception) as exc_info:
+            await server.call_tool(
+                "live_fetch_norm", {"source": source, "ref": bad_ref}
+            )
+        cause = exc_info.value.__cause__ or exc_info.value
+        assert (
+            isinstance(cause, ValueError)
+            or "not allowed" in str(exc_info.value)
+            or "allowed" in str(exc_info.value)
+        )
+        assert fake_client.fetch_calls == []
+    finally:
+        await server.aclose()
+
+
+async def test_mcp_max_chars_clamping_and_heavy_setup_rejection(tmp_path):
+    await _build_archive(tmp_path)
+    fake_client = _FakeClient()
+    server = create_mcp_server(
+        tmp_path, allow_live_fetch=True, client_factory=lambda: fake_client
+    )
+    try:
+        # Negative and zero max_chars must clamp to 1 (never bypass truncation).
+        hits = _extract_tool_result(
+            await server.call_tool(
+                "search_legislation", {"query": "metropolitano", "sources": ["SP"]}
+            )
+        )
+        doc_id = hits[0]["id"]
+        for bad_max in (-1, 0):
+            local_doc = _extract_tool_result(
+                await server.call_tool(
+                    "get_legislation",
+                    {"source": "sp", "doc_id": doc_id, "max_chars": bad_max},
+                )
+            )
+            assert local_doc["truncated"] is True
+            assert len(local_doc["text_markdown"]) == 1
+
+            live_doc = _extract_tool_result(
+                await server.call_tool(
+                    "live_fetch_norm",
+                    {
+                        "source": "camara",
+                        "ref": {
+                            "document_url": "https://www2.camara.leg.br/legin/fed/lei/2024/lei-1.html"
+                        },
+                        "max_chars": bad_max,
+                    },
+                )
+            )
+            assert live_doc["truncated"] is True
+            assert len(live_doc["text_markdown"]) == 1
+
+        # heavy_setup source (ce) must be rejected before calling client.fetch_ref().
+        before = len(fake_client.fetch_calls)
+        with pytest.raises(Exception) as exc_info:
+            await server.call_tool(
+                "live_fetch_norm",
+                {
+                    "source": "ce",
+                    "ref": {"document_url": "https://www.al.ce.gov.br/legislativo/1"},
+                },
+            )
+        cause = exc_info.value.__cause__ or exc_info.value
+        assert isinstance(cause, ValueError) or "heavy" in str(exc_info.value).lower()
+        assert len(fake_client.fetch_calls) == before
+    finally:
+        await server.aclose()
+
+
+async def test_mcp_alias_resolution_does_not_open_unrelated_archive_dbs(
+    tmp_path, monkeypatch
+):
+    from legisbr.core import archive as archive_mod
+
+    await _build_archive(tmp_path)
+    opened: list[Path] = []
+    real_open = archive_mod._open_readonly
+
+    def spy_open(path: Path):
+        opened.append(path)
+        return real_open(path)
+
+    monkeypatch.setattr(archive_mod, "_open_readonly", spy_open)
+    server = create_mcp_server(tmp_path)
+
+    hits = _extract_tool_result(
+        await server.call_tool(
+            "search_legislation", {"query": "hidricos", "sources": ["sp"]}
+        )
+    )
+    assert len(hits) == 1
+    assert all(p.parent.name == "SAO_PAULO" for p in opened)
+    assert not any(p.parent.name == "ACRE" for p in opened)
+
+    opened.clear()
+    doc = _extract_tool_result(
+        await server.call_tool(
+            "get_legislation", {"source": "sp", "doc_id": hits[0]["id"]}
+        )
+    )
+    assert doc is not None
+    assert [p.parent.name for p in opened] == ["SAO_PAULO"]
+
+
+def test_mcp_allowed_domains_cover_all_registered_sources():
+    from urllib.parse import urlparse
+
+    from legisbr.mcp_server import _allowed_domains_for_source, _validate_live_url
+    from legisbr.registry import SCRAPERS
+
+    for spec in SCRAPERS:
+        domains = _allowed_domains_for_source(spec)
+        assert domains, f"Missing allowed domains for {spec.code}"
+        base_url = getattr(spec.load_cls(), "base_url", "")
+        parsed = urlparse(base_url)
+        assert parsed.scheme in {"http", "https"}
+        _validate_live_url(base_url, spec=spec, allowed_domains=domains)
 
 
 def test_mcp_missing_sdk_raises_clear_install_hint(monkeypatch, tmp_path):

@@ -11,6 +11,8 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
+from legisbr.core.query import Query
+from legisbr.core.scraper import BaseScraper
 from legisbr.scrapers.states.sc import SITUATIONS, TYPES, SantaCatarinaScraper
 
 
@@ -21,8 +23,8 @@ def _make_scraper(**kwargs) -> SantaCatarinaScraper:
 
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
-    EXPECTED_COUNT = 2
-    REQUIRED_KEYS = {"Legislativo", "Executivo"}
+    EXPECTED_COUNT = 3
+    REQUIRED_KEYS = {"Constituição Estadual", "Legislativo", "Executivo"}
     REQUIRE_INT_VALUES = False
 
 
@@ -229,3 +231,54 @@ class TestFetch:
         )
         assert doc.summary == "Institui o Dia Estadual do Garçom."
         assert doc.situation == "Revogada"
+
+    async def test_extracts_revocation_after_stripping_large_header_nav_chrome(self):
+        scraper = _make_scraper()
+        nav_items = "".join(f"<span>Item {i}</span>" for i in range(50))
+        html = (
+            f"<html><body><header><nav>{nav_items}</nav></header>"
+            "<main>"
+            "<p>Consolidada e Revogada pela Lei nº 16.719/2015</p>"
+            '<p class="ementa">Institui norma de teste.</p>'
+            "<p>Art. 1º Fica instituído o programa estadual de teste em Santa Catarina.</p>"
+            "</main></body></html>"
+        )
+        scraper.http.request.side_effect = [make_mock_response(html)]
+        doc = await scraper.fetch(
+            self._ref(
+                "LEI Nº 15.805, de 13 de abril de 2012",
+                "https://leis.alesc.sc.gov.br/ato-normativo/legislativo/1",
+            )
+        )
+        assert doc.situation == "Revogada"
+
+    async def test_search_refs_narrows_to_requested_type_only(self):
+        assert SantaCatarinaScraper.list_documents is BaseScraper.list_documents
+        scraper = _make_scraper(years=range(1946, 2026))
+        scraper.http.request.side_effect = [
+            make_mock_response(
+                _listing(_card("/ato-normativo/legislativo/1", "LEI Nº 1"))
+            ),
+            make_mock_response(_listing()),
+        ]
+        refs = [
+            ref
+            async for ref in scraper.search_refs(
+                Query(years=2024, type="Legislativo"), strict_native=True
+            )
+        ]
+        assert [ref["title"] for ref in refs] == ["LEI Nº 1"]
+        called_urls = [call.args[0] for call in scraper.http.request.await_args_list]
+        assert all("/legislativo?ano=2024" in url for url in called_urls)
+        assert not any("/executivo" in url for url in called_urls)
+
+        # Constitution is searchable by year 1989 with zero HTTP calls.
+        scraper.http.request.reset_mock()
+        const = [
+            ref
+            async for ref in scraper.search_refs(
+                Query(years=1989, type="Constituição Estadual"), strict_native=True
+            )
+        ]
+        assert len(const) == 1 and "52785" in const[0]["document_url"]
+        scraper.http.request.assert_not_awaited()

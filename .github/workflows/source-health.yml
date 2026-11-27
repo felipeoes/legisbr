@@ -32,6 +32,7 @@ jobs:
           from __future__ import annotations
 
           import asyncio
+          from datetime import UTC, datetime
           import os
           import time
 
@@ -44,8 +45,7 @@ jobs:
           async def check_one(client: legisbr.Client, info: object, gate: asyncio.Semaphore) -> dict[str, str]:
               name = info.name
               scope = getattr(info, "scope", "-")
-              years = getattr(info, "years", None)
-              target_year = years.stop - 1 if years else None
+              target_year = datetime.now(UTC).year
               started = time.perf_counter()
               async with gate:
                   try:
@@ -101,6 +101,7 @@ jobs:
                       s
                       for s in all_sources
                       if s.name.lower() in wanted
+                      or s.code.lower() in wanted
                       or any(a.lower() in wanted for a in getattr(s, "aliases", ()))
                   ]
               else:

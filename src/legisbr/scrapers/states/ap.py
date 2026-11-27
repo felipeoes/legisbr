@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup, Tag
 
 from legisbr.core.convert import calc_pages
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 TYPES = {
@@ -44,6 +45,7 @@ class AmapaAlapScraper(BaseScraper):
     name = "AMAPA"
     types = TYPES
     base_url = "https://elegis.al.ap.leg.br"
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def _listing_url(self, year: int, type_id: int, page: int) -> str:
         query = urlencode({"ano": year, "tipo_proposicao_id": type_id, "page": page})

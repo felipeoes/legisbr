@@ -6,7 +6,7 @@ import re
 from unittest.mock import AsyncMock, MagicMock
 
 from bs4 import BeautifulSoup
-from conftest import make_scraper
+from conftest import make_mock_response, make_scraper
 from parser_assertions import TypesConstantTests
 
 from legisbr.scrapers.environment.conama import TYPES, ConamaScraper
@@ -392,3 +392,22 @@ class TestCleanPdfMarkdown:
             "* Este texto não substitui a listagem original publicada pelo Decreto no 4.581, de 27 de janeiro de 2003."
         )
         assert scraper._clean_pdf_markdown(text) == text
+
+
+async def test_fetch_pdf_forwards_pdf_executor_and_pdf_workers(monkeypatch):
+    from legisbr.scrapers.environment import conama as conama_mod
+
+    scraper = _make_scraper(pdf_executor="thread", pdf_workers=3)
+    pdf_bytes = b"%PDF-1.4\nfake conama pdf"
+    scraper.http.request = AsyncMock(
+        return_value=make_mock_response(pdf_bytes, content_type="application/pdf")
+    )
+    fake_b2m = AsyncMock(
+        return_value="Art. 1º " + "Resolução CONAMA com texto válido. " * 10
+    )
+    monkeypatch.setattr(conama_mod, "bytes_to_markdown", fake_b2m)
+
+    doc = await scraper.fetch(_sample_row())
+    assert doc is not None
+    assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+    assert fake_b2m.await_args.kwargs["pdf_workers"] == 3

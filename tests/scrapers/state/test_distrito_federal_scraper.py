@@ -358,6 +358,112 @@ class TestHelpers:
             "**PORTARIA Nº 1, DE 2 DE JANEIRO DE 2012**"
         )
 
+    async def test_all_bytes_to_markdown_paths_forward_pdf_executor_and_workers(
+        self, monkeypatch
+    ):
+        from unittest.mock import AsyncMock
+
+        from conftest import make_mock_response
+
+        from legisbr.scrapers.states import df as df_mod
+
+        valid_md = (
+            "PORTARIA Nº 1, DE 2 DE JANEIRO DE 2012\n\n"
+            "Art. 1º Fixa normas de atendimento com texto suficiente para validação."
+        )
+        fake_b2m = AsyncMock(return_value=valid_md)
+        monkeypatch.setattr(df_mod, "bytes_to_markdown", fake_b2m)
+
+        scraper = _make_scraper(pdf_executor="thread", pdf_workers=3)
+        doc_info = {
+            "year": 2012,
+            "type": "Portaria",
+            "number": "1",
+            "title": "Portaria 1 de 02/01/2012",
+            "summary": "",
+            "situation": "Sem Revogação Expressa",
+            "ch_norma": "70283",
+            "document_url": "https://www.sinj.df.gov.br/sinj/Norma/70283/arquivo",
+        }
+
+        # 1. _try_text_endpoint (PDF)
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response(
+                b"%PDF-1.5 fake", content_type="application/pdf"
+            )
+        )
+        await scraper._try_text_endpoint(
+            dict(doc_info),
+            "https://www.sinj.df.gov.br/sinj/TextoArquivoNorma.aspx?id_file=abc",
+            doc_info["document_url"],
+            True,
+            "abc",
+        )
+        assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+        assert fake_b2m.await_args.kwargs["pdf_workers"] == 3
+
+        # 2. _try_raw_pdf_path
+        fake_b2m.reset_mock()
+        await scraper._try_raw_pdf_path(
+            dict(doc_info),
+            b"%PDF-1.5 fake",
+            "norma.pdf",
+            "application/pdf",
+            doc_info["document_url"],
+        )
+        assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+        assert fake_b2m.await_args.kwargs["pdf_workers"] == 3
+
+        # 3. _fetch_diary_pdf_fallback
+        fake_b2m.reset_mock()
+        scraper._fetch_details_json = AsyncMock(
+            return_value={
+                "fontes": [{"ar_diario": {"id_file": "diary-1"}, "nr_pagina": "1"}]
+            }
+        )
+        scraper._extract_pdf_pages = lambda pdf_bytes, pages: pdf_bytes
+        res = await scraper._fetch_diary_pdf_fallback(dict(doc_info))
+        assert res is not None
+        assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+        assert fake_b2m.await_args.kwargs["pdf_workers"] == 3
+
+        # 4. _try_raw_html_path generic fallback
+        fake_b2m.reset_mock()
+        scraper._fetch_diary_pdf_fallback = AsyncMock(return_value=None)
+        doc4 = await scraper._try_raw_html_path(
+            dict(doc_info),
+            b"<html><body><p>sem div_texto</p></body></html>",
+            "norma.html",
+            "text/html",
+            doc_info["document_url"],
+        )
+        assert doc4 is not None
+        assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+        assert fake_b2m.await_args.kwargs["pdf_workers"] == 3
+
+    async def test_fetch_chains_original_exception(self):
+        from unittest.mock import AsyncMock
+
+        import pytest
+
+        scraper = _make_scraper()
+        root_exc = RuntimeError("sinj boom")
+        scraper.http.request = AsyncMock(side_effect=root_exc)
+        with pytest.raises(ValueError, match="sinj boom") as exc_info:
+            await scraper.fetch(
+                {
+                    "year": 2012,
+                    "type": "Portaria",
+                    "number": "1",
+                    "title": "Portaria 1",
+                    "ch_norma": "70283",
+                    "file_id": "",
+                    "file_name": "",
+                    "document_url": "https://www.sinj.df.gov.br/sinj/Norma/70283/arquivo",
+                }
+            )
+        assert exc_info.value.__cause__ is root_exc
+
 
 class TestGetDocsLinks:
     def test_infer_norm_type_uses_title_prefix(self):

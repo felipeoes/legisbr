@@ -6,6 +6,7 @@ from urllib.parse import urlencode
 
 from legisbr.core.convert import clean_markdown
 from legisbr.core.document import Document
+from legisbr.core.query import SearchCapabilities
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 API_URL = "https://api.legislacao.se.gov.br/api/v1/public"
@@ -33,6 +34,7 @@ class SergipeLegsonScraper(BaseScraper):
     situations = SITUATIONS
     name = "SERGIPE"
     base_url = API_URL
+    capabilities = SearchCapabilities(native_year=True, native_type=True)
 
     def _clean_legison_markdown(self, text_markdown: str) -> str:
         """Remove LegisOn portal boilerplate from extracted text."""

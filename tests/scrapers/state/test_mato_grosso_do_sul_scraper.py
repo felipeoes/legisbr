@@ -301,3 +301,35 @@ class TestFetchDominoCleaning:
         assert "anexo.doc" in md
         # Strikethrough ordinals cleaned.
         assert "~~º~~" not in md
+
+    @pytest.mark.asyncio
+    async def test_hr_prefix_check_ignores_head_style_and_title_text(self):
+        scraper = _make_scraper()
+        html = (
+            "<html><head>"
+            "<title>Sistema de Legislação Estadual do Mato Grosso do Sul - Governo de MS</title>"
+            "<style>body { font-family: Tahoma, Arial, Helvetica, sans-serif; margin: 12px; }</style>"
+            "</head><body>"
+            "<hr>"
+            "<p>DECRETO Nº 13.442, DE 5 DE JUNHO DE 2012.</p>"
+            "<p>Art. 1º Fica instituída a política estadual de gestão documental no Estado.</p>"
+            "<hr>"
+            "<p>Art. 2º Este Decreto entra em vigor na data de sua publicação.</p>"
+            "</body></html>"
+        )
+        url = "https://aacpdappls.net.ms.gov.br/appls/legislacao/secoge/govato.nsf/0/abc?OpenDocument"
+        scraper.http.request = AsyncMock(return_value=make_mock_response(html))
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Decreto",
+                "title": "DECRETO Nº 13.442, DE 5 DE JUNHO DE 2012.",
+                "summary": "",
+                "situation": "Não consta",
+                "_html_link": url,
+            }
+        )
+        assert doc is not None
+        # Leading Domino <hr> stripped even though <head> had >50 chars; body <hr> preserved.
+        assert not doc.text_markdown.lstrip().startswith("---")
+        assert "---" in doc.text_markdown

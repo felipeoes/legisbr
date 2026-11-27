@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -346,3 +347,135 @@ class TestFetchFormattingAndEmenta:
         # Verify Art. 28 and Art. 29 are on separate lines.
         for line in doc.text_markdown.splitlines():
             assert not ("Art. 28." in line and "Art. 29." in line)
+
+    @pytest.mark.asyncio
+    async def test_fetch_empty_ementa_preserves_art1_when_summary_empty(self):
+        scraper = build_unit_scraper()
+        doc_html = """
+        <html><body>
+          <div class="texto">
+            <p class="ementa"></p>
+            <p>Art. 1º Fica instituído o programa federal de incentivo à pesquisa científica.</p>
+            <p class="ementa"></p>
+            <p>Artigo 2º O programa atenderá todas as regiões do país.</p>
+            <p class="ementa"></p>
+            <p>§ 1º O regulamento disporá sobre os critérios de seleção.</p>
+          </div>
+        </body></html>
+        """
+        text_url = "https://www2.camara.leg.br/legin/fed/lei/2012/lei-1-publicacaooriginal.html"
+        scraper.http.request = AsyncMock(return_value=make_mock_response(doc_html))
+        scraper._get_document_text_link = AsyncMock(
+            return_value={
+                "title": "Lei nº 1, de 2012",
+                "_norm_type": "Lei Ordinária",
+                "summary": "",
+                "situation": "Não consta revogação expressa",
+                "metadata_url": "https://www2.camara.leg.br/legin/fed/lei/2012/lei-1-norma.html",
+                "document_url": text_url,
+            }
+        )
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Lei Ordinária",
+                "title": "Lei nº 1, de 2012",
+                "summary": "",
+                "situation": "Não consta revogação expressa",
+                "metadata_url": "https://www2.camara.leg.br/legin/fed/lei/2012/lei-1-norma.html",
+            }
+        )
+        assert doc is not None
+        assert "Art. 1º Fica instituído" in doc.text_markdown
+        assert "Artigo 2º O programa" in doc.text_markdown
+        assert "§ 1º O regulamento" in doc.text_markdown
+
+    @pytest.mark.asyncio
+    async def test_fetch_pdf_downloads_once_and_forwards_pdf_executor(
+        self, monkeypatch
+    ):
+        from legisbr.scrapers.federal import camara as camara_mod
+
+        scraper = make_scraper(CamaraDepScraper, pdf_executor="thread", pdf_workers=2)
+        pdf_bytes = b"%PDF-1.4\nfake pdf payload"
+        text_url = "https://www2.camara.leg.br/legin/fed/lei/2012/lei-2.pdf"
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response(pdf_bytes, content_type="application/pdf")
+        )
+        scraper._get_document_text_link = AsyncMock(
+            return_value={
+                "title": "Lei nº 2, de 2012",
+                "_norm_type": "Lei Ordinária",
+                "summary": "Ementa teste.",
+                "situation": "Não consta revogação expressa",
+                "metadata_url": "https://www2.camara.leg.br/legin/fed/lei/2012/lei-2-norma.html",
+                "document_url": text_url,
+            }
+        )
+        fake_b2m = AsyncMock(
+            return_value="Art. 1º Texto da norma federal extraído do PDF com sucesso."
+        )
+        monkeypatch.setattr(camara_mod, "bytes_to_markdown", fake_b2m)
+
+        doc = await scraper.fetch(
+            {
+                "year": 2012,
+                "type": "Lei Ordinária",
+                "title": "Lei nº 2, de 2012",
+                "summary": "Ementa teste.",
+                "situation": "Não consta revogação expressa",
+                "metadata_url": "https://www2.camara.leg.br/legin/fed/lei/2012/lei-2-norma.html",
+            }
+        )
+        assert doc is not None
+        assert scraper.http.request.await_count == 1
+        assert doc.raw == pdf_bytes
+        assert doc.raw_ext == ".pdf"
+        assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+        assert fake_b2m.await_args.kwargs["pdf_workers"] == 2
+
+    @pytest.mark.asyncio
+    async def test_list_documents_reraises_cancelled_error_from_facets(self):
+        scraper = build_unit_scraper()
+        year_html = """
+        <html><body>
+          <div class="busca-info__resultado busca-info__resultado--informado">Foram encontrados 305</div>
+          <aside class="refine-busca">
+            <a href="https://www.camara.leg.br/legislacao/busca?tipo=Decreto&ano=2012">
+              Decreto 305 filtros encontrados
+            </a>
+          </aside>
+        </body></html>
+        """
+        scraper.http.request = AsyncMock(return_value=make_mock_response(year_html))
+        scraper._collect_slice = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            _ = [r async for r in scraper.list_documents(2012)]
+
+    @pytest.mark.asyncio
+    async def test_fetch_chains_original_exception_cause(self):
+        scraper = build_unit_scraper()
+        scraper._get_document_text_link = AsyncMock(
+            return_value={
+                "title": "Lei nº 3, de 2012",
+                "_norm_type": "Lei Ordinária",
+                "summary": "",
+                "situation": "Não consta revogação expressa",
+                "metadata_url": "https://www2.camara.leg.br/legin/fed/lei/2012/lei-3-norma.html",
+                "document_url": "https://www2.camara.leg.br/legin/fed/lei/2012/lei-3.html",
+            }
+        )
+        root_exc = RuntimeError("boom")
+        scraper.http.request = AsyncMock(side_effect=root_exc)
+        with pytest.raises(ValueError, match="boom") as exc_info:
+            await scraper.fetch(
+                {
+                    "year": 2012,
+                    "type": "Lei Ordinária",
+                    "title": "Lei nº 3, de 2012",
+                    "summary": "",
+                    "situation": "Não consta revogação expressa",
+                    "metadata_url": "https://www2.camara.leg.br/legin/fed/lei/2012/lei-3-norma.html",
+                }
+            )
+        assert exc_info.value.__cause__ is root_exc

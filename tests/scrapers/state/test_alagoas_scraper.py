@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import base64
+import io
+import zipfile
 from unittest.mock import AsyncMock, MagicMock
 
-from conftest import make_scraper
+import pytest
+from conftest import make_mock_json_response, make_scraper
 from parser_assertions import TypesConstantTests
 
 from legisbr.scrapers.states.al import TYPES, AlagoasSefazScraper
@@ -171,3 +174,79 @@ class TestDisclaimerLineRegex:
         ):
             cleaned = _DISCLAIMER_LINE_RE.sub("", f"Governador\n\n{line}").strip()
             assert cleaned == "Governador"
+
+
+class TestFetchPdfExecutorAndPre2000NonPdf:
+    @staticmethod
+    def _doc_payload(raw_bytes: bytes, filename: str = "decreto_001.pdf") -> dict:
+        return {
+            "arquivo": {
+                "base64": base64.b64encode(raw_bytes).decode(),
+                "nomeArquivo": filename,
+            }
+        }
+
+    async def test_forwards_pdf_executor_and_workers_for_post_and_pre_2000(
+        self, monkeypatch
+    ):
+        from legisbr.scrapers.states import al as al_mod
+
+        fake_b2m = AsyncMock(
+            return_value="Art. 1º " + "Texto da norma alagoana válido. " * 4
+        )
+        monkeypatch.setattr(al_mod, "bytes_to_markdown", fake_b2m)
+
+        scraper = _make_scraper(pdf_executor="thread", pdf_workers=2, ocr=None)
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_json_response(self._doc_payload(b"%PDF-1.4 fake"))
+        )
+
+        for year in (2020, 1995):
+            fake_b2m.reset_mock()
+            doc = await scraper.fetch(_sample_row(_year=year))
+            assert doc is not None
+            assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+            assert fake_b2m.await_args.kwargs["pdf_workers"] == 2
+
+    async def test_pre_2000_non_pdf_skips_ocr_pdf_and_uses_bytes_to_markdown(
+        self, monkeypatch
+    ):
+        from legisbr.scrapers.states import al as al_mod
+
+        fake_b2m = AsyncMock(
+            return_value="Art. 1º " + "Texto da norma alagoana em DOCX/HTML. " * 4
+        )
+        monkeypatch.setattr(al_mod, "bytes_to_markdown", fake_b2m)
+        ocr = AsyncMock()
+        ocr.pdf = AsyncMock(side_effect=AssertionError("ocr.pdf must not be called"))
+
+        # Test both HTML and DOCX disguised under a .pdf filename.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("word/document.xml", "<w:document/>")
+        cases = [
+            (b"<html><body><p>Art. 1o</p></body></html>", ".html"),
+            (buf.getvalue(), ".docx"),
+        ]
+        for raw_bytes, expected_ext in cases:
+            fake_b2m.reset_mock()
+            scraper = _make_scraper(pdf_executor="thread", pdf_workers=4, ocr=ocr)
+            scraper.http.request = AsyncMock(
+                return_value=make_mock_json_response(
+                    self._doc_payload(raw_bytes, filename="decreto_1995.pdf")
+                )
+            )
+            doc = await scraper.fetch(_sample_row(_year=1995))
+            assert doc is not None
+            assert doc.raw_ext == expected_ext
+            ocr.pdf.assert_not_awaited()
+            assert fake_b2m.await_args.kwargs["pdf_executor"] == "thread"
+            assert fake_b2m.await_args.kwargs["pdf_workers"] == 4
+
+    async def test_fetch_chains_original_exception(self):
+        scraper = _make_scraper()
+        root_exc = RuntimeError("decode boom")
+        scraper.http.request = AsyncMock(side_effect=root_exc)
+        with pytest.raises(ValueError, match="decode boom") as exc_info:
+            await scraper.fetch(_sample_row(_year=2020))
+        assert exc_info.value.__cause__ is root_exc

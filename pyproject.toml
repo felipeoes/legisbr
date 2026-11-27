@@ -61,7 +61,7 @@ ocr = [
 ]
 proxy = ["aiohttp-socks>=0.11.0"]
 parquet = ["pyarrow>=18.0"]
-mcp = ["mcp>=1.9"]
+mcp = ["mcp>=1.14"]
 all = ["legisbr[ocr,proxy,parquet,mcp]"]
 
 [dependency-groups]

@@ -13,6 +13,8 @@ from parser_assertions import (
     TypesConstantTests,
 )
 
+from legisbr.core.query import Query
+from legisbr.core.scraper import BaseScraper
 from legisbr.scrapers.states.to import SITUATIONS, TYPES, TocantinsScraper
 
 
@@ -27,8 +29,8 @@ def _make_scraper(**kwargs) -> TocantinsScraper:
 
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
-    EXPECTED_COUNT = 2
-    REQUIRED_KEYS = {"Lei Ordinária", "Lei Complementar"}
+    EXPECTED_COUNT = 3
+    REQUIRED_KEYS = {"Constituição Estadual", "Lei Ordinária", "Lei Complementar"}
     REQUIRE_INT_VALUES = False
 
 
@@ -174,53 +176,6 @@ class TestExtractTotalCount:
         assert result is None
 
 
-class TestHasTableArtifacts:
-    def test_empty_string_returns_false(self):
-        assert TocantinsScraper._has_table_artifacts("") is False
-
-    def test_text_without_pipes_returns_false(self):
-        assert TocantinsScraper._has_table_artifacts("Texto normal sem pipes.") is False
-
-    def test_many_pipes_returns_true(self):
-        text = "| a | b | c | d |" * 20
-        assert TocantinsScraper._has_table_artifacts(text) is True
-
-    def test_many_pipe_lines_returns_true(self):
-        text = "\n".join(["| cell | cell |"] * 10)
-        assert TocantinsScraper._has_table_artifacts(text) is True
-
-    def test_few_pipes_returns_false(self):
-        text = "| one |"
-        assert TocantinsScraper._has_table_artifacts(text) is False
-
-
-class TestNormalizeTableMarkdown:
-    def test_removes_separator_rows(self):
-        text = "| col1 | col2 |\n|---|---|\n| val1 | val2 |"
-        result = TocantinsScraper._normalize_table_markdown(text)
-        assert "---|---" not in result
-        assert "val1" in result
-
-    def test_collapses_multiple_newlines(self):
-        text = "Line 1.\n\n\n\n\nLine 2."
-        result = TocantinsScraper._normalize_table_markdown(text)
-        assert "\n\n\n" not in result
-
-    def test_non_pipe_lines_preserved(self):
-        text = "Normal text here.\nAnother line."
-        result = TocantinsScraper._normalize_table_markdown(text)
-        assert "Normal text here." in result
-        assert "Another line." in result
-
-    def test_pipe_cells_joined_with_spaces(self):
-        text = "| Alpha | Beta | Gamma |"
-        result = TocantinsScraper._normalize_table_markdown(text)
-        assert "Alpha" in result
-        assert "Beta" in result
-        assert "Gamma" in result
-        assert "|" not in result
-
-
 def _make_redesigned_listing_html(
     *,
     count_banner: str = "138 resultados Mostrando 1–20",
@@ -317,3 +272,90 @@ class TestRedesignedPortalParsing:
         assert doc is not None
         assert mock_b2m.await_args.kwargs["pdf_executor"] == "thread"
         assert mock_b2m.await_args.kwargs["pdf_workers"] == 3
+
+    @pytest.mark.asyncio
+    async def test_fetch_preserves_valid_gfm_tables_and_chains_exception(self):
+        scraper = _make_scraper()
+        scraper.http.request = AsyncMock(
+            return_value=make_mock_response(b"%PDF-1.5 fake")
+        )
+        rows = "\n".join(
+            f"| {i:02d} | Cargo Técnico Estadual {i} | R$ {i}.000,00 |"
+            for i in range(1, 15)
+        )
+        gfm_markdown = (
+            "LEI Nº 2.698, DE 21 DE DEZEMBRO DE 2012.\n\n"
+            "| ITEM | DESCRIÇÃO | VALOR |\n"
+            "| --- | --- | --- |\n"
+            f"{rows}\n"
+        )
+        with patch(
+            "legisbr.scrapers.states.to.bytes_to_markdown",
+            new=AsyncMock(return_value=gfm_markdown),
+        ):
+            doc = await scraper.fetch(
+                {
+                    "year": 2012,
+                    "type": "Lei Ordinária",
+                    "title": "Lei nº 2698 de 2012",
+                    "situation": "Não consta",
+                    "_pdf_link": "https://www.al.to.leg.br/arquivo/31849",
+                }
+            )
+        assert doc is not None
+        assert "| ITEM | DESCRIÇÃO | VALOR |" in doc.text_markdown
+        assert "| --- | --- | --- |" in doc.text_markdown
+        assert "| 14 | Cargo Técnico Estadual 14 | R$ 14.000,00 |" in doc.text_markdown
+
+        # Verify exception chaining (`raise ValueError(...) from e`).
+        orig = RuntimeError("pdf decode failure")
+        with (
+            patch(
+                "legisbr.scrapers.states.to.bytes_to_markdown",
+                new=AsyncMock(side_effect=orig),
+            ),
+            pytest.raises(ValueError, match="pdf decode failure") as exc_info,
+        ):
+            await scraper.fetch(
+                {
+                    "year": 2012,
+                    "type": "Lei Ordinária",
+                    "title": "Lei nº 2698 de 2012",
+                    "situation": "Não consta",
+                    "_pdf_link": "https://www.al.to.leg.br/arquivo/31849",
+                }
+            )
+        assert exc_info.value.__cause__ is orig
+
+    @pytest.mark.asyncio
+    async def test_search_refs_narrows_to_requested_type_only(self):
+        assert TocantinsScraper.list_documents is BaseScraper.list_documents
+        scraper = _make_scraper(years=range(1989, 2026))
+        html = _make_redesigned_listing_html(
+            count_banner="1 resultado Mostrando 1–1", nav_html=""
+        )
+        scraper.http.request = AsyncMock(return_value=make_mock_response(html))
+
+        refs = [
+            ref
+            async for ref in scraper.search_refs(
+                Query(years=2024, type="Lei Complementar"), strict_native=True
+            )
+        ]
+        assert len(refs) == 1
+        assert refs[0]["type"] == "Lei Complementar"
+        scraper.http.request.assert_awaited_once()
+        assert scraper.http.request.await_args.kwargs["data"]["documento.tipo"] == (
+            "complementar"
+        )
+
+        # Constitution is emitted once on narrow range and searchable at 1989 with 0 HTTP calls.
+        scraper.http.request.reset_mock()
+        const = [
+            ref
+            async for ref in scraper.search_refs(
+                Query(years=1989, type="Constituição Estadual"), strict_native=True
+            )
+        ]
+        assert len(const) == 1 and "documento_68367.PDF" in const[0]["document_url"]
+        scraper.http.request.assert_not_awaited()

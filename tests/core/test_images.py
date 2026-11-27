@@ -151,8 +151,18 @@ def test_image_cache_validates_positive_limits():
         b"<!DOCTYPE html><html><body>404 Not Found</body></html>" + b"x" * 200,
         b"  \n<html><head><title>Login</title></head></html>" + b"x" * 200,
         b'{"error": "not found"}' + b" " * 200,
+        b"BM25 plain text starting with BM" + b"x" * 200,
+        b"RIFF\x00\x00\x00\x00WAVEfmt " + b"x" * 200,
+        b'<?xml version="1.0"?><html><body><svg></svg></body></html>' + b" " * 200,
     ],
-    ids=["doctype-html", "html-tag", "json-error"],
+    ids=[
+        "doctype-html",
+        "html-tag",
+        "json-error",
+        "bm-plain-text",
+        "riff-wav-not-webp",
+        "xhtml-with-svg",
+    ],
 )
 async def test_non_image_payload_is_never_encoded_as_data_uri(payload):
     cache = ImageCache()
@@ -174,7 +184,10 @@ async def test_non_image_payload_is_never_encoded_as_data_uri(payload):
         (b"\xff\xd8\xff\xe0" + b"J" * 200, "image/jpeg"),
         (b"GIF89a" + b"G" * 200, "image/gif"),
         (b"RIFF\x00\x00\x00\x00WEBP" + b"W" * 200, "image/webp"),
-        (b"BM" + b"B" * 200, "image/bmp"),
+        (
+            b"BM\x36\x01\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00" + b"B" * 200,
+            "image/bmp",
+        ),
         (b"II*\x00" + b"T" * 200, "image/tiff"),
         (b"MM\x00*" + b"T" * 200, "image/tiff"),
         (
@@ -190,3 +203,59 @@ async def test_magic_bytes_override_misleading_url_extension(payload, expected_m
     result = await inline_images_in_html(html, "https://example.org", fetch)
 
     assert f"data:{expected_mime};base64," in result
+
+
+async def test_relative_src_starting_with_http_resolves_via_urljoin():
+    fetch = AsyncMock(return_value=_IMG_BYTES)
+    html = '<p><img src="http_logo.png"></p>'
+
+    result = await inline_images_in_html(
+        html, "https://example.org/docs/lei.html", fetch
+    )
+
+    fetch.assert_awaited_once_with("https://example.org/docs/http_logo.png")
+    assert "data:image/png;base64," in result
+
+
+async def test_inflight_cancels_only_when_last_waiter_cancels():
+    cache = ImageCache()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = False
+
+    async def slow_fetch(url: str) -> bytes:
+        nonlocal cancelled
+        started.set()
+        try:
+            await release.wait()
+            return _IMG_BYTES
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    # Two waiters: cancelling one keeps the fetch alive for the other.
+    t1 = asyncio.create_task(cache.get_or_fetch("https://x.org/a.png", slow_fetch))
+    t2 = asyncio.create_task(cache.get_or_fetch("https://x.org/a.png", slow_fetch))
+    await started.wait()
+    await asyncio.sleep(0)
+
+    t1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t1
+    assert cancelled is False
+    release.set()
+    assert await t2 is not None
+    assert "https://x.org/a.png" in cache
+
+    # Single waiter cancelled -> underlying fetch is cancelled and evicted from _inflight.
+    started.clear()
+    release.clear()
+    cancelled = False
+    solo = asyncio.create_task(cache.get_or_fetch("https://x.org/b.png", slow_fetch))
+    await started.wait()
+    await asyncio.sleep(0)
+    solo.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await solo
+    assert cancelled is True
+    assert "https://x.org/b.png" not in cache._inflight
