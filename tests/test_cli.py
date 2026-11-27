@@ -16,12 +16,15 @@ from test_store import document
 from legisbr import cli
 from legisbr.core.scraper import BaseScraper
 from legisbr.core.store import Store
-from legisbr.registry import SCRAPERS, ScraperSpec
+from legisbr.registry import SCRAPERS, ScraperSpec, Source
 from legisbr.settings import Settings
 
 
 def test_selection_aliases_and_unknown_names():
     assert cli.select_scrapers(["PB"])[0].name == "PARAIBA"
+    assert cli.select_scrapers(["federal"])[0].name == "LEGISLACAO_FEDERAL"
+    assert cli.select_scrapers(["camara"])[0].name == "LEGISLACAO_FEDERAL"
+    assert len(cli.select_scrapers(["federal", "Camara"])) == 1
     assert len(cli.select_scrapers(["Conama", "CONAMASCRAPER"])) == 1
     with pytest.raises(ValueError, match="Unknown"):
         cli.select_scrapers(["misspelled"])
@@ -70,14 +73,16 @@ def test_list_markdown_and_json_and_lazy_imports(capsys):
     assert cli.main(["list"]) == 0
     md_out = capsys.readouterr().out
     assert md_out.startswith("| Code | Name |")
-    assert "| camara | LEGISLACAO_FEDERAL |" in md_out
+    assert "| federal | LEGISLACAO_FEDERAL |" in md_out
+    assert "| Camara |" in md_out
     assert "| ac | ACRE |" in md_out
 
     assert cli.main(["list", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert len(payload) == 30
     codes = {row["code"] for row in payload}
-    assert {"camara", "conama", "icmbio", "sp", "ac", "ba", "pr"} <= codes
+    assert {"federal", "conama", "icmbio", "sp", "ac", "ba", "pr"} <= codes
+    assert "camara" not in codes
 
     # Fresh subprocess verifies `legisbr list` never imports heavy libraries.
     code = (
@@ -441,7 +446,7 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
     from legisbr.core.query import NormRef, Query, SearchResults
 
     fake_ref = NormRef.from_raw(
-        "camara",
+        Source.FEDERAL,
         {
             "year": 2021,
             "type": "Lei Ordinária",
@@ -489,7 +494,7 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
             [
                 "search",
                 "-s",
-                "Camara",
+                "federal",
                 "--year",
                 "2021",
                 "--number",
@@ -504,9 +509,11 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
     )
     out = json.loads(capsys.readouterr().out)
     assert len(out) == 1 and out[0]["title"] == "Lei nº 14.133/2021"
+    assert out[0]["source"] == "federal"
     # Metadata-only search never passes an OCR model to AsyncClient.
     assert created_clients[-1].kwargs["ocr"] is None
 
+    # Portal alias `-s Camara` also works cleanly.
     assert (
         await cli.async_main(
             ["search", "-s", "Camara", "--year", "2021", "--fetch"], settings=cfg

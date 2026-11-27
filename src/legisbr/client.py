@@ -38,7 +38,7 @@ from legisbr.core.query import (
 )
 from legisbr.core.scraper import BaseScraper, RunResult
 from legisbr.core.sink import DocumentSink, ErrorRecord, NullSink
-from legisbr.registry import ScraperSpec, SourceInfo, get_spec
+from legisbr.registry import ScraperSpec, SourceInfo, SourceInput, get_spec
 from legisbr.registry import sources as registry_sources
 
 logger = logging.getLogger(__name__)
@@ -277,7 +277,7 @@ class AsyncClient:
                     self._setup_done.add(spec.code)
         return scraper
 
-    def _bind_ref(self, source: str, raw: Mapping[str, Any]) -> NormRef:
+    def _bind_ref(self, source: SourceInput, raw: Mapping[str, Any]) -> NormRef:
         client_ref = weakref.ref(self)
         fallback_kwargs = dict(self._init_kwargs)
 
@@ -300,7 +300,7 @@ class AsyncClient:
         )
 
     def _bind_results(
-        self, source: str, query: Query, items: Sequence[NormRef]
+        self, source: SourceInput, query: Query, items: Sequence[NormRef]
     ) -> SearchResults:
         client_ref = weakref.ref(self)
         fallback_kwargs = dict(self._init_kwargs)
@@ -346,7 +346,7 @@ class AsyncClient:
 
     async def list_refs(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -406,7 +406,7 @@ class AsyncClient:
 
     async def search_refs(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -448,7 +448,7 @@ class AsyncClient:
 
     async def search(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -487,7 +487,7 @@ class AsyncClient:
 
     async def get(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -529,7 +529,7 @@ class AsyncClient:
         """Fetch and convert a typed ``NormRef`` using ``ref.source``."""
         return await self.fetch_ref(ref.source, ref)
 
-    async def fetch_ref(self, source: str, ref: DocRef | NormRef) -> Document:
+    async def fetch_ref(self, source: SourceInput, ref: DocRef | NormRef) -> Document:
         """Fetch and convert a single document reference, reusing cached scraper setup."""
         spec = get_spec(source)
         scraper = await self._get_scraper(
@@ -562,7 +562,7 @@ class AsyncClient:
         global_sem = asyncio.Semaphore(concurrency) if concurrency is not None else None
         source_sems: dict[str, asyncio.Semaphore] = {}
 
-        def _source_sem(source: str) -> asyncio.Semaphore:
+        def _source_sem(source: SourceInput) -> asyncio.Semaphore:
             spec = get_spec(source)
             sem = source_sems.get(spec.code)
             if sem is None:
@@ -599,7 +599,7 @@ class AsyncClient:
     @asynccontextmanager
     async def scrape(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -638,7 +638,7 @@ class AsyncClient:
 
     async def run(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -859,7 +859,7 @@ class Client:
 
     def get(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -885,7 +885,7 @@ class Client:
 
     def search(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -916,7 +916,7 @@ class Client:
         """Fetch and convert a typed ``NormRef`` using ``ref.source``."""
         return self._run_coro(lambda: self._async_client.fetch(ref))
 
-    def fetch_ref(self, source: str, ref: DocRef | NormRef) -> Document:
+    def fetch_ref(self, source: SourceInput, ref: DocRef | NormRef) -> Document:
         """Fetch and convert a single document reference, reusing cached scraper setup."""
         return self._run_coro(lambda: self._async_client.fetch_ref(source, ref))
 
@@ -933,7 +933,7 @@ class Client:
 
     def list_refs(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -961,7 +961,7 @@ class Client:
 
     def _open_scrape_stream(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -994,7 +994,7 @@ class Client:
 
     def scrape(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -1017,7 +1017,7 @@ class Client:
 
     def run(
         self,
-        source: str,
+        source: SourceInput,
         *,
         year: int | None = None,
         years: int | range | None = None,
@@ -1041,7 +1041,7 @@ class Client:
 
 
 def get(
-    source: str,
+    source: SourceInput,
     *,
     year: int | None = None,
     years: int | range | None = None,
@@ -1067,7 +1067,7 @@ def get(
 
 
 def search(
-    source: str,
+    source: SourceInput,
     *,
     year: int | None = None,
     years: int | range | None = None,
@@ -1095,7 +1095,7 @@ def search(
 
 
 def scrape(
-    source: str,
+    source: SourceInput,
     *,
     year: int | None = None,
     years: int | range | None = None,

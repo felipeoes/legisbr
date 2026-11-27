@@ -20,7 +20,7 @@ from legisbr.core.query import (
 )
 from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 from legisbr.core.store import Store
-from legisbr.registry import SCRAPERS, get_spec, sources
+from legisbr.registry import SCRAPERS, Source, get_spec, sources
 from legisbr.scrapers.federal.camara import CamaraDepScraper
 from legisbr.scrapers.states.ac import AcreLegisScraper
 from legisbr.scrapers.states.ce import CearaAleceScraper
@@ -494,15 +494,18 @@ def test_registry_capabilities_match_sources_and_stay_lazy():
             )
             assert isinstance(cls.types, dict) and bool(cls.types)
 
-    assert get_spec("camara").capabilities.native_text is True
-    assert get_spec("ac").capabilities.fast_catalog is True
-    assert get_spec("pr").capabilities.direct_id is True
-    assert get_spec("ce").capabilities.heavy_setup is True
+    assert get_spec(Source.FEDERAL).capabilities.native_text is True
+    assert get_spec("federal") is get_spec(Source.FEDERAL)
+    assert get_spec("camara") is get_spec(Source.FEDERAL)
+    assert get_spec(Source.AC).capabilities.fast_catalog is True
+    assert get_spec(Source.PR).capabilities.direct_id is True
+    assert get_spec(Source.CE).capabilities.heavy_setup is True
     assert len(SCRAPERS) == 30
 
     code = (
         "import sys, time, legisbr; "
         "t = time.perf_counter(); "
+        "assert legisbr.Source.PI == 'pi'; "
         "s = legisbr.sources(); "
         "dt = (time.perf_counter() - t) * 1000; "
         "assert len(s) == 30; "

@@ -16,7 +16,7 @@ from urllib.parse import urljoin, urlparse
 
 from legisbr.core.archive import AsyncArchiveIndex
 from legisbr.core.query import NormRef
-from legisbr.registry import ScraperSpec, get_spec
+from legisbr.registry import ScraperSpec, Source, get_spec
 from legisbr.registry import sources as registry_sources
 
 _LIVE_FETCH_DISABLED_MSG = (
@@ -37,42 +37,42 @@ _URI_SCHEME_RE = re.compile(
 
 # Official portal domain suffixes per registered source code (verified against each
 # scraper's base_url and live document links, preventing SSRF and cross-domain hijacks).
-_SOURCE_ALLOWED_DOMAINS: dict[str, tuple[str, ...]] = {
-    "camara": ("camara.leg.br",),
-    "conama": ("conama.mma.gov.br",),
-    "icmbio": (
+_SOURCE_ALLOWED_DOMAINS: dict[Source, tuple[str, ...]] = {
+    Source.FEDERAL: ("camara.leg.br",),
+    Source.CONAMA: ("conama.mma.gov.br",),
+    Source.ICMBIO: (
         "in.gov.br",
         "icmbio.gov.br",
         "app.powerbi.com",
         "wabi-brazil-south-api.analysis.windows.net",
     ),
-    "ac": ("legis.ac.gov.br",),
-    "al": ("sefaz.al.gov.br",),
-    "am": ("imprensaoficial.am.gov.br",),
-    "ap": ("al.ap.leg.br",),
-    "ba": ("legislabahia.ba.gov.br",),
-    "ce": ("al.ce.gov.br",),
-    "df": ("sinj.df.gov.br",),
-    "es": ("al.es.gov.br",),
-    "go": ("casacivil.go.gov.br",),
-    "ma": ("al.ma.leg.br",),
-    "ms": ("aacpdappls.net.ms.gov.br",),
-    "mt": ("al.mt.gov.br",),
-    "mg": ("almg.gov.br",),
-    "pa": ("alepa.pa.gov.br",),
-    "pb": ("al.pb.leg.br",),
-    "pr": ("legislacao.pr.gov.br",),
-    "pe": ("alepe.pe.gov.br",),
-    "pi": ("al.pi.leg.br",),
-    "rj": ("alerj.rj.gov.br",),
-    "rn": ("al.rn.leg.br",),
-    "rs": ("al.rs.gov.br",),
-    "ro": ("casacivil.ro.gov.br",),
-    "rr": ("al.rr.leg.br",),
-    "sc": ("alesc.sc.gov.br",),
-    "sp": ("al.sp.gov.br", "imprensaoficial.com.br"),
-    "se": ("legislacao.se.gov.br",),
-    "to": ("al.to.leg.br",),
+    Source.AC: ("legis.ac.gov.br",),
+    Source.AL: ("sefaz.al.gov.br",),
+    Source.AM: ("imprensaoficial.am.gov.br",),
+    Source.AP: ("al.ap.leg.br",),
+    Source.BA: ("legislabahia.ba.gov.br",),
+    Source.CE: ("al.ce.gov.br",),
+    Source.DF: ("sinj.df.gov.br",),
+    Source.ES: ("al.es.gov.br",),
+    Source.GO: ("casacivil.go.gov.br",),
+    Source.MA: ("al.ma.leg.br",),
+    Source.MS: ("aacpdappls.net.ms.gov.br",),
+    Source.MT: ("al.mt.gov.br",),
+    Source.MG: ("almg.gov.br",),
+    Source.PA: ("alepa.pa.gov.br",),
+    Source.PB: ("al.pb.leg.br",),
+    Source.PR: ("legislacao.pr.gov.br",),
+    Source.PE: ("alepe.pe.gov.br",),
+    Source.PI: ("al.pi.leg.br",),
+    Source.RJ: ("alerj.rj.gov.br",),
+    Source.RN: ("al.rn.leg.br",),
+    Source.RS: ("al.rs.gov.br",),
+    Source.RO: ("casacivil.ro.gov.br",),
+    Source.RR: ("al.rr.leg.br",),
+    Source.SC: ("alesc.sc.gov.br",),
+    Source.SP: ("al.sp.gov.br", "imprensaoficial.com.br"),
+    Source.SE: ("legislacao.se.gov.br",),
+    Source.TO: ("al.to.leg.br",),
 }
 
 

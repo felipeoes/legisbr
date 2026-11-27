@@ -204,7 +204,9 @@ async def test_mcp_server_registers_all_five_tools_and_lists_sources(tmp_path):
     assert by_code["sp"]["archived_documents"] == 2
     assert by_code["sp"]["min_year"] == 2024
     assert by_code["mg"]["archived_documents"] == 0
-    assert by_code["camara"]["capabilities"]["native_text"] is True
+    assert by_code["federal"]["capabilities"]["native_text"] is True
+    assert "Camara" in by_code["federal"]["aliases"]
+    assert "camara" not in by_code
 
 
 async def test_mcp_search_legislation_and_get_legislation_truncation(tmp_path):
@@ -314,7 +316,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
         await live_server.call_tool(
             "live_search_norms",
             {
-                "source": "camara",
+                "source": "federal",
                 "year": 2024,
                 "number": "123",
                 "doc_type": "Lei",
@@ -326,7 +328,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
     assert len(refs) == 20
     assert len(fake_client.search_calls) == 1
     assert fake_client.search_calls[0] == {
-        "source": "camara",
+        "source": "federal",
         "year": 2024,
         "number": "123",
         "type": "Lei",
@@ -344,7 +346,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
     fetched = _extract_tool_result(
         await live_server.call_tool(
             "live_fetch_norm",
-            {"source": "camara", "ref": refs[0], "max_chars": 80},
+            {"source": "federal", "ref": refs[0], "max_chars": 80},
         )
     )
     assert factory_calls == 1
@@ -362,7 +364,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
         await live_server.call_tool(
             "live_fetch_norm",
             {
-                "source": "camara",
+                "source": "federal",
                 "ref": {
                     "_ref_id": refs[0]["_ref_id"],
                     "document_url": "http://169.254.169.254/latest/meta-data/",
@@ -371,7 +373,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
         )
     assert len(fake_client.fetch_calls) == 1
 
-    # Server-issued opaque ref handle works cleanly without repeating ref URLs.
+    # Server-issued opaque ref handle works cleanly (including via portal alias "camara").
     by_handle = _extract_tool_result(
         await live_server.call_tool(
             "live_fetch_norm",
@@ -396,7 +398,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
         ("sp", {"document_url": "http://169.254.169.254/latest/meta-data/"}),
         ("sp", {"text_url": "http://169.254.169.254/latest/meta-data/"}),
         ("ac", {"document_url": "http://127.0.0.1:8080/internal"}),
-        ("camara", {"metadata_url": "http://localhost:9000/secret"}),
+        ("federal", {"metadata_url": "http://localhost:9000/secret"}),
         ("pb", {"_pdf_link": "http://10.0.0.1/admin.pdf"}),
         ("ba", {"_html_link": "http://172.16.0.1/secret.html"}),
         ("rj", {"_html_link": "http://192.168.1.1/router"}),
@@ -404,10 +406,11 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
         ("sp", {"document_url": "http://[fe80::1]/linklocal"}),
         ("sp", {"document_url": "http://[fc00::1]/ula"}),
         ("ac", {"document_url": "file:///etc/passwd"}),
-        ("camara", {"document_url": "gopher://127.0.0.1:6379/_INFO"}),
+        ("federal", {"document_url": "gopher://127.0.0.1:6379/_INFO"}),
         ("sp", {"document_url": "//169.254.169.254/latest/meta-data/"}),
-        ("camara", {"document_url": "https://www2.camara.leg.br@127.0.0.1/hijack"}),
-        ("camara", {"document_url": "https://evil.example.com/norma/1"}),
+        ("federal", {"document_url": "https://www2.camara.leg.br@127.0.0.1/hijack"}),
+        ("federal", {"document_url": "https://evil.example.com/norma/1"}),
+        ("federal", {"document_url": "https://www.al.sp.gov.br/norma/1"}),
         ("camara", {"document_url": "https://www.al.sp.gov.br/norma/1"}),
         ("sp", {"document_url": "https://www.al.sp.gov.br.evil.com/norma/1"}),
     ],
@@ -428,6 +431,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
         "userinfo-bypass",
         "external-domain",
         "cross-source-domain",
+        "cross-source-domain-camara-alias",
         "suffix-spoof",
     ],
 )
@@ -482,7 +486,7 @@ async def test_mcp_max_chars_clamping_and_heavy_setup_rejection(tmp_path):
                 await server.call_tool(
                     "live_fetch_norm",
                     {
-                        "source": "camara",
+                        "source": "federal",
                         "ref": {
                             "document_url": "https://www2.camara.leg.br/legin/fed/lei/2024/lei-1.html"
                         },
@@ -548,10 +552,16 @@ async def test_mcp_alias_resolution_does_not_open_unrelated_archive_dbs(
 def test_mcp_allowed_domains_cover_all_registered_sources():
     from urllib.parse import urlparse
 
-    from legisbr.mcp_server import _allowed_domains_for_source, _validate_live_url
-    from legisbr.registry import SCRAPERS
+    from legisbr.mcp_server import (
+        _SOURCE_ALLOWED_DOMAINS,
+        _allowed_domains_for_source,
+        _validate_live_url,
+    )
+    from legisbr.registry import SCRAPERS, Source
 
+    assert set(_SOURCE_ALLOWED_DOMAINS.keys()) == set(Source)
     for spec in SCRAPERS:
+        assert spec.code in _SOURCE_ALLOWED_DOMAINS
         domains = _allowed_domains_for_source(spec)
         assert domains, f"Missing allowed domains for {spec.code}"
         base_url = getattr(spec.load_cls(), "base_url", "")

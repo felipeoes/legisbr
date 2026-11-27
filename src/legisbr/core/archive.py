@@ -16,7 +16,7 @@ from legisbr.core.store import (
     _row_to_dict,
     _search_connection,
 )
-from legisbr.registry import get_spec
+from legisbr.registry import SourceInput, get_spec
 
 _IMMUTABLE_FALLBACK_CODES: frozenset[int] = frozenset(
     {
@@ -53,7 +53,7 @@ def _source_name_for(path: Path) -> str:
     return path.stem
 
 
-def _expand_source_aliases(sources: Sequence[str]) -> set[str]:
+def _expand_source_aliases(sources: Sequence[SourceInput]) -> set[str]:
     """Expand source names, codes, and aliases via the registry for archive filtering."""
     wanted: set[str] = set()
     for raw in sources:
@@ -150,7 +150,7 @@ class ArchiveIndex:
         discovered.update(self._explicit)
         return dict(sorted(discovered.items()))
 
-    def _resolve_source(self, source: str) -> tuple[str, Path] | None:
+    def _resolve_source(self, source: SourceInput) -> tuple[str, Path] | None:
         archives = self._discover()
         if source in archives:
             return source, archives[source]
@@ -208,7 +208,7 @@ class ArchiveIndex:
         self,
         text: str,
         *,
-        sources: Sequence[str] | None = None,
+        sources: Sequence[SourceInput] | None = None,
         year: int | None = None,
         doc_type: str | None = None,
         limit: int = 20,
@@ -242,8 +242,8 @@ class ArchiveIndex:
         hits.sort(key=lambda hit: (hit.rank, hit.source, hit.id))
         return hits[:limit]
 
-    def get(self, source: str, doc_id: int) -> dict[str, Any] | None:
-        """Fetch a single full document by archive source (name, code, or alias) and id."""
+    def get(self, source: SourceInput, doc_id: int) -> dict[str, Any] | None:
+        """Fetch a single full document by archive source (``Source``, name, code, or alias) and id."""
         resolved = self._resolve_source(source)
         if resolved is None:
             return None
@@ -366,7 +366,7 @@ class AsyncArchiveIndex:
         self,
         text: str,
         *,
-        sources: Sequence[str] | None = None,
+        sources: Sequence[SourceInput] | None = None,
         year: int | None = None,
         doc_type: str | None = None,
         limit: int = 20,
@@ -381,8 +381,8 @@ class AsyncArchiveIndex:
             limit=limit,
         )
 
-    async def get(self, source: str, doc_id: int) -> dict[str, Any] | None:
-        """Fetch a single full document by archive source (name, code, or alias) and id."""
+    async def get(self, source: SourceInput, doc_id: int) -> dict[str, Any] | None:
+        """Fetch a single full document by archive source (``Source``, name, code, or alias) and id."""
         return await asyncio.to_thread(self._index.get, source, doc_id)
 
     async def stats(self) -> list[dict[str, Any]]:
@@ -394,7 +394,7 @@ def query(
     text: str,
     *,
     data_dir: str | Path = "outputs/legislation",
-    sources: Sequence[str] | None = None,
+    sources: Sequence[SourceInput] | None = None,
     year: int | None = None,
     doc_type: str | None = None,
     limit: int = 20,

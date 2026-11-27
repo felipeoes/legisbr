@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -13,16 +14,24 @@ import legisbr
 from legisbr.core.http import HttpClient
 from legisbr.core.scraper import BaseScraper
 from legisbr.core.store import Store
-from legisbr.registry import SCRAPERS, SourceInfo, get_spec, sources
+from legisbr.registry import SCRAPERS, Source, SourceInfo, get_spec, sources
 from legisbr.settings import Settings, export_dotenv
 
 
 def test_all_30_sources_resolve_cleanly_and_match_classes():
     assert len(SCRAPERS) == 30
+    assert len(Source) == 30
+    assert {spec.code for spec in SCRAPERS} == set(Source)
+    assert all(isinstance(spec.code, Source) for spec in SCRAPERS)
+
     all_infos = sources()
     assert len(all_infos) == 30
     assert all(isinstance(info, SourceInfo) for info in all_infos)
-    assert {spec.code for spec in SCRAPERS if spec.insecure_tls} == {"ac", "ba"}
+    assert all(isinstance(info.code, Source) for info in all_infos)
+    assert {spec.code for spec in SCRAPERS if spec.insecure_tls} == {
+        Source.AC,
+        Source.BA,
+    }
 
     seen_names: set[str] = set()
     for spec in SCRAPERS:
@@ -31,6 +40,7 @@ def test_all_30_sources_resolve_cleanly_and_match_classes():
         assert not overlap, f"Duplicate names for {spec.name}: {overlap}"
         seen_names |= spec.names
 
+        assert get_spec(spec.code) is spec
         for alias in spec.names:
             assert get_spec(alias) is spec
 
@@ -41,16 +51,32 @@ def test_all_30_sources_resolve_cleanly_and_match_classes():
         assert cls.capabilities == spec.capabilities
 
 
+def test_source_enum_federal_canonical_and_camara_alias():
+    assert legisbr.Source is Source
+    assert Source.FEDERAL == "federal"
+    assert str(Source.FEDERAL) == "federal"
+    assert json.dumps({"code": Source.FEDERAL}) == '{"code": "federal"}'
+
+    federal = get_spec(Source.FEDERAL)
+    assert federal is get_spec("federal")
+    assert federal is get_spec("camara")
+    assert federal is get_spec("Camara")
+    assert federal is get_spec("LEGISLACAO_FEDERAL")
+    assert federal.code is Source.FEDERAL
+    assert "Camara" in federal.aliases
+    assert federal.info().code is Source.FEDERAL
+
+
 def test_database_path_routes_by_scope(tmp_path: Path):
-    camara = get_spec("camara")
-    conama = get_spec("conama")
-    acre = get_spec("ac")
+    federal = get_spec(Source.FEDERAL)
+    conama = get_spec(Source.CONAMA)
+    acre = get_spec(Source.AC)
 
     base = tmp_path / "base"
     states = tmp_path / "states"
     env = tmp_path / "env"
 
-    assert camara.database_path(base, state_dir=states, specific_dir=env) == (
+    assert federal.database_path(base, state_dir=states, specific_dir=env) == (
         base / "LEGISLACAO_FEDERAL" / "documents.db"
     )
     assert conama.database_path(base, state_dir=states, specific_dir=env) == (
@@ -65,6 +91,8 @@ def test_database_path_routes_by_scope(tmp_path: Path):
 def test_import_legisbr_and_sources_is_lazy_without_heavy_imports():
     code = (
         "import sys, threading, legisbr; "
+        "assert legisbr.Source.PI == 'pi'; "
+        "assert legisbr.Source.FEDERAL == 'federal'; "
         "infos = legisbr.sources(); "
         "assert len(infos) == 30; "
         "assert threading.active_count() == 1; "
@@ -78,6 +106,7 @@ def test_import_legisbr_and_sources_is_lazy_without_heavy_imports():
 
 
 def test_pep562_lazy_exports():
+    assert legisbr.Source is Source
     assert legisbr.Store is Store
     assert legisbr.Settings is Settings
     assert legisbr.Client is not legisbr.AsyncClient

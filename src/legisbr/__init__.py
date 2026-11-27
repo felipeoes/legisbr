@@ -6,7 +6,7 @@ import logging
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
-from legisbr.registry import SourceInfo, sources
+from legisbr.registry import Source, SourceInfo, sources
 
 __version__ = "0.1.0"
 __all__ = [
@@ -28,6 +28,7 @@ __all__ = [
     "SearchHit",
     "SearchResults",
     "Settings",
+    "Source",
     "SourceInfo",
     "Store",
     "UnsupportedQueryError",

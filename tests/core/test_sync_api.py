@@ -28,7 +28,7 @@ from legisbr.core.query import (
 )
 from legisbr.core.scraper import BaseScraper, RunResult
 from legisbr.core.store import SearchHit, Store
-from legisbr.registry import ScraperSpec
+from legisbr.registry import ScraperSpec, Source
 
 
 def _make_fake_spec(
@@ -72,7 +72,7 @@ def test_query_number_coercion_year_filter_and_rank_best_ref():
 
     # Exact primary number in title beats a decree merely citing 14.133.
     decree_citing = NormRef.from_raw(
-        "camara",
+        Source.FEDERAL,
         {
             "year": 2021,
             "type": "Decreto",
@@ -81,7 +81,7 @@ def test_query_number_coercion_year_filter_and_rank_best_ref():
         },
     )
     exact_law = NormRef.from_raw(
-        "camara",
+        Source.FEDERAL,
         {
             "year": 2021,
             "type": "Lei Ordinária",
@@ -93,7 +93,7 @@ def test_query_number_coercion_year_filter_and_rank_best_ref():
 
     # Explicit `number` field exact match beats non-matching explicit `number`.
     explicit_other = NormRef.from_raw(
-        "sp",
+        Source.SP,
         {
             "year": 2021,
             "number": "10818",
@@ -102,7 +102,7 @@ def test_query_number_coercion_year_filter_and_rank_best_ref():
         },
     )
     explicit_exact = NormRef.from_raw(
-        "sp",
+        Source.SP,
         {
             "year": 2021,
             "number": "14133/2021",
@@ -133,8 +133,8 @@ def test_norm_ref_and_search_results_ergonomics():
         "id": 999,
         "_internal": "hidden",
     }
-    ref = NormRef.from_raw("camara", raw)
-    assert ref.source == "camara"
+    ref = NormRef.from_raw(Source.FEDERAL, raw)
+    assert ref.source == Source.FEDERAL == "federal"
     assert ref.year == 2021
     assert ref.number == "14133"
     assert ref.url == "https://www2.camara.leg.br/lei-14133"
@@ -143,14 +143,14 @@ def test_norm_ref_and_search_results_ergonomics():
     assert ref.raw_payload()["_internal"] == "hidden"
 
     as_dict = ref.to_dict()
-    assert as_dict["source"] == "camara"
+    assert as_dict["source"] == "federal"
     assert as_dict["url"] == "https://www2.camara.leg.br/lei-14133"
     assert as_dict["number"] == "14133"
     assert as_dict["extra"] == {"id": 999}
     assert "_internal" not in as_dict
 
     q = Query(years=2021, number=14133)
-    results = SearchResults(source="camara", query=q, items=(ref,))
+    results = SearchResults(source=Source.FEDERAL, query=q, items=(ref,))
     assert len(results) == 1
     assert bool(results) is True
     assert results.first is ref
@@ -161,7 +161,7 @@ def test_norm_ref_and_search_results_ergonomics():
     assert isinstance(sliced, SearchResults) and list(sliced) == [ref]
     assert results.to_dicts() == [as_dict]
 
-    empty = SearchResults(source="camara", query=q, items=())
+    empty = SearchResults(source=Source.FEDERAL, query=q, items=())
     assert len(empty) == 0
     assert bool(empty) is False
     assert empty.first is None
@@ -492,34 +492,51 @@ async def test_store_for_source_export_archive_and_sync_async_archive_index(
             )
         )
 
-    # 1. Sync ArchiveIndex resolves source aliases ("SP", "ac", "SaoPaulo").
+    # 1. Sync ArchiveIndex resolves Source enum and string aliases (Source.SP, "ac", "SaoPaulo").
     with ArchiveIndex(data_dir) as idx:
-        sp_hits = idx.query("mobilidade", sources=["SP"])
+        sp_hits = idx.query("mobilidade", sources=[Source.SP])
         assert len(sp_hits) == 1 and sp_hits[0].source == "SAO_PAULO"
 
-        ac_hits = idx.query("mobilidade", sources=["ac"])
+        ac_hits = idx.query("mobilidade", sources=[Source.AC])
         assert len(ac_hits) == 1 and ac_hits[0].source == "ACRE"
 
-        got_sp = idx.get("SP", sp_hits[0].id)
+        got_sp = idx.get(Source.SP, sp_hits[0].id)
         assert got_sp is not None and got_sp["title"] == "Decreto Paulista nº 2/2024"
 
         got_alias = idx.get("SaoPaulo", sp_hits[0].id)
         assert got_alias is not None and got_alias["id"] == sp_hits[0].id
 
-    # 2. AsyncArchiveIndex parity.
+    # 2. AsyncArchiveIndex parity with Source enum.
     async with AsyncArchiveIndex(data_dir) as aidx:
-        ahits = await aidx.query("mobilidade", sources=["SP"])
+        ahits = await aidx.query("mobilidade", sources=[Source.SP])
         assert len(ahits) == 1 and ahits[0].source == "SAO_PAULO"
-        adoc = await aidx.get("SP", ahits[0].id)
+        adoc = await aidx.get(Source.SP, ahits[0].id)
         assert adoc is not None and adoc["title"] == "Decreto Paulista nº 2/2024"
         asources = await aidx.sources()
         assert {s["source"] for s in asources} == {"ACRE", "SAO_PAULO"}
         astats = await aidx.stats()
         assert len(astats) == 2
 
-    # 3. Top-level sync legisbr.query().
+    # 3. Top-level sync legisbr.query() with Source enum and strings.
     top_hits = legisbr.query("mobilidade", data_dir=data_dir, year=2024)
     assert len(top_hits) == 2
+    enum_hits = legisbr.query(
+        "mobilidade", data_dir=data_dir, sources=[Source.SP, Source.AC], year=2024
+    )
+    assert len(enum_hits) == 2
+    sp_only_hits = legisbr.query(
+        "mobilidade", data_dir=data_dir, sources=[Source.SP], year=2024
+    )
+    assert len(sp_only_hits) == 1 and sp_only_hits[0].source == "SAO_PAULO"
+
+    # Store.for_source accepts Source enum directly (including Source.FEDERAL).
+    fed_store = Store.for_source(Source.FEDERAL, data_dir, save_raw=False)
+    assert Path(fed_store.path) == data_dir / "LEGISLACAO_FEDERAL" / "documents.db"
+    assert fed_store.source == "LEGISLACAO_FEDERAL"
+    assert (
+        Path(Store.for_source(Source.SP, data_dir, save_raw=False).path)
+        == data_dir / "SAO_PAULO" / "documents.db"
+    )
 
     # 4. Top-level sync legisbr.export() auto-infers format & single_file from suffix + year filter!
     pq_out = legisbr.export(
@@ -605,6 +622,8 @@ def test_cold_startup_zero_heavy_imports_zero_threads_and_all_exports():
     code = (
         "import sys, threading, time, legisbr; "
         "t = time.perf_counter(); "
+        "assert legisbr.Source.PI == 'pi'; "
+        "assert legisbr.Source.FEDERAL == 'federal'; "
         "infos = legisbr.sources(); "
         "dt = (time.perf_counter() - t) * 1000; "
         "assert len(infos) == 30; "
@@ -626,6 +645,94 @@ def test_cold_startup_zero_heavy_imports_zero_threads_and_all_exports():
     # Every public symbol in __all__ resolves cleanly.
     for name in legisbr.__all__:
         assert hasattr(legisbr, name), f"Missing export {name!r}"
+
+
+async def test_source_enum_end_to_end_across_client_and_async_client(
+    tmp_path: Path, monkeypatch
+):
+    class FederalFakeScraper(BaseScraper):
+        name = "LEGISLACAO_FEDERAL"
+        base_url = "https://www.camara.leg.br/legislacao/"
+        capabilities = SearchCapabilities(
+            native_year=True, native_type=True, native_number=True, native_text=True
+        )
+
+        async def list_documents(self, year):
+            yield {
+                "year": year,
+                "type": "Lei Ordinária",
+                "title": f"Lei nº 14.133/{year}",
+                "document_url": f"https://www2.camara.leg.br/legin/fed/lei/{year}/lei-14133.html",
+            }
+
+        async def fetch(self, ref):
+            return document(
+                year=ref["year"],
+                type=ref["type"],
+                title=ref["title"],
+                document_url=ref["document_url"],
+            )
+
+    fed_spec = ScraperSpec(
+        name="LEGISLACAO_FEDERAL",
+        cls_name="FederalFakeScraper",
+        cls_path=f"{FederalFakeScraper.__module__}:FederalFakeScraper",
+        code=Source.FEDERAL,
+        scope="federal",
+        aliases=("Camara",),
+        start_year=1808,
+        capabilities=FederalFakeScraper.capabilities,
+        _cls=FederalFakeScraper,
+    )
+    monkeypatch.setattr(
+        "legisbr.client.get_spec",
+        lambda name: (
+            fed_spec
+            if str(name).strip().lower() in {"federal", "camara", "legislacao_federal"}
+            else (_ for _ in ()).throw(ValueError(f"Unexpected source {name!r}"))
+        ),
+    )
+
+    # AsyncClient accepts Source.FEDERAL and returns NormRef/SearchResults with code=Source.FEDERAL.
+    async with AsyncClient() as aclient:
+        ares = await aclient.search(Source.FEDERAL, year=2021, number=14133)
+        assert ares.source is Source.FEDERAL
+        assert ares.source == "federal"
+        assert ares.one().source is Source.FEDERAL
+        adoc = await aclient.get(Source.FEDERAL, year=2021, number=14133)
+        assert adoc.title == "Lei nº 14.133/2021"
+        alisted = [ref async for ref in aclient.list_refs(Source.FEDERAL, year=2021)]
+        assert len(alisted) == 1 and alisted[0].source is Source.FEDERAL
+        async with aclient.scrape(Source.FEDERAL, year=2021, limit=1) as stream:
+            ascraped = [d async for d in stream]
+        assert len(ascraped) == 1
+
+    # Sync Client + top-level helpers accept Source.FEDERAL, "federal", and "camara" interchangeably.
+    store = Store.for_source(Source.FEDERAL, tmp_path, save_raw=False, fts=True)
+    with Client() as client:
+        sres = client.search(Source.FEDERAL, year=2021, number=14133)
+        assert sres.source is Source.FEDERAL
+        assert sres.one().source is Source.FEDERAL
+        assert (
+            client.get(Source.FEDERAL, year=2021, number=14133).title
+            == "Lei nº 14.133/2021"
+        )
+        assert (
+            client.get("federal", year=2021, number=14133).title == "Lei nº 14.133/2021"
+        )
+        assert (
+            client.get("camara", year=2021, number=14133).title == "Lei nº 14.133/2021"
+        )
+        run_res = client.run(Source.FEDERAL, year=2021, limit=1, store=store)
+        assert run_res.docs == 1
+
+    assert (
+        legisbr.get(Source.FEDERAL, year=2021, number=14133).title
+        == "Lei nº 14.133/2021"
+    )
+    assert len(list(legisbr.scrape(Source.FEDERAL, year=2021, limit=1))) == 1
+    hits = legisbr.query("administracao", data_dir=tmp_path, sources=[Source.FEDERAL])
+    assert len(hits) == 1 and hits[0].source == "LEGISLACAO_FEDERAL"
 
 
 def test_document_stream_error_propagation_and_cleanup(monkeypatch):

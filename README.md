@@ -17,9 +17,10 @@
 
 ```python
 import legisbr
+from legisbr import Source
 
-# Fetch a specific law directly as clean Markdown
-law = legisbr.get("camara", number=14133, year=2021)
+# Fetch a specific law directly as clean Markdown (string codes like "federal" also work)
+law = legisbr.get(Source.FEDERAL, number=14133, year=2021)
 print(law.title)
 print(law.text_markdown[:500])
 ```
@@ -46,20 +47,23 @@ uvx legisbr list            # or try the CLI without installing
 
 ## Python API
 
+Every API accepts either a typed `legisbr.Source` enum member (`Source.FEDERAL`, `Source.SP`, `Source.PI`, `Source.AC`, …) for IDE autocomplete and static type safety, or any case-insensitive string code/alias (`"federal"`, `"camara"`, `"sp"`).
+
 ### 1. Fetch & Search Norms
 
 Fetch a single norm directly with `legisbr.get()`, or run a metadata search with `legisbr.search()` to inspect typed `NormRef` results before downloading full text:
 
 ```python
 import legisbr
+from legisbr import Source
 
 # Fetch a specific law directly (raises NormNotFoundError if nothing matches)
-law = legisbr.get("camara", number=14133, year=2021)
+law = legisbr.get(Source.FEDERAL, number=14133, year=2021)
 print(law.title, law.document_url)
 
 # Metadata-only search → typed SearchResults[NormRef]
 results = legisbr.search(
-    "camara", year=2024, type="Lei Ordinária", text="energia", limit=5
+    Source.FEDERAL, year=2024, type="Lei Ordinária", text="energia", limit=5
 )
 for ref in results:
     print(ref.year, ref.title, ref.url)
@@ -73,8 +77,8 @@ Reuse connections, rate-limit pacing, and portal setup across multiple calls wit
 
 ```python
 with legisbr.Client() as client:
-    law = client.get("camara", number=14133, year=2021)
-    results = client.search("sp", year=2024, type="Lei", limit=5)
+    law = client.get(Source.FEDERAL, number=14133, year=2021)
+    results = client.search(Source.SP, year=2024, type="Lei", limit=5)
     docs = results.fetch()
 ```
 
@@ -84,24 +88,29 @@ Stream validated `Document` objects without writing to disk, or archive into SQL
 
 ```python
 import legisbr
+from legisbr import Source
 
 # Zero-disk streaming
-for doc in legisbr.scrape("SP", year=2024, limit=10):
+for doc in legisbr.scrape(Source.SP, year=2024, limit=10):
     print(doc.year, doc.title, len(doc.text_markdown))
 
 # Archive into SQLite (save_raw=False cuts disk usage by 80-95%)
 with legisbr.Client() as client:
     store = legisbr.Store.for_source(
-        "SP", "outputs/legislation", save_raw=False, fts=True
+        Source.SP, "outputs/legislation", save_raw=False, fts=True
     )
-    result = client.run("SP", year=2024, limit=25, store=store)
+    result = client.run(Source.SP, year=2024, limit=25, store=store)
 
 # Export to Parquet (or .jsonl / .json — inferred from extension)
 legisbr.export("outputs/legislation/SAO_PAULO/documents.db", "sp_2024.parquet")
 
 # Instant diacritic-insensitive BM25 search across local archives
 for hit in legisbr.query(
-    "administracao publica", data_dir="outputs/legislation", year=2024, limit=5
+    "administracao publica",
+    data_dir="outputs/legislation",
+    sources=[Source.FEDERAL, Source.SP],
+    year=2024,
+    limit=5,
 ):
     print(f"[{hit.source}] {hit.title}: {hit.snippet}")
 ```
@@ -115,15 +124,16 @@ For repeated local lookups (`sources()`, `query()`, `get(source, doc_id)`, `stat
 ```python
 import asyncio
 import legisbr
+from legisbr import Source
 
 
 async def main() -> None:
     async with legisbr.AsyncClient() as client:
-        law = await client.get("camara", number=14133, year=2021)
-        results = await client.search("sp", year=2024, type="Lei", limit=5)
+        law = await client.get(Source.FEDERAL, number=14133, year=2021)
+        results = await client.search(Source.SP, year=2024, type="Lei", limit=5)
         docs = await client.fetch_many(results)
 
-        async with client.scrape("AC", year=2024, limit=10) as stream:
+        async with client.scrape(Source.AC, year=2024, limit=10) as stream:
             async for doc in stream:
                 print(doc.title)
 
@@ -139,9 +149,10 @@ Install the `ocr` extra (`uv add "legisbr[ocr]"` or `pip install "legisbr[ocr]"`
 
 ```python
 import legisbr
+from legisbr import Source
 
 with legisbr.Client(ocr="anthropic:claude-haiku-5-5") as client:
-    for doc in client.scrape("PI", year=2024, limit=5):
+    for doc in client.scrape(Source.PI, year=2024, limit=5):
         print(doc.title, len(doc.text_markdown))
 ```
 
@@ -153,7 +164,7 @@ Both `legisbr` and `python -m legisbr` expose the full CLI (source names, codes,
 
 ```bash
 legisbr list                                                                  # list all 30 sources & capabilities
-legisbr search -s Camara --year 2021 --number 14133 --strict-native --fetch   # live search + fetch Markdown
+legisbr search -s federal --year 2021 --number 14133 --strict-native --fetch  # live search + fetch Markdown
 legisbr run -s SP --year 2024 --no-raw --fts                                  # scrape into SQLite + FTS5
 legisbr query "licenciamento ambiental" --year 2024 --limit 20                # instant local BM25 search
 legisbr export -s SP --format parquet --single-file --out exports/sp.parquet  # export to ZSTD Parquet
@@ -206,14 +217,14 @@ For remote HTTP clients, pass `--transport streamable-http --host 127.0.0.1 --po
 
 ## Sources
 
-**30 Official Portals:** 1 Federal · 27 States · 2 Environmental — *official portals only, never `leisestaduais.com.br`.*
+**30 Official Portals:** 1 Federal · 27 States · 2 Environmental — *official portals only, never `leisestaduais.com.br`.* Each code corresponds to a typed `legisbr.Source` enum member (e.g., `Source.FEDERAL`, `Source.SP`, `Source.PI`); string codes and aliases work interchangeably.
 
 <details>
 <summary>View all 30 sources &amp; native search capabilities</summary>
 
 | Code | Archive Name | Scope | Start | PDF | OCR | Native Search | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `camara` | `LEGISLACAO_FEDERAL` | Federal | 1808 | Yes | No | year, type, number, text, situation | 100 rps |
+| `federal` | `LEGISLACAO_FEDERAL` | Federal | 1808 | Yes | No | year, type, number, text, situation | 100 rps; Câmara dos Deputados portal (alias: `Camara`) |
 | `conama` | `CONAMA` | Environment | 1984 | Yes | Yes | year | — |
 | `icmbio` | `ICMBIO` | Environment | 2016 | Yes | No | client filter | cookies disabled |
 | `ac` | `ACRE` | State | 1963 | No | No | fast catalog | `insecure_tls` (missing intermediate CA) |

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 from legisbr.core.query import SearchCapabilities
 
@@ -14,6 +15,46 @@ if TYPE_CHECKING:
     from legisbr.core.scraper import BaseScraper
 
 Scope = Literal["federal", "state", "environment"]
+
+
+class Source(StrEnum):
+    """Canonical legislation source codes (30 official Brazilian portals)."""
+
+    # Federal & environmental
+    FEDERAL = "federal"
+    CONAMA = "conama"
+    ICMBIO = "icmbio"
+    # Brazilian states (27 UFs in alphabetical order)
+    AC = "ac"
+    AL = "al"
+    AM = "am"
+    AP = "ap"
+    BA = "ba"
+    CE = "ce"
+    DF = "df"
+    ES = "es"
+    GO = "go"
+    MA = "ma"
+    MG = "mg"
+    MS = "ms"
+    MT = "mt"
+    PA = "pa"
+    PB = "pb"
+    PE = "pe"
+    PI = "pi"
+    PR = "pr"
+    RJ = "rj"
+    RN = "rn"
+    RO = "ro"
+    RR = "rr"
+    RS = "rs"
+    SC = "sc"
+    SE = "se"
+    SP = "sp"
+    TO = "to"
+
+
+SourceInput: TypeAlias = Source | str
 
 _CLS_CACHE: dict[tuple[str, str], type[BaseScraper]] = {}
 
@@ -28,7 +69,7 @@ _CAP_SAPL = SearchCapabilities(
 class SourceInfo:
     """Lightweight, import-free metadata describing a registered source."""
 
-    code: str
+    code: Source
     name: str
     scope: Scope
     aliases: tuple[str, ...]
@@ -45,7 +86,7 @@ class ScraperSpec:
     name: str
     cls_name: str
     cls_path: str
-    code: str
+    code: Source
     scope: Scope
     aliases: tuple[str, ...]
     start_year: int
@@ -125,16 +166,17 @@ class ScraperSpec:
 def _state(
     name: str,
     cls_name: str,
-    code: str,
+    code: SourceInput,
     aliases: tuple[str, ...],
     start_year: int,
     **kwargs: Any,
 ) -> ScraperSpec:
+    source_code = Source(code)
     return ScraperSpec(
         name=name,
         cls_name=cls_name,
-        cls_path=f"legisbr.scrapers.states.{code}:{cls_name}",
-        code=code,
+        cls_path=f"legisbr.scrapers.states.{source_code}:{cls_name}",
+        code=source_code,
         scope="state",
         aliases=aliases,
         start_year=start_year,
@@ -147,9 +189,9 @@ SCRAPERS: list[ScraperSpec] = [
         name="LEGISLACAO_FEDERAL",
         cls_name="CamaraDepScraper",
         cls_path="legisbr.scrapers.federal.camara:CamaraDepScraper",
-        code="camara",
+        code=Source.FEDERAL,
         scope="federal",
-        aliases=(),
+        aliases=("Camara",),
         start_year=1808,
         uses_pdf=True,
         rps=100,
@@ -165,7 +207,7 @@ SCRAPERS: list[ScraperSpec] = [
         name="CONAMA",
         cls_name="ConamaScraper",
         cls_path="legisbr.scrapers.environment.conama:ConamaScraper",
-        code="conama",
+        code=Source.CONAMA,
         scope="environment",
         aliases=(),
         start_year=1984,
@@ -177,7 +219,7 @@ SCRAPERS: list[ScraperSpec] = [
         name="ICMBIO",
         cls_name="ICMBioScraper",
         cls_path="legisbr.scrapers.environment.icmbio:ICMBioScraper",
-        code="icmbio",
+        code=Source.ICMBIO,
         scope="environment",
         aliases=(),
         start_year=2016,
@@ -188,7 +230,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "ACRE",
         "AcreLegisScraper",
-        "ac",
+        Source.AC,
         ("Acre", "AC"),
         1963,
         # legis.ac.gov.br omits its intermediate CA certificate on OpenSSL 3.0 & 3.5.
@@ -198,7 +240,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "ALAGOAS",
         "AlagoasSefazScraper",
-        "al",
+        Source.AL,
         ("Alagoas", "AL"),
         1942,
         uses_pdf=True,
@@ -209,7 +251,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "AMAZONAS",
         "LegislaAMScraper",
-        "am",
+        Source.AM,
         ("Amazonas", "AM"),
         1956,
         rps=50,
@@ -218,7 +260,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "AMAPA",
         "AmapaAlapScraper",
-        "ap",
+        Source.AP,
         ("Amapa", "AP"),
         1991,
         capabilities=_CAP_YEAR_TYPE,
@@ -226,7 +268,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "BAHIA",
         "BahiaLegislaScraper",
-        "ba",
+        Source.BA,
         ("Bahia", "BA"),
         1891,
         max_retries=7,
@@ -239,7 +281,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "CEARA",
         "CearaAleceScraper",
-        "ce",
+        Source.CE,
         ("Ceara", "CE"),
         1968,
         needs_ocr=True,
@@ -250,7 +292,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "DISTRITO_FEDERAL",
         "DFSinjScraper",
-        "df",
+        Source.DF,
         ("DF", "DistritoFederal"),
         1922,
         uses_pdf=True,
@@ -262,7 +304,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "ESPIRITO_SANTO",
         "ESAlesScraper",
-        "es",
+        Source.ES,
         ("ES", "EspiritoSanto"),
         1958,
         uses_pdf=True,
@@ -273,7 +315,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "GOIAS",
         "LegislaGoias",
-        "go",
+        Source.GO,
         ("Goias", "GO"),
         1887,
         uses_pdf=True,
@@ -284,7 +326,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "MARANHAO",
         "MaranhaoAlemaScraper",
-        "ma",
+        Source.MA,
         ("Maranhao", "MA"),
         1906,
         uses_pdf=True,
@@ -294,7 +336,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "MATO_GROSSO_DO_SUL",
         "MSAlemsScraper",
-        "ms",
+        Source.MS,
         ("MS", "MatoGrossoDoSul"),
         1979,
         capabilities=_CAP_YEAR_TYPE,
@@ -302,7 +344,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "MATO_GROSSO",
         "MTAlmtScraper",
-        "mt",
+        Source.MT,
         ("MT", "MatoGrosso"),
         2017,
         needs_ocr=True,
@@ -312,7 +354,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "MINAS_GERAIS",
         "MGAlmgScraper",
-        "mg",
+        Source.MG,
         ("MG", "MinasGerais"),
         1831,
         uses_pdf=True,
@@ -324,7 +366,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "PARA",
         "ParaAlepaScraper",
-        "pa",
+        Source.PA,
         ("Para", "PA"),
         1990,
         uses_pdf=True,
@@ -335,7 +377,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "PARAIBA",
         "ParaibaAlpbScraper",
-        "pb",
+        Source.PB,
         ("Paraiba", "PB"),
         1924,
         uses_pdf=True,
@@ -347,7 +389,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "PARANA",
         "ParanaCVScraper",
-        "pr",
+        Source.PR,
         ("Parana", "PR"),
         2025,
         # The site allows ~20 requests per rolling minute per IP; beyond that it answers
@@ -377,7 +419,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "PERNAMBUCO",
         "PernambucoAlepeScraper",
-        "pe",
+        Source.PE,
         ("Pernambuco", "PE"),
         1835,
         capabilities=_CAP_YEAR_ONLY,
@@ -385,7 +427,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "PIAUI",
         "PiauiAlepiScraper",
-        "pi",
+        Source.PI,
         ("Piaui", "PI"),
         1922,
         uses_pdf=True,
@@ -396,7 +438,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "RIO_DE_JANEIRO",
         "RJAlerjScraper",
-        "rj",
+        Source.RJ,
         ("RJ", "RioDeJaneiro"),
         1891,
         max_retries=3,
@@ -405,7 +447,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "RIO_GRANDE_DO_NORTE",
         "RNAlrnScraper",
-        "rn",
+        Source.RN,
         ("RN", "RioGrandeDoNorte"),
         1971,
         uses_pdf=True,
@@ -415,7 +457,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "RIO_GRANDE_DO_SUL",
         "RSAlrsScraper",
-        "rs",
+        Source.RS,
         ("RS", "RioGrandeDoSul"),
         1830,
         uses_pdf=True,
@@ -425,7 +467,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "RONDONIA",
         "RondoniaCotelScraper",
-        "ro",
+        Source.RO,
         ("Rondonia", "RO"),
         1981,
         uses_pdf=True,
@@ -435,7 +477,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "RORAIMA",
         "RoraimaAlerScraper",
-        "rr",
+        Source.RR,
         ("Roraima", "RR"),
         1991,
         uses_pdf=True,
@@ -445,7 +487,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "SANTA_CATARINA",
         "SantaCatarinaScraper",
-        "sc",
+        Source.SC,
         ("SC",),
         1946,
         capabilities=_CAP_YEAR_TYPE,
@@ -453,7 +495,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "SAO_PAULO",
         "SaoPauloAlespScraper",
-        "sp",
+        Source.SP,
         ("SaoPaulo", "SP"),
         1835,
         uses_pdf=True,
@@ -468,7 +510,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "SERGIPE",
         "SergipeLegsonScraper",
-        "se",
+        Source.SE,
         ("Sergipe", "SE"),
         1940,
         uses_pdf=True,
@@ -478,7 +520,7 @@ SCRAPERS: list[ScraperSpec] = [
     _state(
         "TOCANTINS",
         "TocantinsScraper",
-        "to",
+        Source.TO,
         ("TO",),
         1989,
         uses_pdf=True,
@@ -493,8 +535,8 @@ def sources() -> list[SourceInfo]:
     return [spec.info() for spec in SCRAPERS]
 
 
-def get_spec(name: str) -> ScraperSpec:
-    """Resolve a single source by code, name, class name, or alias."""
+def get_spec(name: SourceInput) -> ScraperSpec:
+    """Resolve a single source by ``Source`` enum, code, name, class name, or alias."""
     key = name.strip().lower()
     for spec in SCRAPERS:
         if key in spec.names:

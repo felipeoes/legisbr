@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from legisbr.core.document import Document, clean_title
 from legisbr.core.sink import ErrorRecord
+from legisbr.registry import SourceInput, get_spec
 
 _T = TypeVar("_T")
 
@@ -248,16 +249,14 @@ class Store:
     @classmethod
     def for_source(
         cls,
-        source: str,
+        source: SourceInput,
         data_dir: str | Path = "outputs/legislation",
         *,
         save_raw: bool = True,
         fts: bool = False,
         low_memory: bool = False,
     ) -> Store:
-        """Build a ``Store`` for *source* (code, name, or alias) under *data_dir*."""
-        from legisbr.registry import get_spec
-
+        """Build a ``Store`` for *source* (``Source`` enum, code, name, or alias) under *data_dir*."""
         spec = get_spec(source)
         return cls(
             spec.database_path(Path(data_dir)),

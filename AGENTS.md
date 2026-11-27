@@ -8,7 +8,7 @@ Python 3.11+ (tested on 3.11–3.14). Install with `uv sync --all-extras --group
 uv run legisbr list
 uv run legisbr run -s Acre Conama --year 2024 --no-raw --fts
 uv run legisbr run --all --jobs 16
-uv run legisbr search -s Camara --year 2021 --number 14133 --strict-native --fetch
+uv run legisbr search -s federal --year 2021 --number 14133 --strict-native --fetch
 uv run legisbr index --all
 uv run legisbr query "licenciamento ambiental" --year 2024
 uv run legisbr stats
@@ -27,8 +27,8 @@ uv run pre-commit run --all-files
 
 ## Architecture
 
-- `src/legisbr/__init__.py`: PEP 562 lazy top-level exports (`Client`, `AsyncClient`, `DocumentStream`, `get`, `search`, `scrape`, `query`, `export`, `sources`, `Document`, `NormRef`, `SearchResults`, `SearchHit`, `SourceInfo`, `Query`, `SearchCapabilities`, `NormNotFoundError`, `UnsupportedQueryError`, `ErrorRecord`, `RunResult`, `Store`, `ArchiveIndex`, `AsyncArchiveIndex`, `DocumentSink`, `NullSink`, `OCR`, `Settings`) + `logging.NullHandler()`. `import legisbr; legisbr.sources()` must stay <30 ms with zero heavy imports (`aiohttp`, `bs4`, `pydantic`, `pypdfium2`, `pdfplumber`, `PIL`, `pypdf`) and zero background threads started at import time.
-- `src/legisbr/registry.py`: Lazy `ScraperSpec` entries (`_state()` for state scrapers) for all 30 sources storing string `cls_path`/`cls_name`, codes, aliases, start years, rates, workers, OCR/proxy settings, `insecure_tls` (`ac` and `ba` only), and `SearchCapabilities`.
+- `src/legisbr/__init__.py`: Eager stdlib-only exports (`Source`, `SourceInfo`, `sources`) plus PEP 562 lazy top-level exports (`Client`, `AsyncClient`, `DocumentStream`, `get`, `search`, `scrape`, `query`, `export`, `Document`, `NormRef`, `SearchResults`, `SearchHit`, `Query`, `SearchCapabilities`, `NormNotFoundError`, `UnsupportedQueryError`, `ErrorRecord`, `RunResult`, `Store`, `ArchiveIndex`, `AsyncArchiveIndex`, `DocumentSink`, `NullSink`, `OCR`, `Settings`) + `logging.NullHandler()`. `import legisbr; legisbr.Source.PI; legisbr.sources()` must stay <30 ms with zero heavy imports (`aiohttp`, `bs4`, `pydantic`, `pypdfium2`, `pdfplumber`, `PIL`, `pypdf`) and zero background threads started at import time.
+- `src/legisbr/registry.py`: Stdlib `Source(StrEnum)` with all 30 canonical source codes (`federal`, `conama`, `icmbio`, and all 27 UFs `ac`..`to`), `SourceInput = Source | str`, and lazy `ScraperSpec` entries (`_state()` for state scrapers) storing string `cls_path`/`cls_name`, typed `Source` codes (`LEGISLACAO_FEDERAL` uses `Source.FEDERAL` / `"federal"` with `aliases=("Camara",)`), aliases, start years, rates, workers, OCR/proxy settings, `insecure_tls` (`ac` and `ba` only), and `SearchCapabilities`.
 - `src/legisbr/settings.py`: Frozen `Settings` dataclass loaded explicitly via `Settings.from_env(env_file=...)` using a stdlib `.env` parser (never mutates `os.environ` or runs at import time).
 - `src/legisbr/_sync.py`: Stdlib-only sync bridge (`_LoopThread` lazy private daemon thread + dedicated `asyncio` event loop that is Jupyter/running-loop safe with `KeyboardInterrupt` cancellation and clean teardown; `DocumentStream` bounded-queue iterator with backpressure, `with` / `close()` / `weakref.finalize` cleanup, and optional owned temporary `Client` teardown).
 - `src/legisbr/client.py`: Synchronous `Client` (wrapping `AsyncClient` + `_LoopThread`) and native async `AsyncClient` managing per-source `HttpClient` pools (enforcing `spec.rps` unless `force_rps=True`, `verify_ssl=not spec.insecure_tls`), cached `setup()` scrapers, `low_memory` preset, `get()`, `search()`, `search_refs()`, `fetch()`, `fetch_many()`, `fetch_ref()`, `list_refs()`, PEP 789-safe `scrape()`, and `run()` (returning `RunResult`), plus top-level synchronous `get()`, `search()`, and `scrape()`.
