@@ -1090,7 +1090,6 @@ dependencies = [
     { name = "html-to-markdown" },
     { name = "lxml" },
     { name = "mammoth" },
-    { name = "pdfplumber" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "pypdf" },
@@ -1138,7 +1137,6 @@ requires-dist = [
     { name = "lxml", specifier = ">=6.0" },
     { name = "mammoth", specifier = ">=1.13.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.14" },
-    { name = "pdfplumber", specifier = ">=0.11" },
     { name = "pillow", specifier = ">=11.0" },
     { name = "pyarrow", marker = "extra == 'parquet'", specifier = ">=18.0" },
     { name = "pydantic", specifier = ">=2.10" },
@@ -1535,33 +1533,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/65/ee/299d360cdc32edc7d2cf530f3accf79c4fca01e96ffc950d8a52213bd8e4/packaging-26.0.tar.gz", hash = "sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4", size = 143416, upload-time = "2026-01-21T20:50:39.064Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/packaging-26.0-py3-none-any.whl", hash = "sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529", size = 74366, upload-time = "2026-01-21T20:50:37.788Z" },
-]
-
-[[package]]
-name = "pdfminer-six"
-version = "20260107"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "charset-normalizer" },
-    { name = "cryptography" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/34/a4/5cec1112009f0439a5ca6afa8ace321f0ab2f48da3255b7a1c8953014670/pdfminer_six-20260107.tar.gz", hash = "sha256:96bfd431e3577a55a0efd25676968ca4ce8fd5b53f14565f85716ff363889602", size = 8512094, upload-time = "2026-01-07T13:29:12.937Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/8b/28c4eaec9d6b036a52cb44720408f26b1a143ca9bce76cc19e8f5de00ab4/pdfminer_six-20260107-py3-none-any.whl", hash = "sha256:366585ba97e80dffa8f00cebe303d2f381884d8637af4ce422f1df3ef38111a9", size = 6592252, upload-time = "2026-01-07T13:29:10.742Z" },
-]
-
-[[package]]
-name = "pdfplumber"
-version = "0.11.11"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pdfminer-six" },
-    { name = "pillow" },
-    { name = "pypdfium2" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/96/22/6673c563900b0c69d48d4e7f57db296900375b3c2de776e7527a8fae3735/pdfplumber-0.11.11.tar.gz", hash = "sha256:e38eb7d3a4c822f93067cf6694dcec655f032619f4bd41ebd34f882fc22fbb87", size = 104005, upload-time = "2026-11-21T02:22:00.645Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/25/27/0b40cb094fe566445fef76ff5c458b63031baf17c246b40b116d472ce2ac/pdfplumber-0.11.11-py3-none-any.whl", hash = "sha256:81fd7c493ac69a0645a68da49320e4e2cace05d99824439accc7b5b3d955f3bc", size = 60456, upload-time = "2026-11-21T02:21:59.498Z" },
 ]
 
 [[package]]

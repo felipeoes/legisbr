@@ -89,7 +89,7 @@ def test_list_markdown_and_json_and_lazy_imports(capsys):
         "import sys, time; from legisbr.cli import main; "
         "t = time.perf_counter(); rc = main(['list']); dt = (time.perf_counter() - t) * 1000; "
         "assert rc == 0; "
-        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pypdfium2', 'pdfplumber', 'PIL', 'pypdf', 'pyarrow', 'mcp'); "
+        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pypdfium2', 'PIL', 'pypdf', 'pyarrow', 'mcp'); "
         "loaded = [m for m in forbidden if m in sys.modules]; "
         "assert not loaded, f'Heavy modules imported: {loaded}'; "
         "print(f'OK {dt:.1f}ms')"

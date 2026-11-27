@@ -1,4 +1,4 @@
-"""Unit tests for the permissive ``pypdfium2`` + ``pypdf`` + ``pdfplumber`` + ``pillow`` PDF engine."""
+"""Unit tests for the permissive ``pypdfium2`` + ``pypdf`` + ``pillow`` PDF engine."""
 
 from __future__ import annotations
 
@@ -252,6 +252,231 @@ class TestTablesWatermarksAndSelectiveOCR:
         assert "| 2010 em diante | <250 cc | 2,5 | 600 |" in md
         # In-place order: intro -> table -> outro
         assert md.find("Art. 1º") < md.find("| Ano |") < md.find("Art. 2º")
+
+    async def test_filled_thin_bar_word_table_and_merged_cells_extracted(self):
+        import io as _io
+
+        import pypdf
+        from pdf_fixtures import _escape_pdf_text, _make_helvetica_font
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+        # Word/LibreOffice style table drawn with 0.5pt filled rectangles (`re f`)
+        # and CONAMA-style row spans (missing internal horizontal rule in col 0).
+        writer = pypdf.PdfWriter()
+        page = writer.add_blank_page(width=595, height=842)
+        font_ref = writer._add_object(_make_helvetica_font())
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+        )
+        xs = [50.0, 180.0, 310.0, 420.0, 530.0]
+        ys = [700.0, 676.0, 652.0, 628.0, 604.0]  # 4 rows: header, single, 2-row span
+        ops: list[bytes] = [
+            b"BT /F1 11 Tf 50 760 Td ("
+            + _escape_pdf_text(
+                "Art. 1º Ficam estabelecidos os limites de emissão previstos na Tabela 3:"
+            )
+            + b") Tj ET",
+            b"0 0 0 rg",
+        ]
+        # Horizontal thin filled bars (skip col 0 on y=628 -> row-span for "2003 a 2009")
+        for ri, y in enumerate(ys):
+            if ri == 3:
+                ops.append(f"{xs[1]} {y} {xs[-1] - xs[1]} 0.6 re f".encode("ascii"))
+            else:
+                ops.append(f"{xs[0]} {y} {xs[-1] - xs[0]} 0.6 re f".encode("ascii"))
+        # Vertical thin filled bars
+        for x in xs:
+            ops.append(f"{x} {ys[-1]} 0.6 {ys[0] - ys[-1]} re f".encode("ascii"))
+
+        cells_text = [
+            (0, 0, "Ano"),
+            (0, 1, "Cilindrada"),
+            (0, 2, "CO (%)"),
+            (0, 3, "HC (ppm)"),
+            (1, 0, "Até 2002"),
+            (1, 1, "Todas"),
+            (1, 2, "7,0"),
+            (1, 3, "3.500"),
+            # Row-span cell spanning rows 2..3 in col 0
+            (2, 0, "2003 a 2009"),
+            (2, 1, "<250 cc"),
+            (2, 2, "6,0"),
+            (2, 3, "2.000"),
+            (3, 1, ">=250 cc"),
+            (3, 2, "4,5"),
+            (3, 3, "2.000"),
+        ]
+        for r, c, txt in cells_text:
+            cy = (
+                ys[r] - 16.0 if not (r == 2 and c == 0) else (ys[2] + ys[4]) * 0.5 - 4.0
+            )
+            cx = xs[c] + 6.0
+            ops.append(
+                b"BT /F1 10 Tf "
+                + f"{cx} {cy} Td (".encode("ascii")
+                + _escape_pdf_text(txt)
+                + b") Tj ET"
+            )
+        ops.append(
+            b"BT /F1 11 Tf 50 540 Td ("
+            + _escape_pdf_text("Art. 2º Esta Resolução entra em vigor nesta data.")
+            + b") Tj ET"
+        )
+        stream = DecodedStreamObject()
+        stream.set_data(b"\n".join(ops))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+        buf = _io.BytesIO()
+        writer.write(buf)
+
+        md = await pdf_to_markdown(buf.getvalue(), executor="thread")
+        assert "| Ano | Cilindrada | CO (%) | HC (ppm) |" in md
+        assert "| Até 2002 | Todas | 7,0 | 3.500 |" in md
+        assert "| 2003 a 2009 | <250 cc | 6,0 | 2.000 |" in md
+        assert "|  | >=250 cc | 4,5 | 2.000 |" in md
+        assert md.find("Art. 1º") < md.find("| Ano |") < md.find("Art. 2º")
+
+    async def test_rejects_one_column_bordered_boxes_and_fim_do_documento(self):
+        import io as _io
+
+        import pypdf
+        from pdf_fixtures import _escape_pdf_text, _make_helvetica_font
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+        writer = pypdf.PdfWriter()
+        page = writer.add_blank_page(width=595, height=842)
+        font_ref = writer._add_object(_make_helvetica_font())
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+        )
+        ops: list[bytes] = [
+            b"BT /F1 11 Tf 50 780 Td ("
+            + _escape_pdf_text(
+                "Art. 1º Fica criada a estrutura administrativa prevista nesta Lei Estadual."
+            )
+            + b") Tj ET",
+            b"0.8 w",
+        ]
+        # 1-column 3-row bordered text box (like PA 355 p.1) -> must be rejected as non-table!
+        for r in range(4):
+            y = 720.0 - r * 24.0
+            ops.append(f"80 {y} m 520 {y} l S".encode("ascii"))
+        ops.append(b"80 720 m 80 648 l S")
+        ops.append(b"520 720 m 520 648 l S")
+        for r, txt in enumerate(
+            ["CARGO DE PROVIMENTO EFETIVO", "NÍVEL SUPERIOR", "VINCULAÇÃO"]
+        ):
+            ops.append(
+                b"BT /F1 10 Tf "
+                + f"90 {704 - r * 24} Td (".encode("ascii")
+                + _escape_pdf_text(txt)
+                + b") Tj ET"
+            )
+        # 2x2 FIM DO DOCUMENTO footer box -> must also be rejected!
+        for y in (200.0, 176.0, 152.0):
+            ops.append(f"80 {y} m 520 {y} l S".encode("ascii"))
+        for x in (80.0, 300.0, 520.0):
+            ops.append(f"{x} 200 m {x} 152 l S".encode("ascii"))
+        ops.append(b"BT /F1 10 Tf 90 184 Td (FIM DO DOCUMENTO) Tj ET")
+        ops.append(b"BT /F1 10 Tf 310 184 Td (OK) Tj ET")
+        ops.append(b"BT /F1 10 Tf 90 160 Td (PAG 1) Tj ET")
+        ops.append(b"BT /F1 10 Tf 310 160 Td (OFICIAL) Tj ET")
+
+        stream = DecodedStreamObject()
+        stream.set_data(b"\n".join(ops))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+        buf = _io.BytesIO()
+        writer.write(buf)
+
+        md = await pdf_to_markdown(buf.getvalue(), executor="thread")
+        assert "| --- |" not in md
+        assert "CARGO DE PROVIMENTO EFETIVO" in md
+
+    async def test_rotated_90_landscape_table_and_visual_lines(self):
+        import io as _io
+
+        import pypdf
+        from pdf_fixtures import _escape_pdf_text, _make_helvetica_font
+        from pypdf.generic import (
+            DecodedStreamObject,
+            DictionaryObject,
+            NameObject,
+            NumberObject,
+        )
+
+        # Build a 595x842 page with /Rotate 90 (visual 842x595 landscape) containing a 3x3
+        # salary table drawn in unrotated user space, matching RN 82 landscape pages.
+        writer = pypdf.PdfWriter()
+        page = writer.add_blank_page(width=595, height=842)
+        page[NameObject("/Rotate")] = NumberObject(90)
+        font_ref = writer._add_object(_make_helvetica_font())
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+        )
+        # In rot=90 CW: visual x = uy, visual top = ux.
+        # Put intro line at ux=60 (visual top=60), table at ux in [120, 210], uy in [80, 500].
+        uxs = [120.0, 150.0, 180.0, 210.0]  # 3 visual rows (top=120..210)
+        uys = [80.0, 220.0, 360.0, 500.0]  # 3 visual cols (x=80..500)
+        ops: list[bytes] = [
+            # Text rotated 90 deg CCW in user space (0 1 -1 0 ux uy Tm) reads LTR visually!
+            b"BT /F1 11 Tf 0 1 -1 0 70 80 Tm ("
+            + _escape_pdf_text(
+                "Art. 1º Tabela remuneratória em página paisagem rotacionada de 90 graus."
+            )
+            + b") Tj ET",
+            b"0.8 w",
+        ]
+        for ux in uxs:
+            ops.append(f"{ux} {uys[0]} m {ux} {uys[-1]} l S".encode("ascii"))
+        for uy in uys:
+            ops.append(f"{uxs[0]} {uy} m {uxs[-1]} {uy} l S".encode("ascii"))
+        grid = [
+            ["Nivel", "Vencimento", "Gratificacao"],
+            ["I", "1.200,00", "450,00"],
+            ["II", "1.450,00", "550,00"],
+        ]
+        for r, row in enumerate(grid):
+            ux = uxs[r] + 18.0
+            for c, val in enumerate(row):
+                uy = uys[c] + 10.0
+                ops.append(
+                    b"BT /F1 10 Tf 0 1 -1 0 "
+                    + f"{ux} {uy} Tm (".encode("ascii")
+                    + _escape_pdf_text(val)
+                    + b") Tj ET"
+                )
+        stream = DecodedStreamObject()
+        stream.set_data(b"\n".join(ops))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+        buf = _io.BytesIO()
+        writer.write(buf)
+
+        md = await pdf_to_markdown(buf.getvalue(), executor="thread")
+        assert "| Nivel | Vencimento | Gratificacao |" in md
+        assert "| I | 1.200,00 | 450,00 |" in md
+        assert "| II | 1.450,00 | 550,00 |" in md
+        # Table cell text must NOT be duplicated outside the GFM table on rotated pages.
+        assert md.count("1.200,00") == 1
+        assert md.count("1.450,00") == 1
+
+    def test_extract_visual_lines_handles_multiline_whitespace_and_soft_hyphens(self):
+        pdf = make_digital_pdf(
+            "Art. 1º Primeira linha do texto legal estadual.\n"
+            "   Art. 2º Segunda linha com recuo inicial.   \n"
+            "Art. 3º Terceira linha final da norma."
+        )
+        doc = pdf_mod._open_pdf(pdf)
+        try:
+            lines = pdf_mod._extract_visual_lines(doc[0])
+        finally:
+            doc.close()
+        texts = [ln.text for ln in lines]
+        assert len(lines) == 3
+        assert texts[0].startswith("Art. 1º")
+        assert texts[1].startswith("Art. 2º")
+        assert texts[2].startswith("Art. 3º")
+        # Visual top coordinates strictly increase down the page
+        assert lines[0].top < lines[1].top < lines[2].top
+        assert all(ln.x1 > ln.x0 and ln.bottom > ln.top for ln in lines)
 
     async def test_multipage_watermark_filtered_while_unique_figure_placed_in_place(
         self,

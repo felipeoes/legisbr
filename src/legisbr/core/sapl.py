@@ -4,7 +4,7 @@ Many Brazilian state legislatures use SAPL with identical REST API structures.
 This base class provides the shared logic for:
   - Paginated norm search via ``/api/norma/normajuridica/``
   - Subject (assunto) fetching via ``/api/norma/assuntonorma/``
-  - PDF processing with pypdfium2 + selective pdfplumber → OCR fallback
+  - PDF processing with pypdfium2 → OCR fallback
 """
 
 from __future__ import annotations

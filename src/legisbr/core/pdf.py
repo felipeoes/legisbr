@@ -1,9 +1,10 @@
-"""Permissive high-performance PDF engine built on ``pypdfium2``, ``pypdf``, ``pdfplumber``, and ``pillow``.
+"""Permissive high-performance PDF engine built on ``pypdfium2``, ``pypdf``, and ``pillow``.
 
-Self-contained (stdlib + ``pypdfium2`` at module import; ``pypdf``, ``pdfplumber``,
-and ``PIL`` are imported lazily on demand) so ``spawn`` worker subprocesses start
-fast without importing ``aiohttp``, ``bs4``, ``lxml``, or ``pdfminer`` unless a
-page actually requires ruled-table extraction, slicing, or rendering.
+Self-contained (stdlib + ``pypdfium2`` at module import; ``pypdf`` and ``PIL``
+are imported lazily on demand) so ``spawn`` worker subprocesses start fast
+without importing ``aiohttp``, ``bs4``, or ``lxml``. Ruled tables
+are extracted natively from PDFium C++ ``FPDF_PAGEOBJ_PATH`` geometry and
+``FPDFText`` em-boxes.
 """
 
 from __future__ import annotations
@@ -11,20 +12,25 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import bisect
 import ctypes
 import hashlib
 import io
+import itertools
 import logging
+import math
 import multiprocessing
 import os
 import re
 import string
 import time
 import weakref
+from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import pypdfium2 as pdfium
@@ -499,38 +505,65 @@ def _populate_page_objects(
     ] = []
     txt_objs = 0
     invis_objs = 0
-    h_xs: list[tuple[float, float, float]] = []
-    v_ys: list[tuple[float, float, float]] = []
+    h_buckets: set[int] = set()
+    v_buckets: set[int] = set()
     rects = 0
+    has_rules = False
     img_idx = 0
 
-    try:
-        for obj in page.get_objects(max_depth=4):
-            ot = obj.type
-            if ot == pdfium_c.FPDF_PAGEOBJ_TEXT:
+    obj_text = pdfium_c.FPDF_PAGEOBJ_TEXT
+    obj_image = pdfium_c.FPDF_PAGEOBJ_IMAGE
+    obj_path = pdfium_c.FPDF_PAGEOBJ_PATH
+    obj_form = pdfium_c.FPDF_PAGEOBJ_FORM
+    invis_mode = pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE
+
+    page_count = pdfium_c.FPDFPage_CountObjects
+    page_get = pdfium_c.FPDFPage_GetObject
+    form_count = pdfium_c.FPDFFormObj_CountObjects
+    form_get = pdfium_c.FPDFFormObj_GetObject
+    get_type = pdfium_c.FPDFPageObj_GetType
+    get_bounds = pdfium_c.FPDFPageObj_GetBounds
+    get_render_mode = pdfium_c.FPDFTextObj_GetTextRenderMode
+    get_img_meta = pdfium_c.FPDFImageObj_GetImageMetadata
+    count_segs = pdfium_c.FPDFPath_CountSegments
+
+    c_l = ctypes.c_float()
+    c_b = ctypes.c_float()
+    c_r = ctypes.c_float()
+    c_t = ctypes.c_float()
+    meta = pdfium_c.FPDF_IMAGEOBJ_METADATA()
+    page_raw = page.raw
+
+    def _walk(container: Any, is_form: bool, depth: int) -> None:
+        nonlocal txt_objs, invis_objs, rects, has_rules, img_idx
+        n_objs = form_count(container) if is_form else page_count(container)
+        if n_objs <= 0:
+            return
+        for i in range(n_objs):
+            raw_obj = form_get(container, i) if is_form else page_get(container, i)
+            if not raw_obj:
+                continue
+            ot = get_type(raw_obj)
+            if ot == obj_text:
                 txt_objs += 1
-                try:
-                    left, b, r, t = obj.get_bounds()
-                    cx, cy = (left + r) * 0.5, (b + t) * 0.5
+                if get_bounds(raw_obj, c_l, c_b, c_r, c_t):
+                    cx = (c_l.value + c_r.value) * 0.5
+                    cy = (c_b.value + c_t.value) * 0.5
                     text_centers.append((cx, cy))
-                    rm = pdfium_c.FPDFTextObj_GetTextRenderMode(obj)
-                    if rm == pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE:
+                    if get_render_mode(raw_obj) == invis_mode:
                         invis_objs += 1
                     else:
                         vis_text_centers.append((cx, cy))
-                except Exception:
-                    pass
-            elif ot == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+            elif ot == obj_image:
                 cur_idx = img_idx
                 img_idx += 1
-                try:
-                    left, b, r, t = obj.get_bounds()
+                if get_bounds(raw_obj, c_l, c_b, c_r, c_t):
+                    left, b, r, t = c_l.value, c_b.value, c_r.value, c_t.value
                     w, h = max(0.0, r - left), max(0.0, t - b)
                     ratio = (w * h) / page_area
-                    meta = pdfium_c.FPDF_IMAGEOBJ_METADATA()
                     bpp = (
                         int(meta.bits_per_pixel)
-                        if pdfium_c.FPDFImageObj_GetImageMetadata(obj, page, meta)
+                        if get_img_meta(raw_obj, page_raw, meta)
                         else -1
                     )
                     sha = b""
@@ -538,10 +571,13 @@ def _populate_page_objects(
                     is_jpeg = False
                     if collect_image_hashes and image_size_limit <= ratio < 0.80:
                         try:
-                            raw_data = bytes(obj.get_data(decode_simple=False))
+                            img_helper = pdfium.PdfObject(
+                                raw_obj, page=page, pdf=page.pdf, level=depth
+                            )
+                            raw_data = bytes(img_helper.get_data(decode_simple=False))
                             raw_len = len(raw_data)
                             sha = hashlib.sha256(raw_data).digest()
-                            filts = obj.get_filters()
+                            filts = img_helper.get_filters()
                             is_jpeg = filts == ["DCTDecode"] and raw_data.startswith(
                                 b"\xff\xd8"
                             )
@@ -550,22 +586,32 @@ def _populate_page_objects(
                     raw_imgs.append(
                         (left, b, r, t, ratio, bpp, sha, raw_len, is_jpeg, cur_idx)
                     )
-                except Exception:
-                    pass
-            elif ot == pdfium_c.FPDF_PAGEOBJ_PATH:
-                try:
-                    left, b, r, t = obj.get_bounds()
+            elif ot == obj_path:
+                if has_rules:
+                    continue
+                if get_bounds(raw_obj, c_l, c_b, c_r, c_t):
+                    left, b, r, t = c_l.value, c_b.value, c_r.value, c_t.value
                     w, h = abs(r - left), abs(t - b)
-                    if w >= 20.0 and h <= 4.0:
-                        h_xs.append((left, r, (b + t) * 0.5))
+                    # Symmetric >= 10pt thresholds handle both portrait and 90-deg rotated pages.
+                    if w >= 10.0 and h <= 4.0:
+                        h_buckets.add(round(((b + t) * 0.5) / 3.0))
+                        if len(h_buckets) >= 3 and len(v_buckets) >= 3:
+                            has_rules = True
                     elif h >= 10.0 and w <= 4.0:
-                        v_ys.append((b, t, (left + r) * 0.5))
-                    elif w >= 20.0 and h >= 10.0:
-                        n_segs = pdfium_c.FPDFPath_CountSegments(obj)
+                        v_buckets.add(round(((left + r) * 0.5) / 3.0))
+                        if len(h_buckets) >= 3 and len(v_buckets) >= 3:
+                            has_rules = True
+                    elif w >= 10.0 and h >= 10.0:
+                        n_segs = count_segs(raw_obj)
                         if n_segs >= 4:
                             rects += max(1, n_segs // 5)
-                except Exception:
-                    pass
+                            if rects >= 4:
+                                has_rules = True
+            elif ot == obj_form and depth < 3:
+                _walk(raw_obj, True, depth + 1)
+
+    try:
+        _walk(page_raw, False, 0)
     except Exception:
         pass
 
@@ -615,9 +661,6 @@ def _populate_page_objects(
         )
 
     invis_ratio = invis_objs / txt_objs if txt_objs > 0 else 0.0
-    distinct_v = len({round(x / 3.0) for _, _, x in v_ys})
-    distinct_h = len({round(y / 3.0) for _, _, y in h_xs})
-    has_rules = (distinct_h >= 3 and distinct_v >= 3) or rects >= 4
 
     pa.img_coverage = min(1.0, total_cov)
     pa.bpp1_unocrd_coverage = min(1.0, bpp1_unocrd_cov)
@@ -754,6 +797,26 @@ class _LineBox:
     text: str
 
 
+_VISUAL_LINE_RE = re.compile(r"[^\r\n]+")
+
+
+def _make_user_to_visual(
+    mb: tuple[float, float, float, float], rot: int
+) -> Callable[[float, float], tuple[float, float]]:
+    """Map unrotated PDF user-space ``(ux, uy)`` to top-down visual ``(vx, vy)``."""
+    mx0, my0, mx1, my1 = mb
+    mw = mx1 - mx0
+    mh = my1 - my0
+    r = rot % 360
+    if r == 0:
+        return lambda ux, uy: (ux - mx0, mh - (uy - my0))
+    if r == 90:
+        return lambda ux, uy: (uy - my0, ux - mx0)
+    if r == 180:
+        return lambda ux, uy: (mw - (ux - mx0), uy - my0)
+    return lambda ux, uy: (mh - (uy - my0), mw - (ux - mx0))
+
+
 def _extract_visual_lines(page: pdfium.PdfPage) -> list[_LineBox]:
     """Extract lines with top-down bounding boxes via PDFium ``FPDFText``."""
     pw, ph = page.get_size()
@@ -774,8 +837,14 @@ def _extract_visual_lines(page: pdfium.PdfPage) -> list[_LineBox]:
                 for i, ln in enumerate(lines)
             ]
 
+        mb = page.get_mediabox()
+        mx0, my0, _, my1 = mb
+        mh = my1 - my0
+        rot = page.get_rotation() % 360
+        simple_transform = rot == 0 and mx0 == 0.0 and my0 == 0.0
+        to_vis = None if simple_transform else _make_user_to_visual(mb, rot)
+
         raw_lines: list[_LineBox] = []
-        i = 0
         c_left = ctypes.c_double()
         c_right = ctypes.c_double()
         c_bottom = ctypes.c_double()
@@ -783,59 +852,57 @@ def _extract_visual_lines(page: pdfium.PdfPage) -> list[_LineBox]:
         get_box = pdfium_c.FPDFText_GetCharBox
         tp_raw = tp.raw
 
-        while i < n_chars:
-            j = i
-            while j < n_chars and full[j] not in "\r\n":
-                j += 1
-            seg = full[i:j]
-            s = i
-            while s < j and full[s].isspace():
-                s += 1
-            e = j - 1
-            while e >= s and full[e].isspace():
-                e -= 1
-            if s <= e:
-                probes = (s, (s + e) // 2, e) if e - s >= 2 else (s, e)
-                x0 = pw
-                x1 = 0.0
-                b_min = ph
-                t_max = 0.0
-                got_any = False
-                for idx in probes:
-                    if full[idx].isspace() or full[idx] == "\x02":
-                        continue
-                    if get_box(tp_raw, idx, c_left, c_right, c_bottom, c_top):
-                        lx, rx = c_left.value, c_right.value
-                        by, ty = c_bottom.value, c_top.value
-                        if rx >= lx and ty >= by:
-                            if lx < x0:
-                                x0 = lx
-                            if rx > x1:
-                                x1 = rx
-                            if by < b_min:
-                                b_min = by
-                            if ty > t_max:
-                                t_max = ty
-                            got_any = True
-                if got_any:
-                    txt = seg.strip()
-                    if txt:
-                        raw_lines.append(
-                            _LineBox(
-                                x0=x0,
-                                top=ph - t_max,
-                                x1=x1,
-                                bottom=ph - b_min,
-                                text=txt,
-                            )
-                        )
-            if j < n_chars:
-                if full[j] == "\r" and j + 1 < n_chars and full[j + 1] == "\n":
-                    i = j + 2
-                else:
-                    i = j + 1
-            else:
-                break
+        for match in _VISUAL_LINE_RE.finditer(full):
+            seg = match.group()
+            txt = seg.strip()
+            if not txt:
+                continue
+            s = match.start() + (len(seg) - len(seg.lstrip()))
+            e = s + len(txt) - 1
+            probes = (s, (s + e) // 2, e) if e - s >= 2 else (s, e)
+            vx0 = pw
+            vx1 = 0.0
+            vtop = ph
+            vbot = 0.0
+            got_any = False
+            for idx in probes:
+                ch = full[idx]
+                if ch.isspace() or ch == "\x02":
+                    continue
+                if get_box(tp_raw, idx, c_left, c_right, c_bottom, c_top):
+                    lx, rx = c_left.value, c_right.value
+                    by, ty = c_bottom.value, c_top.value
+                    if rx >= lx and ty >= by:
+                        if simple_transform:
+                            px0, px1 = lx, rx
+                            py0, py1 = mh - ty, mh - by
+                        else:
+                            assert to_vis is not None
+                            px0, py0 = to_vis(lx, ty)
+                            px1, py1 = to_vis(rx, by)
+                            if px0 > px1:
+                                px0, px1 = px1, px0
+                            if py0 > py1:
+                                py0, py1 = py1, py0
+                        if px0 < vx0:
+                            vx0 = px0
+                        if px1 > vx1:
+                            vx1 = px1
+                        if py0 < vtop:
+                            vtop = py0
+                        if py1 > vbot:
+                            vbot = py1
+                        got_any = True
+            if got_any:
+                raw_lines.append(
+                    _LineBox(
+                        x0=vx0,
+                        top=vtop,
+                        x1=vx1,
+                        bottom=vbot,
+                        text=txt,
+                    )
+                )
         return raw_lines
     finally:
         tp.close()
@@ -1033,8 +1100,23 @@ def _join_lines_to_paragraphs(lines: list[_LineBox]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ruled-table extraction (lazy pdfplumber on candidate pages ONLY)
+# Ruled-table extraction (PDFium-native C++ path geometry + FPDFText em-boxes)
 # ---------------------------------------------------------------------------
+_SEG_LINETO = pdfium_c.FPDF_SEGMENT_LINETO
+_SEG_BEZIERTO = pdfium_c.FPDF_SEGMENT_BEZIERTO
+_SEG_MOVETO = pdfium_c.FPDF_SEGMENT_MOVETO
+_OBJ_PATH = pdfium_c.FPDF_PAGEOBJ_PATH
+_OBJ_FORM = pdfium_c.FPDF_PAGEOBJ_FORM
+_ID_MATRIX: tuple[float, float, float, float, float, float] = (
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+)
+
+
 @dataclass
 class _TableBlock:
     x0: float
@@ -1045,7 +1127,7 @@ class _TableBlock:
 
 
 def _format_gfm_table(rows: list[list[str | None]]) -> str | None:
-    """Format a validated pdfplumber cell matrix into clean GFM Markdown."""
+    """Format a validated ruled-table cell matrix into clean GFM Markdown."""
     if not rows or len(rows) < 2:
         return None
     ncols = max(len(r) for r in rows)
@@ -1090,48 +1172,653 @@ def _format_gfm_table(rows: list[list[str | None]]) -> str | None:
     return "\n".join(md_lines)
 
 
-def _extract_tables_for_pages(
-    data: bytes, page_indices_0based: list[int]
-) -> dict[int, list[_TableBlock]]:
-    """Run ``pdfplumber`` ONLY on candidate pages that passed the PDFium ruled-line gate.
+def _mul_matrix(
+    m1: tuple[float, float, float, float, float, float],
+    m2: tuple[float, float, float, float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    a1, b1, c1, d1, e1, f1 = m1
+    a2, b2, c2, d2, e2, f2 = m2
+    return (
+        a1 * a2 + c1 * b2,
+        b1 * a2 + d1 * b2,
+        a1 * c2 + c1 * d2,
+        b1 * c2 + d1 * d2,
+        a1 * e2 + c1 * f2 + e1,
+        b1 * e2 + d1 * f2 + f1,
+    )
 
-    Lazy-imports ``pdfplumber`` so text-only PDF workers never load ``pdfminer``
-    or ``cryptography``. Processes in 15-page chunks and flushes caches per page
-    to keep peak RSS flat on 170-page budget laws.
-    """
+
+def _extract_raw_edges_pdfium(
+    page: pdfium.PdfPage,
+    *,
+    min_len_prefilter: float = 1.0,
+    axis_eps: float = 0.05,
+    max_depth: int = 8,
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    """Extract horizontal & vertical vector edges in visual top-down coordinates via PDFium C++."""
+    mb = page.get_mediabox()
+    rot = page.get_rotation() % 360
+    mx0, my0, mx1, my1 = mb
+    mw = mx1 - mx0
+    mh = my1 - my0
+    to_vis = _make_user_to_visual(mb, rot)
+
+    h_edges: list[tuple[float, float, float]] = []
+    v_edges: list[tuple[float, float, float]] = []
+
+    c_fill = ctypes.c_int()
+    c_stroke = ctypes.c_int()
+    c_mat = pdfium_c.FS_MATRIX()
+    c_px = ctypes.c_float()
+    c_py = ctypes.c_float()
+    c_l = ctypes.c_float()
+    c_b = ctypes.c_float()
+    c_r = ctypes.c_float()
+    c_t = ctypes.c_float()
+
+    get_type = pdfium_c.FPDFPageObj_GetType
+    get_bounds = pdfium_c.FPDFPageObj_GetBounds
+    get_mat = pdfium_c.FPDFPageObj_GetMatrix
+    get_draw_mode = pdfium_c.FPDFPath_GetDrawMode
+    count_segs = pdfium_c.FPDFPath_CountSegments
+    get_seg = pdfium_c.FPDFPath_GetPathSegment
+    seg_type = pdfium_c.FPDFPathSegment_GetType
+    seg_pt = pdfium_c.FPDFPathSegment_GetPoint
+    seg_close = pdfium_c.FPDFPathSegment_GetClose
+    form_count = pdfium_c.FPDFFormObj_CountObjects
+    form_get = pdfium_c.FPDFFormObj_GetObject
+    page_count = pdfium_c.FPDFPage_CountObjects
+    page_get = pdfium_c.FPDFPage_GetObject
+
+    def emit_seg(x0: float, y0: float, x1: float, y1: float) -> None:
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        if dy <= axis_eps and dx >= min_len_prefilter:
+            y = (y0 + y1) * 0.5
+            h_edges.append((y, x0, x1) if x0 <= x1 else (y, x1, x0))
+        elif dx <= axis_eps and dy >= min_len_prefilter:
+            x = (x0 + x1) * 0.5
+            v_edges.append((x, y0, y1) if y0 <= y1 else (x, y1, y0))
+
+    def emit_rect_user(lx: float, by: float, rx: float, ty: float) -> None:
+        if rot == 0:
+            vx0, vx1 = lx - mx0, rx - mx0
+            vy0, vy1 = mh - (ty - my0), mh - (by - my0)
+        elif rot == 90:
+            vx0, vx1 = by - my0, ty - my0
+            vy0, vy1 = lx - mx0, rx - mx0
+        elif rot == 180:
+            vx0, vx1 = mw - (rx - mx0), mw - (lx - mx0)
+            vy0, vy1 = by - my0, ty - my0
+        else:
+            vx0, vx1 = mh - (ty - my0), mh - (by - my0)
+            vy0, vy1 = mw - (rx - mx0), mw - (lx - mx0)
+        if vx0 > vx1:
+            vx0, vx1 = vx1, vx0
+        if vy0 > vy1:
+            vy0, vy1 = vy1, vy0
+        if (vx1 - vx0) >= min_len_prefilter:
+            h_edges.append((vy0, vx0, vx1))
+            h_edges.append((vy1, vx0, vx1))
+        if (vy1 - vy0) >= min_len_prefilter:
+            v_edges.append((vx0, vy0, vy1))
+            v_edges.append((vx1, vy0, vy1))
+
+    def walk_container(
+        container: Any,
+        is_form: bool,
+        parent_mat: tuple[float, float, float, float, float, float],
+        depth: int,
+    ) -> None:
+        n_objs = form_count(container) if is_form else page_count(container)
+        if n_objs <= 0:
+            return
+        for i in range(n_objs):
+            raw_obj = form_get(container, i) if is_form else page_get(container, i)
+            if not raw_obj:
+                continue
+            ot = get_type(raw_obj)
+            if ot == _OBJ_FORM:
+                if depth + 1 < max_depth:
+                    if get_mat(raw_obj, c_mat):
+                        fm = (c_mat.a, c_mat.b, c_mat.c, c_mat.d, c_mat.e, c_mat.f)
+                        next_mat = _mul_matrix(parent_mat, fm)
+                    else:
+                        next_mat = parent_mat
+                    walk_container(raw_obj, True, next_mat, depth + 1)
+                continue
+            if ot != _OBJ_PATH:
+                continue
+
+            # Fast bounds rejection + filled thin-bar fast path (Word/LibreOffice rules)
+            if not is_form and get_bounds(raw_obj, c_l, c_b, c_r, c_t):
+                bl, bb, br, bt = c_l.value, c_b.value, c_r.value, c_t.value
+                bw = br - bl
+                bh = bt - bb
+                if bw < min_len_prefilter and bh < min_len_prefilter:
+                    continue
+                if not get_draw_mode(raw_obj, c_fill, c_stroke):
+                    continue
+                if c_fill.value == 0 and c_stroke.value == 0:
+                    continue
+                ns = count_segs(raw_obj)
+                if ns < 2:
+                    continue
+                if (
+                    c_stroke.value == 0
+                    and ns == 5
+                    and (bw < min_len_prefilter or bh < min_len_prefilter)
+                ):
+                    if rot == 0:
+                        vx0, vx1 = bl - mx0, br - mx0
+                        vy0, vy1 = mh - (bt - my0), mh - (bb - my0)
+                        if bw >= min_len_prefilter:
+                            h_edges.append((vy0, vx0, vx1))
+                            h_edges.append((vy1, vx0, vx1))
+                        if bh >= min_len_prefilter:
+                            v_edges.append((vx0, vy0, vy1))
+                            v_edges.append((vx1, vy0, vy1))
+                    else:
+                        emit_rect_user(bl, bb, br, bt)
+                    continue
+            else:
+                if not get_draw_mode(raw_obj, c_fill, c_stroke):
+                    continue
+                if c_fill.value == 0 and c_stroke.value == 0:
+                    continue
+                ns = count_segs(raw_obj)
+                if ns < 2:
+                    continue
+
+            if get_mat(raw_obj, c_mat):
+                pm = (c_mat.a, c_mat.b, c_mat.c, c_mat.d, c_mat.e, c_mat.f)
+                a, b, c, d, e, f = (
+                    pm if parent_mat == _ID_MATRIX else _mul_matrix(parent_mat, pm)
+                )
+            else:
+                a, b, c, d, e, f = parent_mat
+
+            is_id = (
+                a == 1.0
+                and b == 0.0
+                and c == 0.0
+                and d == 1.0
+                and e == 0.0
+                and f == 0.0
+            )
+
+            start_x = start_y = cur_x = cur_y = 0.0
+            has_cur = False
+            bezier_rem = 0
+
+            for si in range(ns):
+                seg = get_seg(raw_obj, si)
+                if not seg:
+                    continue
+                st = seg_type(seg)
+                if not seg_pt(seg, c_px, c_py):
+                    continue
+                px, py = c_px.value, c_py.value
+                if is_id:
+                    vx, vy = to_vis(px, py)
+                else:
+                    vx, vy = to_vis(a * px + c * py + e, b * px + d * py + f)
+
+                if st == _SEG_MOVETO:
+                    start_x = cur_x = vx
+                    start_y = cur_y = vy
+                    has_cur = True
+                    bezier_rem = 0
+                elif st == _SEG_LINETO:
+                    if has_cur:
+                        emit_seg(cur_x, cur_y, vx, vy)
+                    cur_x, cur_y = vx, vy
+                    has_cur = True
+                    bezier_rem = 0
+                    if seg_close(seg):
+                        if abs(cur_x - start_x) > 1e-4 or abs(cur_y - start_y) > 1e-4:
+                            emit_seg(cur_x, cur_y, start_x, start_y)
+                        cur_x, cur_y = start_x, start_y
+                elif st == _SEG_BEZIERTO:
+                    bezier_rem = (bezier_rem + 1) % 3
+                    if bezier_rem == 0:
+                        cur_x, cur_y = vx, vy
+                        has_cur = True
+                        if seg_close(seg):
+                            if (
+                                abs(cur_x - start_x) > 1e-4
+                                or abs(cur_y - start_y) > 1e-4
+                            ):
+                                emit_seg(cur_x, cur_y, start_x, start_y)
+                            cur_x, cur_y = start_x, start_y
+
+    walk_container(page.raw, False, _ID_MATRIX, 0)
+    return h_edges, v_edges
+
+
+def _snap_and_merge_1d(
+    edges: list[tuple[float, float, float]],
+    snap_tol: float = 3.0,
+    join_tol: float = 3.0,
+    min_length: float = 3.0,
+) -> list[tuple[float, float, float]]:
+    """Snap collinear edges within *snap_tol*, merge gaps <= *join_tol*, and filter length."""
+    if not edges:
+        return []
+    edges_sorted = sorted(edges, key=itemgetter(0))
+    merged: list[tuple[float, float, float]] = []
+
+    cluster: list[tuple[float, float, float]] = [edges_sorted[0]]
+    last_pos = edges_sorted[0][0]
+
+    def flush_cluster(cl: list[tuple[float, float, float]]) -> None:
+        avg_pos = sum(e[0] for e in cl) / len(cl)
+        cl_by_start = sorted(cl, key=itemgetter(1))
+        s0, s1 = cl_by_start[0][1], cl_by_start[0][2]
+        for _, lo, hi in cl_by_start[1:]:
+            if lo <= s1 + join_tol:
+                if hi > s1:
+                    s1 = hi
+            else:
+                if s1 - s0 >= min_length:
+                    merged.append((avg_pos, s0, s1))
+                s0, s1 = lo, hi
+        if s1 - s0 >= min_length:
+            merged.append((avg_pos, s0, s1))
+
+    for e in edges_sorted[1:]:
+        if e[0] <= last_pos + snap_tol:
+            cluster.append(e)
+        else:
+            flush_cluster(cluster)
+            cluster = [e]
+        last_pos = e[0]
+    flush_cluster(cluster)
+    return merged
+
+
+def _find_table_cell_groups(
+    h_edges: list[tuple[float, float, float]],
+    v_edges: list[tuple[float, float, float]],
+    *,
+    snap_tol: float = 3.0,
+    join_tol: float = 3.0,
+    min_length: float = 3.0,
+    inter_tol: float = 3.0,
+) -> list[list[tuple[float, float, float, float]]]:
+    """Find connected ruled-table cell groups ``[(x0, top, x1, bottom), ...]``."""
+    hs = _snap_and_merge_1d(h_edges, snap_tol, join_tol, min_length)
+    vs = _snap_and_merge_1d(v_edges, snap_tol, join_tol, min_length)
+    if len(hs) < 2 or len(vs) < 2:
+        return []
+
+    hs.sort(key=itemgetter(0, 1))
+    vs.sort(key=itemgetter(0, 1))
+    h_ys = [e[0] for e in hs]
+
+    inter_v: dict[tuple[float, float], set[int]] = {}
+    inter_h: dict[tuple[float, float], set[int]] = {}
+    pts_by_x: dict[float, list[float]] = defaultdict(list)
+    pts_by_y: dict[float, list[float]] = defaultdict(list)
+
+    for vi, (vx, vtop, vbot) in enumerate(vs):
+        lo = bisect.bisect_left(h_ys, vtop - inter_tol)
+        hi = bisect.bisect_right(h_ys, vbot + inter_tol)
+        for hi_idx in range(lo, hi):
+            hy, hx0, hx1 = hs[hi_idx]
+            if (hx0 - inter_tol) <= vx <= (hx1 + inter_tol):
+                pt = (vx, hy)
+                vset = inter_v.get(pt)
+                if vset is None:
+                    inter_v[pt] = {vi}
+                    inter_h[pt] = {hi_idx}
+                    pts_by_x[vx].append(hy)
+                    pts_by_y[hy].append(vx)
+                else:
+                    vset.add(vi)
+                    inter_h[pt].add(hi_idx)
+
+    if len(inter_v) < 4:
+        return []
+
+    for ys in pts_by_x.values():
+        ys.sort()
+    for xs in pts_by_y.values():
+        xs.sort()
+
+    cells: list[tuple[float, float, float, float]] = []
+    for vx in sorted(pts_by_x):
+        ys = pts_by_x[vx]
+        ny = len(ys)
+        for yi in range(ny - 1):
+            hy = ys[yi]
+            pt = (vx, hy)
+            pt_vs = inter_v[pt]
+            pt_hs = inter_h[pt]
+
+            xs_row = pts_by_y[hy]
+            xi_start = bisect.bisect_right(xs_row, vx)
+            if xi_start >= len(xs_row):
+                continue
+
+            right_xs = [
+                rx
+                for rx in xs_row[xi_start:]
+                if not pt_hs.isdisjoint(inter_h[(rx, hy)])
+            ]
+            if not right_xs:
+                continue
+
+            found = False
+            for yj in range(yi + 1, ny):
+                by = ys[yj]
+                bpt = (vx, by)
+                if pt_vs.isdisjoint(inter_v[bpt]):
+                    continue
+                bpt_hs = inter_h[bpt]
+                for rx in right_xs:
+                    br = (rx, by)
+                    br_vs = inter_v.get(br)
+                    if br_vs is None:
+                        continue
+                    if not br_vs.isdisjoint(inter_v[(rx, hy)]) and not inter_h[
+                        br
+                    ].isdisjoint(bpt_hs):
+                        cells.append((vx, hy, rx, by))
+                        found = True
+                        break
+                if found:
+                    break
+
+    if len(cells) < 2:
+        return []
+
+    # Group contiguous cells sharing corners via union-find.
+    parent = list(range(len(cells)))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    corner_owner: dict[tuple[float, float], int] = {}
+    for ci, (x0, top, x1, bot) in enumerate(cells):
+        for corner in ((x0, top), (x0, bot), (x1, top), (x1, bot)):
+            prev = corner_owner.get(corner)
+            if prev is None:
+                corner_owner[corner] = ci
+            else:
+                ra, rb = find(ci), find(prev)
+                if ra != rb:
+                    parent[ra] = rb
+
+    groups: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
+    for ci, cell in enumerate(cells):
+        groups[find(ci)].append(cell)
+
+    tables = [g for g in groups.values() if len(g) > 1]
+    tables.sort(key=lambda g: min((c[1], c[0]) for c in g))
+    return tables
+
+
+def _extract_page_chars_visual(
+    page: pdfium.PdfPage,
+    tables_bboxes: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float, float, float, str]]:
+    """Extract PDFium characters inside table bboxes as ``(cx, cy, x0, top, x1, bottom, ch)``."""
+    tp = page.get_textpage()
+    try:
+        n_chars = tp.count_chars()
+        if n_chars <= 0:
+            return []
+        mb = page.get_mediabox()
+        mx0, my0, _, my1 = mb
+        mh = my1 - my0
+        rot = page.get_rotation() % 360
+        to_vis = _make_user_to_visual(mb, rot)
+
+        ux0 = min(b[0] for b in tables_bboxes) - 2.0
+        utop = min(b[1] for b in tables_bboxes) - 2.0
+        ux1 = max(b[2] for b in tables_bboxes) + 2.0
+        ubot = max(b[3] for b in tables_bboxes) + 2.0
+        ux0_m, utop_m, ux1_m, ubot_m = ux0 - 20.0, utop - 20.0, ux1 + 20.0, ubot + 20.0
+
+        rect = pdfium_c.FS_RECTF()
+        c_mat = pdfium_c.FS_MATRIX()
+        get_loose = pdfium_c.FPDFText_GetLooseCharBox
+        get_uni = pdfium_c.FPDFText_GetUnicode
+        is_gen = pdfium_c.FPDFText_IsGenerated
+        get_fsize = pdfium_c.FPDFText_GetFontSize
+        get_tmat = pdfium_c.FPDFText_GetMatrix
+        tp_raw = tp.raw
+
+        chars: list[tuple[float, float, float, float, float, float, str]] = []
+        for idx in range(n_chars):
+            cp = get_uni(tp_raw, idx)
+            if cp == 2:
+                # PDFium soft-hyphen marker at line end -> explicit hyphen
+                ch = "-"
+            elif cp == 32:
+                # Keep explicit PDF space glyphs; skip synthetic spaces whose bboxes can drift.
+                if is_gen(tp_raw, idx):
+                    continue
+                ch = " "
+            elif cp < 32:
+                continue
+            else:
+                ch = chr(cp)
+            if not get_loose(tp_raw, idx, rect):
+                continue
+            lx, rx = rect.left, rect.right
+            by, ty = rect.bottom, rect.top
+            if rx < lx or ty < by:
+                continue
+            if rot == 0:
+                cx_approx = (lx + rx) * 0.5 - mx0
+                cy_approx = mh - ((by + ty) * 0.5 - my0)
+                if not (ux0_m <= cx_approx <= ux1_m and utop_m <= cy_approx <= ubot_m):
+                    continue
+            # Normalize em-box height to exact scaled font size along the glyph ascent
+            # axis (c, d) from FPDFText_GetMatrix so all glyphs on a baseline share cy.
+            fs = get_fsize(tp_raw, idx)
+            if fs > 0.0 and get_tmat(tp_raw, idx, c_mat):
+                mc, md = c_mat.c, c_mat.d
+                sfs = fs * math.hypot(mc, md)
+                if sfs > 0.0:
+                    if md > abs(mc):
+                        ty = by + sfs
+                    elif md < -abs(mc):
+                        by = ty - sfs
+                    elif mc < -abs(md):
+                        lx = rx - sfs
+                    elif mc > abs(md):
+                        rx = lx + sfs
+            if rot == 0:
+                vx0, vx1 = lx - mx0, rx - mx0
+                vy0, vy1 = mh - (ty - my0), mh - (by - my0)
+            else:
+                vx0, vy0 = to_vis(lx, ty)
+                vx1, vy1 = to_vis(rx, by)
+                if vx0 > vx1:
+                    vx0, vx1 = vx1, vx0
+                if vy0 > vy1:
+                    vy0, vy1 = vy1, vy0
+            cx = (vx0 + vx1) * 0.5
+            cy = (vy0 + vy1) * 0.5
+            if ux0 <= cx <= ux1 and utop <= cy <= ubot:
+                chars.append((cx, cy, vx0, vy0, vx1, vy1, ch))
+        return chars
+    finally:
+        tp.close()
+
+
+def _chars_to_cell_text(
+    cell_chars: list[tuple[float, float, float, float, float, float, str]],
+    *,
+    x_tol: float = 3.0,
+    y_tol: float = 3.0,
+) -> str:
+    """Reconstruct visual reading-order text for one table cell from em-box chars."""
+    if not cell_chars:
+        return ""
+    by_top = sorted(cell_chars, key=itemgetter(3))
+    lines: list[list[tuple[float, float, float, float, float, float, str]]] = [
+        [by_top[0]]
+    ]
+    last_top = by_top[0][3]
+    for item in by_top[1:]:
+        if item[3] <= last_top + y_tol:
+            lines[-1].append(item)
+        else:
+            lines.append([item])
+        last_top = item[3]
+
+    out_lines: list[str] = []
+    for ln in lines:
+        ln.sort(key=itemgetter(2))
+        line_h = max((c[5] - c[3]) for c in ln)
+        gap_thresh = min(x_tol, max(1.2, line_h * 0.20))
+        parts: list[str] = []
+        prev_x1: float | None = None
+        for _, _, x0, _, x1, _, ch in ln:
+            if prev_x1 is not None and (x0 - prev_x1) > gap_thresh:
+                if parts and parts[-1] != " ":
+                    parts.append(" ")
+            parts.append(ch)
+            if prev_x1 is None or x1 > prev_x1:
+                prev_x1 = x1
+        txt = "".join(parts).strip()
+        if txt:
+            out_lines.append(txt)
+    return " ".join(out_lines)
+
+
+def _extract_tables_pdfium_page(page: pdfium.PdfPage) -> list[_TableBlock]:
+    """Extract ruled GFM tables from one PDFium page using native C++ path & text APIs."""
+    h_edges, v_edges = _extract_raw_edges_pdfium(page)
+    if len(h_edges) < 2 or len(v_edges) < 2:
+        return []
+    table_groups = _find_table_cell_groups(h_edges, v_edges)
+    if not table_groups:
+        return []
+
+    table_bboxes = [
+        (
+            min(c[0] for c in g),
+            min(c[1] for c in g),
+            max(c[2] for c in g),
+            max(c[3] for c in g),
+        )
+        for g in table_groups
+    ]
+    page_chars = _extract_page_chars_visual(page, table_bboxes)
+
+    blocks: list[_TableBlock] = []
+    for g, tbbox in zip(table_groups, table_bboxes):
+        tx0, ttop, tx1, tbot = tbbox
+        t_chars = sorted(
+            (ch for ch in page_chars if tx0 <= ch[0] < tx1 and ttop <= ch[1] < tbot),
+            key=itemgetter(1),
+        )
+        t_cys = [ch[1] for ch in t_chars]
+        xs = sorted({c[0] for c in g})
+        sorted_cells = sorted(g, key=itemgetter(1, 0))
+        rows_out: list[list[str | None]] = []
+        for _, row_iter in itertools.groupby(sorted_cells, key=itemgetter(1)):
+            row_cells = list(row_iter)
+            r_top = min(c[1] for c in row_cells)
+            r_bot = max(c[3] for c in row_cells)
+            r_x0 = min(c[0] for c in row_cells)
+            r_x1 = max(c[2] for c in row_cells)
+            lo_y = bisect.bisect_left(t_cys, r_top)
+            hi_y = bisect.bisect_left(t_cys, r_bot)
+            row_chars = [ch for ch in t_chars[lo_y:hi_y] if r_x0 <= ch[0] < r_x1]
+            # Deduplicate characters if nested inset boxes overlap horizontally on the same row.
+            has_row_overlap = any(
+                row_cells[k][0] < row_cells[k - 1][2] - 1e-6
+                for k in range(1, len(row_cells))
+            )
+            if has_row_overlap and row_chars:
+                ordered_idx = sorted(
+                    range(len(row_cells)),
+                    key=lambda k: (
+                        (row_cells[k][2] - row_cells[k][0])
+                        * (row_cells[k][3] - row_cells[k][1])
+                    ),
+                )
+                buckets: list[
+                    list[tuple[float, float, float, float, float, float, str]]
+                ] = [[] for _ in row_cells]
+                for ch in row_chars:
+                    cx, cy = ch[0], ch[1]
+                    for k in ordered_idx:
+                        cx0, ctop, cx1, cbot = row_cells[k]
+                        if cx0 <= cx < cx1 and ctop <= cy < cbot:
+                            buckets[k].append(ch)
+                            break
+                xdict_text = {
+                    row_cells[k][0]: _chars_to_cell_text(buckets[k])
+                    for k in range(len(row_cells))
+                }
+                row_vals: list[str | None] = [xdict_text.get(x) for x in xs]
+            else:
+                row_chars_x = sorted(row_chars, key=itemgetter(0))
+                r_cxs = [ch[0] for ch in row_chars_x]
+                xdict = {c[0]: c for c in row_cells}
+                row_vals = []
+                for x in xs:
+                    cell = xdict.get(x)
+                    if cell is None:
+                        row_vals.append(None)
+                    else:
+                        cx0, ctop, cx1, cbot = cell
+                        lo_x = bisect.bisect_left(r_cxs, cx0)
+                        hi_x = bisect.bisect_left(r_cxs, cx1)
+                        c_chars = [
+                            ch for ch in row_chars_x[lo_x:hi_x] if ctop <= ch[1] < cbot
+                        ]
+                        row_vals.append(_chars_to_cell_text(c_chars))
+            rows_out.append(row_vals)
+        md = _format_gfm_table(rows_out)
+        if md:
+            blocks.append(_TableBlock(tx0, ttop, tx1, tbot, md))
+    return blocks
+
+
+def _extract_tables_for_pages(
+    data: bytes,
+    page_indices_0based: list[int],
+    *,
+    _doc: pdfium.PdfDocument | None = None,
+) -> dict[int, list[_TableBlock]]:
+    """Extract ruled GFM tables natively via PDFium on candidate pages."""
     if not page_indices_0based:
         return {}
-    import pdfplumber
-
+    owns_doc = _doc is None
+    doc = _open_pdf(data) if owns_doc else _doc
+    assert doc is not None
     result: dict[int, list[_TableBlock]] = {}
-    chunk_size = 15
     try:
-        for offset in range(0, len(page_indices_0based), chunk_size):
-            chunk_one_based = [
-                p + 1 for p in page_indices_0based[offset : offset + chunk_size]
-            ]
-            with pdfplumber.open(io.BytesIO(data), pages=chunk_one_based) as pdf:
-                for p in pdf.pages:
-                    idx0 = p.page_number - 1
-                    try:
-                        blocks: list[_TableBlock] = []
-                        for tbl in p.find_tables():
-                            rows = tbl.extract()
-                            md = _format_gfm_table(rows)
-                            if md:
-                                x0, top, x1, bottom = tbl.bbox
-                                blocks.append(_TableBlock(x0, top, x1, bottom, md))
-                        if blocks:
-                            result[idx0] = blocks
-                    finally:
-                        p.flush_cache()
-                        p.close()
-                pdf.flush_cache()
+        n_pages = len(doc)
+        for idx0 in page_indices_0based:
+            if not (0 <= idx0 < n_pages):
+                continue
+            page = doc[idx0]
+            try:
+                blocks = _extract_tables_pdfium_page(page)
+                if blocks:
+                    result[idx0] = blocks
+            finally:
+                page.close()
     except Exception:
         logger.debug(
-            "pdfplumber table extraction failed; falling back to text only",
+            "PDFium table extraction failed; falling back to text only",
             exc_info=True,
         )
+    finally:
+        if owns_doc:
+            doc.close()
     return result
 
 
@@ -1347,7 +2034,7 @@ def _extract_pdf_core(
     *,
     yield_between_pages: bool = False,
 ) -> _ExtractionResult:
-    """Single-open PDFium + selective ``pdfplumber`` extraction.
+    """Single-open PDFium extraction (text, native ruled tables, images, selective OCR).
 
     Two-stage design for maximum speed and flat RSS:
       1. Fast text pass on all pages + object inspection ONLY on <=10 sampled
@@ -1499,7 +2186,9 @@ def _extract_pdf_core(
             else []
         )
         tables_by_page = (
-            _extract_tables_for_pages(data, table_pages) if table_pages else {}
+            _extract_tables_for_pages(data, table_pages, _doc=doc)
+            if table_pages
+            else {}
         )
 
         selected_imgs = (

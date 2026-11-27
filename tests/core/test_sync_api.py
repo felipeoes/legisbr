@@ -628,7 +628,7 @@ def test_cold_startup_zero_heavy_imports_zero_threads_and_all_exports():
         "dt = (time.perf_counter() - t) * 1000; "
         "assert len(infos) == 30; "
         "assert threading.active_count() == 1, f'Threads spawned at import: {threading.enumerate()}'; "
-        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pypdfium2', 'pdfplumber', 'PIL', 'pypdf', 'pydantic_ai', 'pyarrow', 'mcp'); "
+        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pypdfium2', 'PIL', 'pypdf', 'pydantic_ai', 'pyarrow', 'mcp'); "
         "loaded = [m for m in forbidden if m in sys.modules]; "
         "assert not loaded, f'Heavy modules loaded: {loaded}'; "
         "print(f'OK {dt:.2f}ms')"

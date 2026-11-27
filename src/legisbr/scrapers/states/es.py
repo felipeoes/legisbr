@@ -172,7 +172,7 @@ class ESAlesScraper(BaseScraper):
         response and is fetched directly via aiohttp.
       - "NORMA ORIGINAL" links (.pdf) — scanned PDFs at
         /Arquivo/Documents/legislacao/image/. Downloaded and converted via
-        pypdfium2 + selective pdfplumber with LLM OCR fallback.
+        pypdfium2 with LLM OCR fallback.
       - "Digital.aspx" links — document viewer URLs; the embedded PDF path is
         extracted from the ``arquivo`` query param and fetched as a regular PDF.
 
