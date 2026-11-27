@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Verify & Build Distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --python 3.12 --all-extras --group dev
+      - name: Verify git tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION=$(uv run --no-sync python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "ERROR: Git tag '$GITHUB_REF_NAME' ($TAG) does not match pyproject.toml version '$VERSION'"
+            exit 1
+          fi
+      - name: Run offline unit tests
+        run: uv run --no-sync pytest tests -m "not integration" -n auto --timeout=60
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Verify sdist contains no local secrets or artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDIST=$(ls dist/legisbr-*.tar.gz | head -n 1)
+          if tar -tzf "$SDIST" | grep -E '(^|/)(proxies[^/]*\.txt|\.env(\.[^/]*)?|logs/|outputs/|\.gemini/|\.claude/)'; then
+            echo "ERROR: Forbidden files found in $SDIST"
+            exit 1
+          fi
+      - name: Smoke test core wheel & audit core licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/legisbr-*.whl | head -n 1)
+          uv venv .venv-core --python 3.12
+          uv pip install --python .venv-core/bin/python "$WHEEL"
+          .venv-core/bin/legisbr list
+          .venv-core/bin/python -c "import legisbr; assert len(legisbr.sources()) == 30"
+          .venv-core/bin/python scripts/check_licenses.py --mode core --verbose
+      - name: Audit extras licenses ([all])
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/legisbr-*.whl | head -n 1)
+          uv venv .venv-all --python 3.12
+          uv pip install --python .venv-all/bin/python "${WHEEL}[all]"
+          .venv-all/bin/python scripts/check_licenses.py --mode extras --verbose
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/legisbr
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish via Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

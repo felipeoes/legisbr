@@ -1,235 +1,293 @@
-# Brazilian Legislation Scraper
+<div align="center">
 
-Web scraper for legal documents regarding Brazilian legislation — federal, state, and regulatory bodies (CONAMA, ICMBio).
+<h1>legisbr</h1>
 
-> **Note:** This project does **not** scrape [leisestaduais.com.br](https://leisestaduais.com.br) as it is explicitly forbidden by their `robots.txt`.
+<p><strong>Brazilian legislation as clean Markdown, SQLite, and Parquet — in Python, CLI, or MCP.</strong></p>
 
-## Features
+<p>30 official federal, state, and environmental portals · Sync &amp; async · Zero browser dependencies.</p>
 
-- **27 state scrapers** — covering all Brazilian states with dedicated scrapers for each state legislature website
-- **Federal legislation** — scrapes Câmara dos Deputados
-- **Environment regulatory bodies** — CONAMA and ICMBio scrapers
-- **Async concurrency** — built on `asyncio` + `aiohttp` for non-blocking I/O with independent per-scraper rate limiting for HTTP and shared rate limiting for LLM API calls
-- **LLM providers** — supports OpenAI-compatible APIs and AWS Bedrock Converse for OCR
-- **PDF & image extraction** — converts PDFs to Markdown with embedded images (base64), optional LLM-powered OCR for scanned documents, and inline image preservation for HTML sources
-- **Playwright support** — async Chromium automation for JavaScript-rendered pages (3 state scrapers)
-- **Proxy rotation** — optional proxy support from a file or HTTP endpoint
-- **SAPL integration** — dedicated base class for state legislatures using the SAPL REST API
-- **Structured output** — saves scraped data as JSON files grouped by year via `FileSaver`
-- **CLI interface** — select scrapers by name, list available scrapers
+[![PyPI](https://img.shields.io/pypi/v/legisbr.svg)](https://pypi.org/project/legisbr/)
+[![Python](https://img.shields.io/pypi/pyversions/legisbr.svg)](https://pypi.org/project/legisbr/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/felipeoes/legisbr/actions/workflows/ci.yml/badge.svg)](https://github.com/felipeoes/legisbr/actions/workflows/ci.yml)
 
-## Requirements
+[Quickstart](#quickstart) · [Python API](#python-api) · [CLI](#cli) · [MCP Server](#mcp-server) · [Sources](#sources) · [OCR](#ocr-for-scanned-pdfs)
 
-- Python >= 3.12
-- [uv](https://docs.astral.sh/uv/) package manager
-- Playwright Chromium browser (`uv run playwright install chromium`)
+</div>
 
-## Installation
+```python
+import legisbr
+from legisbr import Source
 
-1. Install `uv` if you don't have it:
-   ```bash
-   pip install uv
-   ```
+# Fetch a specific law directly as clean Markdown (string codes like "federal" also work)
+law = legisbr.get(Source.FEDERAL, number=14133, year=2021)
+print(law.title)
+print(law.text_markdown[:500])
+```
 
-2. Install project dependencies:
-   ```bash
-   uv sync
-   ```
+## Quickstart
 
-3. Install Playwright browsers:
-   ```bash
-   uv run playwright install chromium
-   ```
+Requires **Python 3.11+**.
 
-4. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your values
-   ```
+```bash
+uv add legisbr              # add to a uv project (recommended)
+pip install legisbr         # or install with pip
+uv tool install legisbr     # install the CLI globally
+uvx legisbr list            # or try the CLI without installing
+```
+
+## Why `legisbr`?
+
+- **30 official government portals:** Federal legislation (Câmara dos Deputados), all 27 Brazilian states, CONAMA, and ICMBio — fetched directly from official portals, never scraping `leisestaduais.com.br`.
+- **Sync by default, async when you scale:** Write clean synchronous scripts and notebooks with `legisbr.get()`, `legisbr.search()`, and `legisbr.Client`, or run high-throughput pipelines with `legisbr.AsyncClient`.
+- **Clean Markdown from HTML, DOCX, and PDF:** Preserves legal structure (`Art.`, `§`, incisos), ruled tables, and inline images, with optional multi-provider Vision OCR for scanned PDFs.
+- **Instant local search & Parquet export:** Store archives in SQLite with diacritic-insensitive Portuguese full-text search (FTS5), query across jurisdictions in milliseconds, and export directly to ZSTD Parquet.
+- **Plug-and-play MCP server:** Connect Claude Desktop, Claude Code, or any MCP client to your local legislation archives with a single `uvx` command.
+- **Lightweight, pure HTTP, 100% MIT core:** No headless browser runtime, fast startup, typed (`py.typed`), and permissive-only core dependencies on Linux, macOS, and Windows (Python 3.11–3.14).
+
+## Python API
+
+Every API accepts either a typed `legisbr.Source` enum member (`Source.FEDERAL`, `Source.SP`, `Source.PI`, `Source.AC`, …) for IDE autocomplete and static type safety, or any case-insensitive string code/alias (`"federal"`, `"camara"`, `"sp"`).
+
+### 1. Fetch & Search Norms
+
+Fetch a single norm directly with `legisbr.get()`, or run a metadata search with `legisbr.search()` to inspect typed `NormRef` results before downloading full text:
+
+```python
+import legisbr
+from legisbr import Source
+
+# Fetch a specific law directly (raises NormNotFoundError if nothing matches)
+law = legisbr.get(Source.FEDERAL, number=14133, year=2021)
+print(law.title, law.document_url)
+
+# Metadata-only search → typed SearchResults[NormRef]
+results = legisbr.search(
+    Source.FEDERAL, year=2024, type="Lei Ordinária", text="energia", limit=5
+)
+for ref in results:
+    print(ref.year, ref.title, ref.url)
+
+# Fetch the top match or batch-fetch all matching norms
+doc = results.one().fetch()     # use results.first for NormRef | None
+docs = results.fetch()
+```
+
+Reuse connections, rate-limit pacing, and portal setup across multiple calls with `legisbr.Client`:
+
+```python
+with legisbr.Client() as client:
+    law = client.get(Source.FEDERAL, number=14133, year=2021)
+    results = client.search(Source.SP, year=2024, type="Lei", limit=5)
+    docs = results.fetch()
+```
+
+### 2. Stream, Archive & Query Locally
+
+Stream validated `Document` objects without writing to disk, or archive into SQLite, export to Parquet, and search locally:
+
+```python
+import legisbr
+from legisbr import Source
+
+# Zero-disk streaming
+for doc in legisbr.scrape(Source.SP, year=2024, limit=10):
+    print(doc.year, doc.title, len(doc.text_markdown))
+
+# Archive into SQLite (save_raw=False cuts disk usage by 80-95%)
+with legisbr.Client() as client:
+    store = legisbr.Store.for_source(
+        Source.SP, "outputs/legislation", save_raw=False, fts=True
+    )
+    result = client.run(Source.SP, year=2024, limit=25, store=store)
+
+# Export to Parquet (or .jsonl / .json — inferred from extension)
+legisbr.export("outputs/legislation/SAO_PAULO/documents.db", "sp_2024.parquet")
+
+# Instant diacritic-insensitive BM25 search across local archives
+for hit in legisbr.query(
+    "administracao publica",
+    data_dir="outputs/legislation",
+    sources=[Source.FEDERAL, Source.SP],
+    year=2024,
+    limit=5,
+):
+    print(f"[{hit.source}] {hit.title}: {hit.snippet}")
+```
+
+For repeated local lookups (`sources()`, `query()`, `get(source, doc_id)`, `stats()`), open `with legisbr.ArchiveIndex("outputs/legislation") as index:`.
+
+### 3. Async & High-Throughput Scraping
+
+`AsyncClient` and `AsyncArchiveIndex` provide native async parity for async applications and concurrent pipelines:
+
+```python
+import asyncio
+import legisbr
+from legisbr import Source
+
+
+async def main() -> None:
+    async with legisbr.AsyncClient() as client:
+        law = await client.get(Source.FEDERAL, number=14133, year=2021)
+        results = await client.search(Source.SP, year=2024, type="Lei", limit=5)
+        docs = await client.fetch_many(results)
+
+        async with client.scrape(Source.AC, year=2024, limit=10) as stream:
+            async for doc in stream:
+                print(doc.title)
+
+
+asyncio.run(main())
+```
+
+> **Small containers & CI runners:** Pass `low_memory=True` to `Client` or `AsyncClient` to cap workers (`<= 4`), use threaded PDF extraction, and shrink in-memory caches.
+
+## OCR for Scanned PDFs
+
+Install the `ocr` extra (`uv add "legisbr[ocr]"` or `pip install "legisbr[ocr]"`) and pass any [PydanticAI](https://ai.pydantic.dev/) model string (or comma-separated fallback list) to transcribe scanned PDFs automatically:
+
+```python
+import legisbr
+from legisbr import Source
+
+with legisbr.Client(ocr="anthropic:claude-haiku-5-5") as client:
+    for doc in client.scrape(Source.PI, year=2024, limit=5):
+        print(doc.title, len(doc.text_markdown))
+```
+
+Supports **OpenAI, Anthropic, Google, AWS Bedrock, Mistral, Groq, and Hugging Face** via PydanticAI using their standard provider environment variables (see [Configuration](#configuration)).
+
+## CLI
+
+Both `legisbr` and `python -m legisbr` expose the full CLI (source names, codes, and aliases are case-insensitive):
+
+```bash
+legisbr list                                                                  # list all 30 sources & capabilities
+legisbr search -s federal --year 2021 --number 14133 --strict-native --fetch  # live search + fetch Markdown
+legisbr run -s SP --year 2024 --no-raw --fts                                  # scrape into SQLite + FTS5
+legisbr query "licenciamento ambiental" --year 2024 --limit 20                # instant local BM25 search
+legisbr export -s SP --format parquet --single-file --out exports/sp.parquet  # export to ZSTD Parquet
+legisbr mcp serve --data-dir ./outputs/legislation                            # start MCP server for AI agents
+```
+
+Also includes `legisbr index --all` (build/rebuild FTS5 indexes), `legisbr import-json`, and `legisbr stats`.
+
+## MCP Server
+
+Give Claude Desktop, Claude Code, or any MCP-compatible AI agent instant, read-only BM25 search over local Brazilian legislation archives:
+
+```json
+{
+  "mcpServers": {
+    "legisbr": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "legisbr[mcp]",
+        "legisbr",
+        "mcp",
+        "serve",
+        "--data-dir",
+        "/path/to/outputs/legislation"
+      ]
+    }
+  }
+}
+```
+
+Tools exposed:
+
+- `list_sources` — all 30 jurisdictions with local archive coverage and search capabilities.
+- `search_legislation` — BM25 full-text search returning metadata and highlighted snippets.
+- `get_legislation` — full norm Markdown by `(source, doc_id)` with `max_chars` truncation safety.
+- `--allow-live-fetch` *(opt-in)* — enables `live_search_norms` and `live_fetch_norm` against official portals (`strict_native=True`, official-domain allowlist).
+
+For remote HTTP clients, pass `--transport streamable-http --host 127.0.0.1 --port 8000`.
+
+## Optional Extras
+
+| Extra | `uv` (project) | `pip` / `uv pip` | Purpose |
+| --- | --- | --- | --- |
+| `ocr` | `uv add "legisbr[ocr]"` | `pip install "legisbr[ocr]"` | Scanned PDF OCR via PydanticAI (OpenAI, Anthropic, Google, Bedrock, Mistral, Groq, Hugging Face) |
+| `proxy` | `uv add "legisbr[proxy]"` | `pip install "legisbr[proxy]"` | SOCKS/HTTP proxy rotation (`aiohttp-socks`, used for Paraná) |
+| `parquet` | `uv add "legisbr[parquet]"` | `pip install "legisbr[parquet]"` | Fixed-schema streaming ZSTD Parquet export (`pyarrow`) |
+| `mcp` | `uv add "legisbr[mcp]"` | `pip install "legisbr[mcp]"` | Model Context Protocol server (`mcp`) for AI agents |
+| `all` | `uv add "legisbr[all]"` | `pip install "legisbr[all]"` | All optional extras combined (zero GPL/AGPL/LGPL) |
+
+## Sources
+
+**30 Official Portals:** 1 Federal · 27 States · 2 Environmental — *official portals only, never `leisestaduais.com.br`.* Each code corresponds to a typed `legisbr.Source` enum member (e.g., `Source.FEDERAL`, `Source.SP`, `Source.PI`); string codes and aliases work interchangeably.
+
+<details>
+<summary>View all 30 sources &amp; native search capabilities</summary>
+
+| Code | Archive Name | Scope | Start | PDF | OCR | Native Search | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `federal` | `LEGISLACAO_FEDERAL` | Federal | 1808 | Yes | No | year, type, number, text, situation | 100 rps; Câmara dos Deputados portal (alias: `Camara`) |
+| `conama` | `CONAMA` | Environment | 1984 | Yes | Yes | year | — |
+| `icmbio` | `ICMBIO` | Environment | 2016 | Yes | No | client filter | cookies disabled |
+| `ac` | `ACRE` | State | 1963 | No | No | fast catalog | `insecure_tls` (missing intermediate CA) |
+| `al` | `ALAGOAS` | State | 1942 | Yes | Yes | year | 5 rps |
+| `am` | `AMAZONAS` | State | 1956 | No | No | year, type | 50 rps |
+| `ap` | `AMAPA` | State | 1991 | No | No | year, type | `--year` filters bill filing year |
+| `ba` | `BAHIA` | State | 1891 | No | No | year | 1 rps, `insecure_tls` (legacy TLS 1.2 RSA) |
+| `ce` | `CEARA` | State | 1968 | No | Yes | heavy setup (no strict native) | prefetches catalog in `setup()` |
+| `df` | `DISTRITO_FEDERAL` | State | 1922 | Yes | Yes | year | 100 rps, 100 workers |
+| `es` | `ESPIRITO_SANTO` | State | 1958 | Yes | Yes | year | 50 rps |
+| `go` | `GOIAS` | State | 1887 | Yes | Yes | year | 100 rps |
+| `ma` | `MARANHAO` | State | 1906 | Yes | Yes | year, type | — |
+| `mg` | `MINAS_GERAIS` | State | 1831 | Yes | Yes | year, type, number, text | — |
+| `ms` | `MATO_GROSSO_DO_SUL` | State | 1979 | No | No | year, type | — |
+| `mt` | `MATO_GROSSO` | State | 2017 | No | Yes | year | 5 rps |
+| `pa` | `PARA` | State | 1990 | Yes | Yes | year, type | 5 rps |
+| `pb` | `PARAIBA` | State | 1924 | Yes | Yes | year, type, number, text (SAPL) | 1 rps, 2 workers |
+| `pe` | `PERNAMBUCO` | State | 1835 | No | No | year | — |
+| `pi` | `PIAUI` | State | 1922 | Yes | Yes | year, type, number, text (SAPL) | — |
+| `pr` | `PARANA` | State | 2025 | No | No | year, type, number, direct ID | 0.3 rps, 35m 403-pause, optional `[proxy]` |
+| `rj` | `RIO_DE_JANEIRO` | State | 1891 | No | No | type (yearless) | 300s request timeout, 3 retries |
+| `rn` | `RIO_GRANDE_DO_NORTE` | State | 1971 | Yes | Yes | year | — |
+| `ro` | `RONDONIA` | State | 1981 | Yes | Yes | year, type | — |
+| `rr` | `RORAIMA` | State | 1991 | Yes | Yes | year, type, number, text (SAPL) | — |
+| `rs` | `RIO_GRANDE_DO_SUL` | State | 1830 | Yes | Yes | year | — |
+| `sc` | `SANTA_CATARINA` | State | 1946 | No | No | year, type | — |
+| `se` | `SERGIPE` | State | 1940 | Yes | Yes | year, type | — |
+| `sp` | `SAO_PAULO` | State | 1835 | Yes | Yes | year, type, number, situation | — |
+| `to` | `TOCANTINS` | State | 1989 | Yes | Yes | year, type | — |
+
+</details>
 
 ## Configuration
 
-Copy `.env.example` to `.env` and configure the following variables:
+Library code never auto-loads `.env` or mutates `os.environ`. The CLI loads `Settings.from_env(env_file=Path(".env"))` explicitly.
 
-| Variable | Description | Default |
-|---|---|---|
-| `LLM_PROVIDER` | LLM provider to use (`openai` or `bedrock`) | `openai` |
-| `LLM_API_KEY` | API key for the LLM provider (used for OCR on image-based PDFs) | — |
-| `LLM_MODEL` | Model name (e.g. `gpt-4o`); comma-separated for multiple models | — |
-| `PROVIDER_BASE_URL` | LLM provider base URL | `https://openrouter.ai/api/v1` |
-| `SAVE_DIR` | Base directory for scraped JSON output | `outputs/legislation` |
-| `STATE_LEGISLATION_SAVE_DIR` | Directory for state legislation documents | — |
-| `SPECIFIC_LEGISLATION_SAVE_DIR` | Directory for CONAMA/ICMBio documents | — |
-| `LOG_DIR` | Directory for per-scraper runtime logs and error logs | `logs/legislation` |
-| `PROXY_FILE_PATH` | Path to a file containing proxy URLs (one per line) | — |
-| `PROXY_ENDPOINT` | HTTP endpoint that returns proxy URLs | — |
+<details>
+<summary>Environment variables (.env)</summary>
 
-## Usage
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `SAVE_DIR` | Root directory for SQLite archives | `outputs/legislation` |
+| `STATE_LEGISLATION_SAVE_DIR` | Optional override root for state archives | `SAVE_DIR` |
+| `SPECIFIC_LEGISLATION_SAVE_DIR` | Optional override root for CONAMA / ICMBio | `SAVE_DIR` |
+| `LOG_DIR` | Optional directory for per-scraper CLI log files | Empty (stderr only) |
+| `LLM_MODEL` | PydanticAI model string or comma-separated fallback list (requires `legisbr[ocr]`) | Empty (OCR disabled) |
+| `LLM_PDF_INPUT` | Send sliced PDF batches instead of 150 DPI rendered PNG pages | `false` |
+| `LLM_BATCH_SIZE` | Pages per OCR request | `5` |
+| `LLM_CONCURRENCY` | Maximum concurrent OCR batches per scraper process | `8` |
+| `PDF_WORKERS` | Worker processes for PDF extraction (`0` forces thread mode) | `min(8, CPUs)` |
+| `PROXY_FILE_PATH` | Optional newline-separated proxy list for Paraná (`legisbr[proxy]`) | Empty |
+| `PROXY_ENDPOINT` | Optional proxy-list HTTP endpoint for Paraná (`legisbr[proxy]`) | Empty |
 
-### Run all enabled scrapers
+Provider credentials follow PydanticAI's standard environment variables (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `AWS_*` / `AWS_BEARER_TOKEN_BEDROCK`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `HF_TOKEN`).
 
-```bash
-uv run main.py
-```
+</details>
 
-By default, only scrapers with `run=True` in their config will execute. Edit `main.py` → `build_scraper_configs()` to toggle which scrapers are enabled.
+## Legal Notice, Contributing & License
 
-### Verbose logging
+- **Public domain:** Official Brazilian laws, decrees, resolutions, and normative acts are excluded from copyright protection under **Lei nº 9.610/1998, art. 8º, I**.
+- **Official portals only:** `legisbr` queries official government portals with conservative per-source rate limits and never scrapes `leisestaduais.com.br`.
+- **No legal advice:** Extracted text reflects the official portal at scrape time and is provided as-is for research, indexing, and engineering; always verify authoritative texts before legal reliance.
 
-```bash
-# Default: Shows only warnings, errors, and progress bars
-uv run main.py
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the 10-minute broken-scraper fix guide, and the PR checklist.
 
-# Verbose mode: Shows all info logs including debug messages
-uv run main.py --verbose
-```
-
-When `--verbose` is not specified, scrapers only log warnings, errors, and show tqdm progress bars in the terminal. With `--verbose`, all debug and info messages are displayed in the terminal.
-
-Each scraper also writes a debug-level runtime log to `LOG_DIR/<SCRAPER>/runtime.log` on every run. Structured document error JSON files are saved in the same scraper log directory.
-
-### Run specific scrapers by name
-
-```bash
-uv run main.py --scrapers MTAlmt Conama SaoPauloAlesp
-```
-
-### Overwrite previously scraped data
-
-```bash
-uv run main.py --overwrite
-```
-
-By default, scrapers resume from where they left off using document-level `(document_url, title)` keys. The `--overwrite` flag disables this resume logic and re-scrapes everything.
-
-### List all available scrapers
-
-```bash
-uv run main.py --list
-```
-
-## Project Structure
-
-```
-├── main.py                          # Entry point & CLI (asyncio.run)
-├── pyproject.toml                   # Project config & dependencies
-├── .env.example                     # Environment variable template
-├── src/
-│   ├── database/
-│   │   └── saver.py                 # FileSaver — async JSON persistence (aiofiles) with document-level resume
-│   ├── scraper/
-│   │   ├── base/
-│   │   │   ├── scraper.py           # BaseScraper & StateScraper — async HTTP, PDF/OCR, markdown, save/resume
-│   │   │   ├── sapl_scraper.py      # SAPLBaseScraper — base for SAPL REST API sites (Paraíba, Piauí, Roraima)
-│   │   │   └── concurrency.py       # RateLimiter, bounded_gather(), run_in_thread()
-│   │   ├── federal_legislation/
-│   │   │   └── scrape.py            # CamaraDepScraper
-│   │   ├── conama/
-│   │   │   └── scrape.py            # ConamaScraper
-│   │   ├── icmbio/
-│   │   │   └── scrape.py            # ICMBioScraper
-│   │   └── state_legislation/       # 27 state-specific scrapers
-│   │       ├── acre.py
-│   │       ├── alagoas.py
-│   │       ├── ...
-│   │       └── tocantins.py
-│   ├── services/
-│   │   ├── browser/
-│   │   │   └── playwright.py        # BrowserService — Playwright page pool
-│   │   ├── ocr/
-│   │   │   ├── llm.py               # LLMOCRService — PDF/image-to-Markdown via LLM vision
-│   │   │   └── bedrock.py           # BedrockClient — AWS Bedrock Converse API adapter
-│   │   ├── proxy/
-│   │   │   └── service.py           # ProxyService — proxy rotation from file or endpoint
-│   │   └── request/
-│   │       └── service.py           # RequestService — async HTTP with rate limiting & retries
-│   └── utils/
-│       ├── __init__.py              # clean_md_tag() — strips markdown code block wrappers
-│       └── image_inliner.py         # inline_images_in_html() — async base64 image inlining
-```
-
-## Architecture
-
-The project uses an **async-first** concurrency model with optimized parallelism:
-
-### Concurrency Levels
-- **Years** — scraped **sequentially** (one year completes before next starts)
-  - Prevents resource exhaustion with many years
-  - Better progress visibility and logging
-  - Each year's data completes fully before moving to next
-- **Types/Situations** — scraped **concurrently** within each year via `asyncio.gather()`
-  - All document types for a year scrape in parallel
-  - Nested situation+type combinations run concurrently
-  - Significantly faster when a year has many types
-- **Pages** — scraped **concurrently** via `asyncio.gather()`
-- **Documents** — scraped **concurrently** via `asyncio.gather()`
-
-### Rate Limiting
-- **HTTP requests** — each scraper has its own `RateLimiter` (via `RequestService`), configured independently with its `rps` parameter. Scrapers targeting different websites do not interfere with each other.
-- **LLM requests** — all scrapers share a single `RateLimiter` instance for LLM API calls, since they all query the same LLM endpoint. This prevents exceeding the provider's rate limit when multiple scrapers run in parallel.
-
-### Technology Stack
-- **HTTP I/O** — `aiohttp.ClientSession` for non-blocking requests with per-scraper sliding-window rate limiting
-- **HTML→Markdown** — `html-to-markdown` for HTML content conversion with full base64 image preservation; `pymupdf4llm` for PDF-to-markdown with embedded images
-- **LLM OCR** — vision model-based PDF/image extraction via OpenAI-compatible API or AWS Bedrock Converse API
-- **File I/O** — `aiofiles` for non-blocking JSON writes
-- **Browser automation** (3 scrapers) — Playwright async API (natively async, no thread wrappers)
-- **CPU-bound work** (PDF/image conversion) — offloaded via `asyncio.to_thread()`
-- **Retries** — `tenacity` for async retry logic with exponential backoff
-- **Proxy support** — optional proxy rotation from a file or HTTP endpoint
-
-## Development
-
-Install dev dependencies:
-
-```bash
-uv sync --group dev
-```
-
-Lint and format:
-
-```bash
-uv run ruff check --fix src/ main.py
-uv run ruff format src/ main.py
-```
-
-Run tests:
-
-```bash
-# Fast tests (recommended for development) - skips slow integration tests
-uv run pytest -m "not integration"
-
-# Parallel execution (faster on multi-core systems)
-uv run pytest -n auto -m "not integration"
-
-# Run all tests (including slow integration tests)
-uv run pytest tests/
-
-# Run a single test file
-uv run pytest tests/test_core.py
-
-# Run only integration tests (requires network and credentials)
-uv run pytest tests/ -m integration
-
-# Run tests with timing information
-uv run pytest --durations=10
-```
-
-**Test Performance**: The test suite has been optimized for speed:
-- **Fast tests**: ~12 seconds (98.3% faster than before)
-- **Integration tests**: Include live network calls and may take several minutes
-- **Parallel execution**: Use `-n auto` for multi-core speedup
-
-Integration tests make real network requests to live legislative websites. They require internet access and (for Snowflake tests) valid credentials in `.env`. Use `-m "not integration"` for fast offline or CI runs.
-
-Run pre-commit hooks on all files:
-
-```bash
-uv run pre-commit run --all-files
-```
-
-Pre-commit runs trailing-whitespace, end-of-file, large-file checks, ruff linting/formatting, and the full pytest suite (including integration tests) on every commit.
-
-## License
-
-See [LICENSE](LICENSE) for details.
+Licensed under the [MIT License](LICENSE).

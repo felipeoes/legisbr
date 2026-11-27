@@ -1,63 +1,31 @@
-"""Tests for LegislaGoias scraper.
+"Parser and metadata regression tests for goias_scraper."
 
-Covers:
-- TYPES constant: 10 types present with id + url_suffix structure
-- _TYPE_ID_TO_SUFFIX: reverse mapping from type id to url_suffix
-- SITUATIONS module-level dict preserved (empty dict for Goias — situations come from API)
-- Class docstring accessible (__doc__ is not None)
-- _build_search_url: correct URL + query params, optional norm_type_id, page=1 default
-- _clean_markdown: strips javascript:print(), strips whitespace
-- _process_pdf_link: download failure/invalid markdown → None, valid → correct shape,
-  sets document_url when missing vs pdf_link when already set
-- _get_doc_info: HTTP error → None, early resume skip (before detail API call) → None,
-  redirect guard → None, HTML with baixar_div as secondary pdf source,
-  HTML to markdown happy path, stub HTML falls back to PDF,
-  invalid markdown falls back to PDF, javascript error message guard → None,
-  saves successful HTML as `.html`, derives norm_url_suffix from search result
-- _fetch_search_page: HTTP error → empty list, valid → list of docs
-- _scrape_year: single paginated fetch per year, handles empty results, delegates to
-  _process_documents and uses _fetch_all_pages for remaining pages
+from __future__ import annotations
 
-Run with:
-    uv run pytest tests/scrapers/state/test_goias_scraper.py -v
-"""
-
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from base_tests import ScraperClassTests, SituationsConstantTests, TypesConstantTests
-from conftest import make_base_scraper
+from bs4 import BeautifulSoup
+from conftest import make_mock_json_response, make_scraper
+from parser_assertions import (
+    ScraperClassTests,
+    SituationsConstantTests,
+    TypesConstantTests,
+)
 
-from src.scraper.state_legislation.goias import (
+from legisbr.scrapers.states.go import (
     _TYPE_ID_TO_SUFFIX,
     SITUATIONS,
     TYPES,
     LegislaGoias,
-    _remove_summary_from_markdown,
+    remove_summary_from_markdown,
 )
-
-# ---------------------------------------------------------------------------
-# Factory helper
-# ---------------------------------------------------------------------------
 
 
 def _make_scraper(**kwargs) -> LegislaGoias:
-    """Instantiate LegislaGoias bypassing __init__ (no network, no I/O)."""
-    return make_base_scraper(
-        LegislaGoias,
-        "https://legisla.casacivil.go.gov.br/api/v2/pesquisa/legislacoes",
-        "GOIAS",
-        {k: dict(v) for k, v in TYPES.items()},
-        dict(SITUATIONS),
-        **kwargs,
-    )
-
-
-def _make_valid_md() -> str:
-    return (
-        "# Lei Estadual\n\nO governador do estado de Goiás decreta a presente lei. "
-        * 30
-    )
+    """Instantiate LegislaGoias with injected dependencies."""
+    return make_scraper(LegislaGoias, **kwargs)
 
 
 def _make_doc_detail(
@@ -106,11 +74,6 @@ def _make_response(data: dict) -> MagicMock:
     return resp
 
 
-# ---------------------------------------------------------------------------
-# TYPES constant
-# ---------------------------------------------------------------------------
-
-
 class TestTypesConstant(TypesConstantTests):
     TYPES = TYPES
     EXPECTED_COUNT = 10
@@ -127,11 +90,6 @@ class TestTypesConstant(TypesConstantTests):
             assert isinstance(data["id"], int), f"{name} id is not int"
 
 
-# ---------------------------------------------------------------------------
-# _TYPE_ID_TO_SUFFIX
-# ---------------------------------------------------------------------------
-
-
 class TestTypeIdToSuffix:
     def test_maps_all_type_ids(self):
         for name, data in TYPES.items():
@@ -144,20 +102,10 @@ class TestTypeIdToSuffix:
         assert _TYPE_ID_TO_SUFFIX[12] == "constituicao-estadual"
 
 
-# ---------------------------------------------------------------------------
-# SITUATIONS constant
-# ---------------------------------------------------------------------------
-
-
 class TestSituationsConstant(SituationsConstantTests):
     SITUATIONS = SITUATIONS
     EXPECTED_TYPE = dict
     EXPECTED_EMPTY = True
-
-
-# ---------------------------------------------------------------------------
-# Class-level attributes
-# ---------------------------------------------------------------------------
 
 
 class TestClassAttributes(ScraperClassTests):
@@ -167,11 +115,6 @@ class TestClassAttributes(ScraperClassTests):
     def test_situations_empty_by_default(self):
         scraper = _make_scraper()
         assert scraper.situations == {}
-
-
-# ---------------------------------------------------------------------------
-# _build_search_url
-# ---------------------------------------------------------------------------
 
 
 class TestBuildSearchUrl:
@@ -215,11 +158,6 @@ class TestBuildSearchUrl:
         assert "page=1" in url
 
 
-# ---------------------------------------------------------------------------
-# _clean_markdown
-# ---------------------------------------------------------------------------
-
-
 class TestCleanMarkdown:
     def test_removes_javascript_print(self):
         scraper = _make_scraper()
@@ -237,16 +175,11 @@ class TestCleanMarkdown:
         assert scraper._clean_markdown(text) == text
 
 
-# ---------------------------------------------------------------------------
-# _remove_summary_from_markdown
-# ---------------------------------------------------------------------------
-
-
 class TestRemoveSummaryFromMarkdown:
     def test_removes_matching_standalone_paragraph(self):
         summary = "Altera o Decreto nº 10.218 de 2023."
         md = f"# DECRETO\n\n{summary}\n\nO GOVERNADOR decreta:"
-        result = _remove_summary_from_markdown(md, summary)
+        result = remove_summary_from_markdown(md, summary)
         assert summary not in result
         assert "# DECRETO" in result
         assert "O GOVERNADOR decreta:" in result
@@ -254,531 +187,168 @@ class TestRemoveSummaryFromMarkdown:
     def test_noop_when_summary_embedded_in_article(self):
         summary = "Fica aberto crédito suplementar."
         md = "# Portaria\n\nO SECRETÁRIO resolve:\n\nArt. 1º Fica aberto crédito suplementar.\n\nArt. 2º Esta portaria entra em vigor nesta data."
-        result = _remove_summary_from_markdown(md, summary)
+        result = remove_summary_from_markdown(md, summary)
         assert result == md
 
     def test_noop_when_summary_empty(self):
         md = "# Lei\n\nConteúdo da lei."
-        assert _remove_summary_from_markdown(md, "") == md
+        assert remove_summary_from_markdown(md, "") == md
 
     def test_noop_when_summary_not_found(self):
         md = "# Lei\n\nConteúdo completamente diferente."
-        result = _remove_summary_from_markdown(md, "Ementa que não existe no texto.")
+        result = remove_summary_from_markdown(md, "Ementa que não existe no texto.")
         assert result == md
 
     def test_normalizes_extra_whitespace_in_summary(self):
         summary = "Dispõe sobre  a reorganização   administrativa."
         md = "# Lei\n\nDispõe sobre a reorganização administrativa.\n\nArt. 1º ..."
-        result = _remove_summary_from_markdown(md, summary)
+        result = remove_summary_from_markdown(md, summary)
         assert "Dispõe sobre a reorganização administrativa." not in result
 
     def test_strips_markdown_formatting_chars_from_paragraph(self):
         summary = "Dispõe sobre a reorganização administrativa."
         md = "# Lei\n\n**Dispõe sobre a reorganização administrativa.**\n\nArt. 1º ..."
-        result = _remove_summary_from_markdown(md, summary)
+        result = remove_summary_from_markdown(md, summary)
         assert "Dispõe sobre a reorganização administrativa." not in result
 
     def test_removes_only_first_occurrence_if_duplicate_paragraphs(self):
         summary = "Ementa da lei."
         md = f"# Lei\n\n{summary}\n\nConteúdo\n\n{summary}"
-        result = _remove_summary_from_markdown(md, summary)
-        # Both occurrences are standalone paragraphs — both should be removed
+        result = remove_summary_from_markdown(md, summary)
         assert result.count(summary) == 0
 
 
-# ---------------------------------------------------------------------------
-# _process_pdf_link
-# ---------------------------------------------------------------------------
-
-
-class TestProcessPdfLink:
-    @pytest.mark.asyncio
-    async def test_download_failure_returns_none(self):
+class TestPrepareInlineHtml:
+    def test_uses_the_document_with_text_when_two_are_concatenated(self):
+        """Lei 17.604/2012: the API prepends an empty HTML shell to the real document."""
         scraper = _make_scraper()
-        scraper._download_and_convert = AsyncMock(return_value=("", b"", ""))
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf",
-            "42",
-            {
-                "title": "Lei 001",
-                "year": 2020,
-                "type": "Lei Ordinária",
-                "situation": "Vigente",
-            },
+        content = (
+            "<!DOCTYPE html><html><head><title>Lei</title></head><body>\n</body></html>"
+            "<html><head></head><body><p>Art. 1º Ficam reajustados os valores das"
+            " pensões especiais.</p></body></html>"
         )
-        assert result is None
+        clean_html, pdf_link, redirect = scraper._prepare_inline_html(content)
+        assert "Ficam reajustados" in clean_html
+        assert (pdf_link, redirect) == ("", False)
 
     @pytest.mark.asyncio
-    async def test_invalid_markdown_returns_none(self):
+    async def test_unwraps_legacy_layout_table_while_preserving_annex_data_table(self):
         scraper = _make_scraper()
-        scraper._download_and_convert = AsyncMock(
-            return_value=("short", b"%PDF short", ".pdf")
+        html = """
+        <html><body>
+          <table border="0" width="100%">
+            <tr><td><img src="../../assets/brasao_goias.gif"/><strong>GOVERNO DO ESTADO DE GOIÁS</strong></td></tr>
+            <tr><td>Secretaria de Estado da Casa Civil</td></tr>
+          </table>
+          <table border="0" width="100%">
+            <tbody><tr>
+              <td width="6%">&nbsp;</td>
+              <td width="94%">
+                <p>Dispõe sobre cargos e vencimentos.</p>
+                <p>Art. 1º Ficam criados os cargos do Anexo Único.</p>
+                <p>Art. 2º Esta Lei entra em vigor na data de sua publicação.</p>
+                <table border="1">
+                  <tr><th>Cargo</th><th>Vagas</th></tr>
+                  <tr><td>Analista</td><td>10</td></tr>
+                  <tr><td>Técnico</td><td>20</td></tr>
+                </table>
+                <p><a href="/api/v1/arquivos/1"><img src="../../assets/winzip.jpg"/></a>
+                <a href="/api/v1/arquivos/2">Download do Anexo</a></p>
+              </td>
+            </tr></tbody>
+          </table>
+        </body></html>
+        """
+        clean_html, _, _ = scraper._prepare_inline_html(html)
+        soup = BeautifulSoup(clean_html, "lxml")
+        tables = soup.find_all("table")
+        assert len(tables) == 1
+        assert "Analista" in tables[0].get_text()
+        assert "winzip.jpg" not in clean_html
+        assert "Download do Anexo" not in clean_html
+        assert "brasao_goias.gif" not in clean_html
+
+        md = scraper._clean_markdown(
+            await scraper.markdown(
+                html=clean_html,
+                base_url="https://legisla.casacivil.go.gov.br/pesquisa_legislacao/1/lei-1",
+            )
         )
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf",
-            "42",
-            {
-                "title": "Lei 001",
-                "year": 2020,
-                "type": "Lei Ordinária",
-                "situation": "Vigente",
-            },
+        assert not md.lstrip().startswith("|")
+        assert "Art. 1º" in md
+        assert "Art. 2º" in md
+        assert any("Art. 1º" in ln and "Art. 2º" not in ln for ln in md.splitlines())
+        assert re.search(r"\|\s*Analista\s*\|\s*10\s*\|", md)
+
+    def test_preserves_epigrafe_inside_header_table(self):
+        """Lei 17.928/2012 (id=76): epígrafe sits inside the GOVERNO DO ESTADO DE GOIÁS table."""
+        scraper = _make_scraper()
+        html = """
+        <html><body>
+          <table border="0" width="100%"><tr><td>
+            <p align="center">
+              <img src="/assets/brasao_goias.gif"/>
+              <strong>GOVERNO DO ESTADO DE GOIÁS</strong><br/>
+              <strong>Secretaria de Estado da Casa Civil</strong><br/>
+              <b>LEI Nº 17.928, DE 27 DE DEZEMBRO DE 2012.</b>
+            </p>
+          </td></tr></table>
+          <table border="0" width="100%"><tr><td width="1%">&nbsp;</td><td width="99%">
+            <p>Art. 1º Normas suplementares de licitações.</p>
+          </td></tr></table>
+        </body></html>
+        """
+        clean_html, _, _ = scraper._prepare_inline_html(html)
+        assert "LEI Nº 17.928, DE 27 DE DEZEMBRO DE 2012." in clean_html
+        assert "GOVERNO DO ESTADO DE GOIÁS" not in clean_html
+        assert "Secretaria de Estado da Casa Civil" not in clean_html
+
+    def test_build_doc_info_decodes_cp1252_c1_bytes_in_summary(self):
+        scraper = _make_scraper()
+        detail = _make_doc_detail(
+            ementa="Disp\u00f5e sobre Goi\u00e1s Previd\u00eancia \x96 GOIASPREV e \x93normas\x94."
         )
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_valid_pdf_returns_correct_shape(self):
-        scraper = _make_scraper()
-        valid_md = _make_valid_md()
-        scraper._download_and_convert = AsyncMock(
-            return_value=(valid_md, b"%PDF content", ".pdf")
+        info = scraper._build_doc_info(
+            {}, detail, norm_type="Lei Ordinária", situation="Vigente"
         )
-        doc_info = {
-            "title": "Lei 001",
-            "summary": "ementa",
-            "year": 2020,
-            "type": "Lei Ordinária",
-            "situation": "Vigente",
-        }
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf", "42", doc_info
-        )
-        assert result is not None
-        assert result["_content_extension"] == ".pdf"
-        assert result["document_url"] == "http://example.com/doc.pdf"
-        assert result["_raw_content"] == b"%PDF content"
+        assert "\x96" not in info["summary"]
+        assert "\x93" not in info["summary"]
+        assert "\x94" not in info["summary"]
+        assert "– GOIASPREV" in info["summary"]
+        assert "“normas”" in info["summary"]
 
     @pytest.mark.asyncio
-    async def test_sets_pdf_link_when_document_url_already_set(self):
+    async def test_fetch_passes_document_url_as_base_url_and_strips_summary(self):
         scraper = _make_scraper()
-        valid_md = _make_valid_md()
-        scraper._download_and_convert = AsyncMock(
-            return_value=(valid_md, b"%PDF content", ".pdf")
-        )
-        doc_info = {
-            "title": "Lei 001",
-            "summary": "ementa",
-            "document_url": "https://existing.url",
-            "year": 2020,
-            "type": "Lei Ordinária",
-            "situation": "Vigente",
-        }
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf", "42", doc_info
-        )
-        assert result is not None
-        assert result["document_url"] == "https://existing.url"
-        assert result["pdf_link"] == "http://example.com/doc.pdf"
-
-    @pytest.mark.asyncio
-    async def test_clean_markdown_applied(self):
-        scraper = _make_scraper()
-        valid_md = _make_valid_md() + " javascript:print()"
-        scraper._download_and_convert = AsyncMock(
-            return_value=(valid_md, b"%PDF content", ".pdf")
-        )
-        doc_info = {
-            "title": "Lei 001",
-            "summary": "ementa",
-            "year": 2020,
-            "type": "Lei Ordinária",
-            "situation": "Vigente",
-        }
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf", "42", doc_info
-        )
-        assert result is not None
-        assert "javascript:print()" not in result["text_markdown"]
-
-    @pytest.mark.asyncio
-    async def test_summary_removed_from_pdf_markdown(self):
-        scraper = _make_scraper()
-        summary = "Dispõe sobre reorganização administrativa do Estado."
-        # Build valid markdown that includes the summary as a standalone paragraph
-        valid_body = "# Lei Estadual\n\n" + "O governador do estado decreta. " * 30
-        valid_md = valid_body + f"\n\n{summary}\n\nArt. 1º Disposições gerais."
-        scraper._download_and_convert = AsyncMock(
-            return_value=(valid_md, b"%PDF content", ".pdf")
-        )
-        doc_info = {
-            "title": "Lei 001",
-            "summary": summary,
-            "year": 2020,
-            "type": "Lei Ordinária",
-            "situation": "Vigente",
-        }
-        result = await scraper._process_pdf_link(
-            "http://example.com/doc.pdf", "42", doc_info
-        )
-        assert result is not None
-        paragraphs = result["text_markdown"].split("\n\n")
-        assert summary not in paragraphs
-
-
-# ---------------------------------------------------------------------------
-# _get_doc_data
-# ---------------------------------------------------------------------------
-
-
-class TestGetDocInfo:
-    @pytest.mark.asyncio
-    async def test_http_error_returns_none(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        failed = MagicMock()
-        failed.__bool__ = MagicMock(return_value=False)
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(_make_search_result())
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_resume_skip_returns_none_without_api_call(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=True)
-        scraper.request_service.make_request = AsyncMock()
-        result = await scraper._get_doc_data(_make_search_result())
-        assert result is None
-        # Detail API should NOT be called when resume-skipping
-        scraper.request_service.make_request.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_redirect_guard_saves_error_and_returns_none(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        scraper._save_doc_error = AsyncMock()
-        conteudo = "<html><body>Clique no link abaixo para acessar a: constituição</body></html>"
-        detail = _make_doc_detail(conteudo=conteudo)
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        result = await scraper._get_doc_data(_make_search_result())
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_no_conteudo_without_pdf_link_returns_none(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        detail = _make_doc_detail(conteudo="")
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(_make_search_result())
-        assert result is None
-        scraper._save_doc_error.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_valid_html_content_returns_doc(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        # Long enough content (after stripping summary) to pass the 150-char threshold
-        long_content = "<p>" + "Lei text " * 100 + "</p>"
-        detail = _make_doc_detail(conteudo=long_content, ementa="ementa")
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        valid_md = _make_valid_md()
-        scraper._get_markdown = AsyncMock(return_value=valid_md)
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(_make_search_result())
-        assert result is not None
-        assert result["type"] == "Lei Ordinária"
-        assert result["text_markdown"] is not None
-
-    @pytest.mark.asyncio
-    async def test_summary_removed_from_html_markdown(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        summary = "Dispõe sobre a reorganização administrativa do Poder Executivo."
-        long_content = "<p>" + "Lei text " * 100 + "</p>"
-        detail = _make_doc_detail(conteudo=long_content, ementa=summary)
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        # Include the summary as a standalone paragraph in the markdown output
-        valid_body = _make_valid_md()
-        valid_md_with_summary = f"# DECRETO\n\n{summary}\n\n{valid_body}"
-        scraper._get_markdown = AsyncMock(return_value=valid_md_with_summary)
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(_make_search_result())
-        assert result is not None
-        paragraphs = result["text_markdown"].split("\n\n")
-        assert summary not in paragraphs
-
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        detail = _make_doc_detail(conteudo="<p>" + "Lei text " * 100 + "</p>")
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
-        scraper._capture_mhtml = AsyncMock()
-        scraper._save_doc_error = AsyncMock()
-
-        result = await scraper._get_doc_data(_make_search_result())
-
-        assert result is not None
-        assert result["_content_extension"] == ".html"
-        scraper._capture_mhtml.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_stub_html_with_pdf_link_falls_back_to_pdf_even_if_markdown_valid(
-        self,
-    ):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        conteudo = (
-            '<a href="/api/v1/arquivos/14168"><img src="/assets/ver_lei.jpg"></a>'
-            "<p>Ementa da lei</p><p>(D.O. de 29-12-1978)</p>"
-        )
-        detail = _make_doc_detail(conteudo=conteudo, ementa="Ementa da lei")
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._get_markdown = AsyncMock(
-            return_value=("Ementa da lei " * 8) + "Diario Oficial"
-        )
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "Lei 001",
-                "text_markdown": _make_valid_md(),
-                "document_url": "http://x.com",
-                "type": "Lei Ordinária",
-                "situation": "Vigente",
-                "year": 2020,
-                "summary": "",
-            }
-        )
-        scraper._save_doc_error = AsyncMock()
-
-        result = await scraper._get_doc_data(_make_search_result())
-
-        assert result is not None
-        scraper._process_pdf_link.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_type_falls_back_to_search_row_when_detail_type_missing(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        detail = _make_doc_detail(conteudo="<p>" + "Lei text " * 100 + "</p>")
-        detail["tipo_legislacao"] = {}
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._get_markdown = AsyncMock(return_value=_make_valid_md())
-        scraper._save_doc_error = AsyncMock()
-
-        result = await scraper._get_doc_data(
-            _make_search_result(tipo_nome="Resolução", tipo_id=7)
-        )
-
-        assert result is not None
-        assert result["type"] == "Resolução"
-
-    @pytest.mark.asyncio
-    async def test_javascript_error_msg_guard(self):
-        """valid_markdown catches the JS-disabled message; no PDF fallback → error."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        content = "<p>Some content</p>"
-        detail = _make_doc_detail(conteudo=content, ementa="ementa")
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        bad_md = "doesn't work properly without JavaScript enabled " * 10
-        scraper._get_markdown = AsyncMock(return_value=bad_md)
-        scraper._save_doc_error = AsyncMock()
-        result = await scraper._get_doc_data(_make_search_result())
-        # valid_markdown catches the JS error pattern → no PDF link → saves error
-        scraper._save_doc_error.assert_called_once()
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_constituicao_url_has_no_number_suffix(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
         detail = _make_doc_detail(
             doc_id=42,
-            numero="001",
-            tipo_nome="Constituição Estadual",
-            tipo_id=12,
-            conteudo="",
+            numero="17.928",
+            ano=2012,
+            ementa="Disp\u00f5e sobre licita\u00e7\u00f5es \x96 regras gerais.",
+            conteudo=(
+                '<table border="0"><tr><td>&nbsp;</td><td>'
+                "<p>Dispõe sobre licita\xadções – regras gerais.</p>"
+                "<p>Art. 1º Esta Lei estabelece normas suplementares de licitações e contratos "
+                "no âmbito da administração pública estadual direta e indireta.</p>"
+                "</td></tr></table>"
+            ),
         )
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._save_doc_error = AsyncMock()
-        search_result = _make_search_result(
-            doc_id=42, numero="001", tipo_nome="Constituição Estadual", tipo_id=12
+        scraper.http.request = AsyncMock(return_value=make_mock_json_response(detail))
+        captured_base_urls: list[str | None] = []
+        orig_markdown = scraper.markdown
+
+        async def spy_markdown(*, html: str, base_url: str | None = None) -> str:
+            captured_base_urls.append(base_url)
+            return await orig_markdown(html=html, base_url=base_url)
+
+        scraper.markdown = spy_markdown  # type: ignore[method-assign]
+        doc = await scraper.fetch(
+            _make_search_result(doc_id=42, numero="17.928", ano=2012)
         )
-        await scraper._get_doc_data(search_result)
-        # Check is_already_scraped was called with URL ending in /constituicao-estadual (no number)
-        called_url = scraper._is_already_scraped.call_args[0][0]
-        assert called_url.endswith("constituicao-estadual")
-        assert "001" not in called_url
-
-    @pytest.mark.asyncio
-    async def test_derives_suffix_from_search_result_tipo_id(self):
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        detail = _make_doc_detail(
-            doc_id=99, numero="55", tipo_nome="Resolução", tipo_id=7
-        )
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._save_doc_error = AsyncMock()
-        search_result = _make_search_result(
-            doc_id=99, numero="55", tipo_nome="Resolução", tipo_id=7
-        )
-        await scraper._get_doc_data(search_result)
-        called_url = scraper._is_already_scraped.call_args[0][0]
-        assert "resolucao-55" in called_url
-
-    @pytest.mark.asyncio
-    async def test_baixar_div_used_as_secondary_pdf_source(self):
-        """When ver_lei.jpg is absent, baixar_div provides the pdf_link."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        # HTML with botao-baixar but no ver_lei.jpg, and short content to trigger PDF fallback
-        conteudo = '<div class="botao-baixar"><a href="/api/v1/arquivos/123">Download</a></div><p>short</p>'
-        detail = _make_doc_detail(conteudo=conteudo, ementa="short")
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        # Make markdown invalid to force PDF fallback
-        scraper._get_markdown = AsyncMock(return_value="x")
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "Lei 001",
-                "text_markdown": _make_valid_md(),
-                "document_url": "http://x.com",
-                "type": "Lei Ordinária",
-                "situation": "Vigente",
-                "year": 2020,
-                "summary": "",
-            }
-        )
-        scraper._save_doc_error = AsyncMock()
-        await scraper._get_doc_data(_make_search_result())
-        # _process_pdf_link should be called with the baixar_div link
-        scraper._process_pdf_link.assert_called_once()
-        assert (
-            scraper._process_pdf_link.call_args[0][0]
-            == "https://legisla.casacivil.go.gov.br/api/v1/arquivos/123"
-        )
-
-    @pytest.mark.asyncio
-    async def test_baixar_div_does_not_override_ver_lei_pdf_link(self):
-        """When both ver_lei.jpg and baixar_div exist, ver_lei.jpg link is used."""
-        scraper = _make_scraper()
-        scraper._is_already_scraped = MagicMock(return_value=False)
-        conteudo = (
-            '<a href="/api/v1/arquivos/primary"><img src="/assets/ver_lei.jpg"></a>'
-            '<div class="botao-baixar"><a href="/api/v1/arquivos/secondary">Download</a></div>'
-            "<p>short</p>"
-        )
-        detail = _make_doc_detail(conteudo=conteudo, ementa="short")
-        response = _make_response(detail)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._get_markdown = AsyncMock(return_value="x")
-        scraper._process_pdf_link = AsyncMock(
-            return_value={
-                "title": "Lei 001",
-                "text_markdown": _make_valid_md(),
-                "document_url": "http://x.com",
-                "type": "Lei Ordinária",
-                "situation": "Vigente",
-                "year": 2020,
-                "summary": "",
-            }
-        )
-        scraper._save_doc_error = AsyncMock()
-        await scraper._get_doc_data(_make_search_result())
-        # Should use the ver_lei.jpg link, NOT the baixar_div link
-        scraper._process_pdf_link.assert_called_once()
-        assert (
-            scraper._process_pdf_link.call_args[0][0]
-            == "https://legisla.casacivil.go.gov.br/api/v1/arquivos/primary"
-        )
-
-
-# ---------------------------------------------------------------------------
-# _fetch_search_page
-# ---------------------------------------------------------------------------
-
-
-class TestFetchSearchPage:
-    @pytest.mark.asyncio
-    async def test_http_error_returns_empty_list(self):
-        scraper = _make_scraper()
-        failed = MagicMock()
-        failed.__bool__ = MagicMock(return_value=False)
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._fetch_search_page(2025, 2)
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_returns_page_results(self):
-        scraper = _make_scraper()
-        payload = {"total_resultados": 1, "resultados": [_make_search_result()]}
-        response = _make_response(payload)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        result = await scraper._fetch_search_page(2025, 2)
-        assert result == payload["resultados"]
-
-
-# ---------------------------------------------------------------------------
-# _scrape_year
-# ---------------------------------------------------------------------------
-
-
-class TestScrapeYear:
-    @pytest.mark.asyncio
-    async def test_empty_year_returns_empty_list(self):
-        scraper = _make_scraper()
-        response = _make_response({"total_resultados": 0, "resultados": []})
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        result = await scraper._scrape_year(2025)
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_http_error_returns_empty_list(self):
-        scraper = _make_scraper()
-        failed = MagicMock()
-        failed.__bool__ = MagicMock(return_value=False)
-        scraper.request_service.make_request = AsyncMock(return_value=failed)
-        result = await scraper._scrape_year(2025)
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_single_page_processes_documents_once(self):
-        scraper = _make_scraper()
-        data = {"total_resultados": 5, "resultados": [_make_search_result()]}
-        response = _make_response(data)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._process_documents = AsyncMock(return_value=[{"title": "Doc"}])
-        result = await scraper._scrape_year(2025)
-        assert len(result) == 1
-        scraper._process_documents.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_multi_page_uses_fetch_all_pages(self):
-        scraper = _make_scraper()
-        data = {"total_resultados": 150, "resultados": [_make_search_result(doc_id=1)]}
-        response = _make_response(data)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        scraper._fetch_all_pages = AsyncMock(
-            return_value=[_make_search_result(doc_id=2)]
-        )
-        scraper._process_documents = AsyncMock(return_value=[{"title": "Doc"}])
-
-        result = await scraper._scrape_year(2025)
-
-        assert result == [{"title": "Doc"}]
-        scraper._fetch_all_pages.assert_called_once()
-        scraper._process_documents.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_builds_url_without_tipo_legislacao(self):
-        """_scrape_year should fetch all types at once (no tipo_legislacao param)."""
-        scraper = _make_scraper()
-        data = {"total_resultados": 0, "resultados": []}
-        response = _make_response(data)
-        scraper.request_service.make_request = AsyncMock(return_value=response)
-        await scraper._scrape_year(2025)
-        called_url = scraper.request_service.make_request.call_args[0][0]
-        assert "tipo_legislacao" not in called_url
-        assert "page=1" in called_url
+        assert doc is not None
+        assert captured_base_urls == [
+            "https://legisla.casacivil.go.gov.br/pesquisa_legislacao/42/lei-17.928"
+        ]
+        assert "– regras gerais." in doc.summary
+        assert "regras gerais" not in doc.text_markdown
+        assert "Art. 1º" in doc.text_markdown

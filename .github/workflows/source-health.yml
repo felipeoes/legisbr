@@ -1,0 +1,136 @@
+name: Source Health Matrix
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: "Optional space-separated source names or aliases (blank = all 30)"
+        required: false
+        default: ""
+
+jobs:
+  health:
+    name: Live Listing Smoke Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Install core package
+        run: uv sync --python 3.12
+      - name: Run 1-ref smoke check across sources
+        continue-on-error: true
+        env:
+          SOURCES_INPUT: ${{ inputs.sources }}
+        run: |
+          uv run python - <<'PY'
+          from __future__ import annotations
+
+          import asyncio
+          from datetime import UTC, datetime
+          import os
+          import time
+
+          import legisbr
+
+          TIMEOUT_SECONDS = 20.0
+          CONCURRENCY = 6
+
+
+          async def check_one(client: legisbr.AsyncClient, info: object, gate: asyncio.Semaphore) -> dict[str, str]:
+              name = info.name
+              scope = getattr(info, "scope", "-")
+              target_year = datetime.now(UTC).year
+              started = time.perf_counter()
+              async with gate:
+                  try:
+                      async def first_ref():
+                          async for ref in client.list_refs(name, year=target_year):
+                              return ref
+                          return None
+
+                      ref = await asyncio.wait_for(first_ref(), timeout=TIMEOUT_SECONDS)
+                      ms = int((time.perf_counter() - started) * 1000)
+                      if ref is None:
+                          return {
+                              "source": name,
+                              "scope": str(scope),
+                              "status": "EMPTY",
+                              "latency": f"{ms} ms",
+                              "detail": f"0 refs listed for {target_year}",
+                          }
+                      title = str(ref.title or "").replace("|", "/")[:60]
+                      return {
+                          "source": name,
+                          "scope": str(scope),
+                          "status": "OK",
+                          "latency": f"{ms} ms",
+                          "detail": title or str(ref.url or "")[:60],
+                      }
+                  except asyncio.TimeoutError:
+                      return {
+                          "source": name,
+                          "scope": str(scope),
+                          "status": "TIMEOUT",
+                          "latency": f">{int(TIMEOUT_SECONDS * 1000)} ms",
+                          "detail": f"Timed out after {TIMEOUT_SECONDS:.0f}s",
+                      }
+                  except Exception as exc:
+                      ms = int((time.perf_counter() - started) * 1000)
+                      msg = f"{type(exc).__name__}: {exc}".replace("\n", " ").replace("|", "/")[:80]
+                      return {
+                          "source": name,
+                          "scope": str(scope),
+                          "status": "ERROR",
+                          "latency": f"{ms} ms",
+                          "detail": msg,
+                      }
+
+
+          async def main() -> None:
+              raw = os.environ.get("SOURCES_INPUT", "").strip()
+              all_sources = legisbr.sources()
+              if raw:
+                  wanted = {tok.lower() for tok in raw.split()}
+                  selected = [
+                      s
+                      for s in all_sources
+                      if s.name.lower() in wanted
+                      or s.code.lower() in wanted
+                      or any(a.lower() in wanted for a in getattr(s, "aliases", ()))
+                  ]
+              else:
+                  selected = list(all_sources)
+
+              gate = asyncio.Semaphore(CONCURRENCY)
+              async with legisbr.AsyncClient() as client:
+                  rows = await asyncio.gather(
+                      *(check_one(client, info, gate) for info in selected)
+                  )
+
+              ok = sum(1 for r in rows if r["status"] == "OK")
+              lines = [
+                  f"## Source Health Matrix ({ok}/{len(rows)} OK)",
+                  "",
+                  "| Source | Scope | Status | Latency | Sample / Error |",
+                  "|---|---|---|---|---|",
+              ]
+              for r in rows:
+                  lines.append(
+                      f"| `{r['source']}` | {r['scope']} | **{r['status']}** | {r['latency']} | {r['detail']} |"
+                  )
+              report = "\n".join(lines) + "\n"
+              print(report)
+              summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary_path:
+                  with open(summary_path, "a", encoding="utf-8") as fh:
+                      fh.write(report)
+
+
+          asyncio.run(main())
+          PY

@@ -7,17 +7,19 @@ repos:
       - id: check-added-large-files
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.4
+    rev: v0.15.7
     hooks:
-      - id: ruff
-        args: [ --fix ]
+      - id: ruff-check
+        args: [--fix]
+        files: ^(src/legisbr/|tests/|scripts/check_(proxies|licenses)\.py$)
       - id: ruff-format
+        files: ^(src/legisbr/|tests/|scripts/check_(proxies|licenses)\.py$)
 
   - repo: local
     hooks:
       - id: pytest
         name: pytest
-        entry: uv run pytest tests/ -q --tb=short -m "not integration"
+        entry: uv run --all-extras --group dev pytest tests -q -n auto --timeout=60 --tb=short -m "not integration"
         language: system
         pass_filenames: false
         always_run: true

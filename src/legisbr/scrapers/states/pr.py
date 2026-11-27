@@ -1,0 +1,424 @@
+"""Paraná state legislation scraper using direct HTTP requests.
+
+Scrapes the Casa Civil legislation system at ``legislacao.pr.gov.br``: one
+unpaginated year listing per type, then one page per act.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup, Tag
+
+from legisbr.core.convert import (
+    clean_norm_soup,
+    infer_type_from_title,
+    valid_markdown,
+    wrap_html,
+)
+from legisbr.core.document import DocRef, Document, clean_title
+from legisbr.core.query import (
+    Query,
+    SearchCapabilities,
+    UnsupportedQueryError,
+    match_type_entry,
+    matches_query,
+)
+from legisbr.core.scraper import (
+    DEFAULT_INVALID_SITUATION,
+    DEFAULT_VALID_SITUATION,
+    BaseScraper,
+)
+
+TYPES = {
+    "Lei": 1,
+    "Lei Complementar": 3,
+    "Constituição Estadual": 10,
+    "Decreto": 11,
+    "Emenda Constitucional": 9,
+    "Resolução": 13,
+    "Portaria": 14,
+}
+VALID_SITUATIONS: list[str] = []
+INVALID_SITUATIONS: list[str] = []
+SITUATIONS = {s: s for s in VALID_SITUATIONS + INVALID_SITUATIONS}
+_RE_LIST_ITEMS = re.compile("list_cor_(sim|nao)")
+_RE_INVALID = re.compile(r"\bRevogad[ao]\s+(?:pelo|pela|por)\b", re.IGNORECASE)
+_RE_HEADER_REVOKED = re.compile(
+    r"^\(\s*Revogad[ao]\s+(?:pelo|pela|por)\b[^)]*\)$", re.IGNORECASE
+)
+_RE_BODY_LABEL = re.compile(
+    r"^(?:S[uú]mula\s*:|Art\.?|§|Par[aá]grafo)\b", re.IGNORECASE
+)
+_RE_ANEXOS_LABEL = re.compile(
+    r"(?:^|\r?\n)[ \t]*ANEXOS:[ \t]*(?=$|\r?\n|<)", re.MULTILINE
+)
+_RE_DISCLAIMER = re.compile(
+    r"Este\s+texto\s+n[aã]o\s+substitui\s+o\s+publicado", re.IGNORECASE
+)
+_RE_TOTAL_PAGES = re.compile(r"P[áa]gina\s+\d+\s+de\s+(\d+)", re.IGNORECASE)
+_RE_TOTAL_RECORDS = re.compile("Total de (\\d+) registros")
+_RE_COD_ATO = re.compile(r"codAto=(\d+)")
+_RE_SITE_ERROR = re.compile(r'class="msg_aviso">([^<]*)')
+
+
+class ParanaCVScraper(BaseScraper):
+    """Scraper for Paraná state legislation (Casa Civil).
+
+    Year start (earliest on source): 2025
+
+    Lists each type and year with one unpaginated request to the site's year
+    listing (``listarAtosAno.do``), then fetches each act's page over HTTP.
+    """
+
+    types = TYPES
+    situations = SITUATIONS
+    name = "PARANA"
+    base_url = "https://www.legislacao.pr.gov.br"
+    capabilities = SearchCapabilities(
+        native_year=True,
+        native_type=True,
+        native_number=True,
+        direct_id=True,
+    )
+
+    @staticmethod
+    def _parse_results_table(soup: BeautifulSoup) -> list[dict]:
+        """Extract document metadata from the results table."""
+        table = soup.find("table", id="list_tabela")
+        if not table:
+            return []
+        docs: list[dict] = []
+        for row in table.find_all("tr", class_=_RE_LIST_ITEMS):
+            tds = row.find_all("td")
+            link_tag = tds[0].find("a", href=True) if len(tds) >= 4 else None
+            match = _RE_COD_ATO.search(link_tag["href"]) if link_tag else None
+            if not match:
+                continue
+            docs.append(
+                {
+                    "id": match.group(1),
+                    "title": tds[1].text.strip(),
+                    "summary": tds[2].text.strip(),
+                    "date": tds[3].text.strip(),
+                }
+            )
+        return docs
+
+    @staticmethod
+    def _clean_form_html(form: Tag) -> str:
+        """Strip Paraná attachment table, disclaimer footer, Voltar button, and ANEXOS chrome."""
+        table = form.find("table", id="list_tabela")
+        if isinstance(table, Tag):
+            table.decompose()
+        for inp in list(form.find_all("input")):
+            if not inp.decomposed:
+                inp.decompose()
+        for p in list(form.find_all("p")):
+            if p.decomposed:
+                continue
+            txt = " ".join(p.get_text(" ", strip=True).split())
+            if len(txt) < 300 and _RE_DISCLAIMER.search(txt):
+                prev = p.find_previous_sibling()
+                if isinstance(prev, Tag) and prev.name == "hr":
+                    prev.decompose()
+                p.decompose()
+        clean_norm_soup(
+            form,
+            remove_disclaimers=True,
+            unwrap_links=False,
+            remove_images=False,
+            remove_empty_tags=True,
+            remove_style_tags=True,
+            remove_script_tags=True,
+        )
+        html_string = _RE_ANEXOS_LABEL.sub("", str(form)).strip()
+        html_string = html_string.replace("javascript:listarAssinaturas();", "")
+        return wrap_html(html_string)
+
+    async def fetch(self, doc_info: dict) -> Document:
+        """Fetch a single document's HTML and convert to markdown.
+
+        Plain HTTP: the HTML is complete without JavaScript, and the site
+        temporarily blocks fast clients (403 "Acesso temporariamente
+        bloqueado"), so one request per act beats a full browser page load.
+        """
+        cod_ato = doc_info.get("id", "")
+        html_link = urljoin(
+            self.base_url, f"/legislacao/pesquisarAto.do?action=exibir&codAto={cod_ato}"
+        )
+        response = await self.http.request(html_link)
+        soup = response.soup()
+        form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
+        if not isinstance(form, Tag):
+            raise ValueError("No pesquisarAtoForm found")
+        situation = self._infer_situation(soup)
+        html_string = self._clean_form_html(form)
+        text_markdown = (
+            await self.markdown(html=html_string, base_url=html_link)
+        ).strip()
+        valid, reason = valid_markdown(text_markdown)
+        if not valid:
+            raise ValueError(f"Invalid markdown: {reason}")
+        result = {
+            **doc_info,
+            "text_markdown": text_markdown,
+            "document_url": html_link,
+            "situation": situation,
+            "raw": response.content,
+            "raw_ext": ".html",
+        }
+        return Document(**result)
+
+    async def fetch_by_id(self, cod_ato: str) -> Document:
+        """Fetch a single Paraná act directly by its ``codAto`` identifier."""
+        cod = str(cod_ato).strip()
+        html_link = urljoin(
+            self.base_url, f"/legislacao/pesquisarAto.do?action=exibir&codAto={cod}"
+        )
+        response = await self.http.request(html_link)
+        soup = response.soup()
+        form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
+        if not isinstance(form, Tag):
+            raise ValueError("No pesquisarAtoForm found")
+        situation = self._infer_situation(soup)
+        table = form.find("table", id="list_tabela")
+        if isinstance(table, Tag):
+            table.decompose()
+        lines = [
+            clean_title(line)
+            for line in form.get_text("\n").splitlines()
+            if line.strip()
+        ]
+        title = lines[0] if lines else f"Ato {cod}"
+        year_match = re.search(r"\b((?:18|19|20)\d{2})\b", " ".join(lines[:5]))
+        year = int(year_match.group(1)) if year_match else 0
+        norm_type = infer_type_from_title(title, TYPES) or "Lei"
+        html_string = self._clean_form_html(form)
+        text_markdown = (
+            await self.markdown(html=html_string, base_url=html_link)
+        ).strip()
+        valid, reason = valid_markdown(text_markdown)
+        if not valid:
+            raise ValueError(f"Invalid markdown: {reason}")
+        return Document(
+            id=cod,
+            title=title,
+            year=year,
+            type=norm_type,
+            situation=situation,
+            document_url=html_link,
+            text_markdown=text_markdown,
+            raw=response.content,
+            raw_ext=".html",
+        )
+
+    @staticmethod
+    def _infer_row_year(row: dict, fallback: int | None) -> int:
+        if fallback is not None:
+            return fallback
+        for field in (row.get("date", ""), row.get("title", "")):
+            matches = re.findall(r"\b((?:18|19|20)\d{2})\b", str(field))
+            if matches:
+                return int(matches[-1])
+        return 0
+
+    @staticmethod
+    def _parse_search_pagination(soup: BeautifulSoup) -> tuple[int, int | None]:
+        """Return ``(total_pages, total_records)`` parsed from ``barra_paginacao``."""
+        text = soup.get_text(" ", strip=True)
+        pages_match = _RE_TOTAL_PAGES.search(text)
+        records_match = _RE_TOTAL_RECORDS.search(text)
+        total_records = int(records_match.group(1)) if records_match else None
+        total_pages = int(pages_match.group(1)) if pages_match else 1
+        return (max(1, total_pages), total_records)
+
+    async def search_refs(
+        self,
+        query: Query,
+        *,
+        strict_native: bool = False,
+        on_error: Callable[[DocRef, Exception], Awaitable[None] | None] | None = None,
+    ) -> AsyncIterator[DocRef]:
+        """Targeted ``pesquisarAto.do`` search avoiding the 13 MB bulk ``listarAtosAno.do`` dump."""
+        if strict_native and not self.capabilities.supports_query(query):
+            raise UnsupportedQueryError(f"{self.name} does not support {query!r}")
+        if query.limit == 0:
+            return
+
+        type_name = ""
+        type_id = ""
+        if query.type is not None:
+            matched = match_type_entry(TYPES, query.type)
+            if matched is None:
+                return
+            type_name, raw_id = matched
+            type_id = str(raw_id)
+
+        target_years: list[int | None] = (
+            [None]
+            if query.years is None
+            else ([query.years] if isinstance(query.years, int) else list(query.years))
+        )
+
+        search_url = f"{self.base_url}/legislacao/pesquisarAto.do?action=pesquisar"
+        yielded = 0
+        seen: set[str] = set()
+        for year in target_years:
+            base_payload = {
+                "codTipoAto": type_id,
+                "numeroAto": str(query.number or ""),
+                "anoAto": "" if year is None else str(year),
+                "isPaginado": "true",
+                "site": "1",
+            }
+            page = 1
+            total_pages = 1
+            total_records: int | None = None
+            while page <= total_pages:
+                if page == 1:
+                    page_url = search_url
+                    payload = base_payload
+                else:
+                    page_url = (
+                        f"{search_url}&indice={page}&totalRegistros={total_records}"
+                        if total_records is not None
+                        else f"{search_url}&indice={page}"
+                    )
+                    payload = {**base_payload, "paginaAtual": str(page)}
+                try:
+                    response = await self.http.request(
+                        page_url, method="POST", data=payload
+                    )
+                    soup = response.soup()
+                    if error := _RE_SITE_ERROR.search(str(soup)):
+                        raise ValueError(
+                            f"Paraná search failed: {error.group(1).strip()}"
+                        )
+                    rows = self._parse_results_table(soup)
+                    if page == 1:
+                        total_pages, total_records = self._parse_search_pagination(soup)
+                except Exception as exc:
+                    await self._report_search_error(
+                        {"year": year, "document_url": page_url}, exc, on_error
+                    )
+                    break
+                if not rows:
+                    break
+                for row in rows:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    ref: DocRef = {
+                        **row,
+                        "title": clean_title(row["title"]),
+                        "year": self._infer_row_year(row, year),
+                        "type": type_name
+                        or infer_type_from_title(row["title"], TYPES)
+                        or "Lei",
+                        "situation": DEFAULT_VALID_SITUATION,
+                        "document_url": urljoin(
+                            self.base_url,
+                            f"/legislacao/pesquisarAto.do?action=exibir&codAto={row['id']}",
+                        ),
+                    }
+                    if not matches_query(ref, query):
+                        continue
+                    yield ref
+                    yielded += 1
+                    if query.limit is not None and yielded >= query.limit:
+                        return
+                page += 1
+
+    @staticmethod
+    def _total(soup: BeautifulSoup) -> int:
+        """Return the act count a year listing reports."""
+        html = str(soup)
+        # The site's error page also says "Nenhum registro encontrado".
+        if error := _RE_SITE_ERROR.search(html):
+            raise ValueError(f"Paraná listing failed: {error.group(1).strip()}")
+        if match := _RE_TOTAL_RECORDS.search(soup.get_text()):
+            return int(match.group(1))
+        if "Nenhum registro encontrado" in html:
+            return 0
+        raise ValueError("Unrecognized Paraná listing page")
+
+    async def list_type(
+        self, year: int, norm_type: str, norm_type_id: int
+    ) -> AsyncIterator[dict]:
+        # One unpaginated request lists every act of the type and year, from every
+        # agency. The paginated search sorts by date without a tiebreak, so its pages
+        # overlapped and skipped acts (2025: 649 of 682 Leis).
+        response = await self.http.request(
+            f"{self.base_url}/legislacao/listarAtosAno.do"
+            f"?action=listarAtos&anoAto={year}&isPaginado=false",
+            method="POST",
+            data={
+                "codTipoAto": str(norm_type_id),
+                "codTipoAtoSelecionado": str(norm_type_id),
+                "codOrgaoUnidade": "",
+                "codOrgaoUnidadeSelecionado": "",
+                "pesquisou": "",
+                "anoAtoPesquisado": "0",
+                "paginaAtual": "",
+                "isPaginado": "true",
+                "site": "1",
+            },
+            # A year of resoluções (15k rows) takes the server ~2 minutes.
+            timeout=600,
+            # 13 MB is too much for a proxy; 7 listings a year fit the direct IP's budget.
+            use_proxy=False,
+        )
+        soup = response.soup()
+        total = self._total(soup)
+        rows = self._parse_results_table(soup)
+        if len(rows) != total:
+            raise ValueError(f"Paraná listed {len(rows)} of {total} acts")
+        seen: set[str] = set()
+        for row in rows:
+            if row["id"] in seen:  # the site repeats a few rows and counts them
+                continue
+            seen.add(row["id"])
+            yield {
+                **row,
+                "year": year,
+                "type": norm_type,
+                "situation": DEFAULT_VALID_SITUATION,
+                "document_url": urljoin(
+                    self.base_url,
+                    f"/legislacao/pesquisarAto.do?action=exibir&codAto={row['id']}",
+                ),
+            }
+
+    @staticmethod
+    def _infer_situation(soup: BeautifulSoup) -> str:
+        status = soup.find(string=re.compile(r"^\s*Situa[çc][ãa]o\s*:", re.IGNORECASE))
+        if status is not None:
+            text = status.parent.get_text(" ", strip=True)
+            sibling = status.parent.find_next_sibling()
+            if sibling is not None and (not text.partition(":")[2].strip()):
+                text += " " + sibling.get_text(" ", strip=True)
+            if _RE_INVALID.search(text):
+                return DEFAULT_INVALID_SITUATION
+            return DEFAULT_VALID_SITUATION
+        # Paraná Casa Civil places whole-act revocations inside pesquisarAtoForm
+        # directly below "Publicado no Diário Oficial..." before Súmula: / Art. 1º
+        # as a standalone parenthesized notice `(Revogado pelo ...)`.
+        form = soup.find("form", attrs={"name": "pesquisarAtoForm"})
+        if not isinstance(form, Tag):
+            return DEFAULT_VALID_SITUATION
+        for p in form.find_all("p"):
+            label = p.find("b", class_="labelAto")
+            label_text = label.get_text(" ", strip=True) if label else ""
+            if label_text and _RE_BODY_LABEL.match(label_text):
+                break
+            p_text = " ".join(p.get_text(" ", strip=True).split())
+            if not p_text:
+                continue
+            if _RE_BODY_LABEL.match(p_text):
+                break
+            if _RE_HEADER_REVOKED.match(p_text):
+                return DEFAULT_INVALID_SITUATION
+        return DEFAULT_VALID_SITUATION

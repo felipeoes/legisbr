@@ -1,0 +1,39 @@
+name: Feature Request
+description: Propose a new feature, jurisdiction, export format, or API improvement
+title: "[feat] <short summary>"
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Python API (Client / Streaming / Query)
+        - CLI (`legisbr`)
+        - Storage / FTS5 / Parquet / ArchiveIndex
+        - New official source / jurisdiction
+        - MCP server
+        - Performance / OCR / PDF extraction
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and why is it currently hard or impossible?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired API, CLI flags, or behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: source_url
+    attributes:
+      label: Official portal URL (if requesting a new source)
+      description: Only official government portals are supported (never third-party aggregators such as leisestaduais.com.br).
+      placeholder: "https://..."
