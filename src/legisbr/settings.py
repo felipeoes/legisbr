@@ -93,7 +93,7 @@ class Settings:
         scoped_source = env_map if env_map.get("SAVE_DIR") else merged
         raw_state = scoped_source.get("STATE_LEGISLATION_SAVE_DIR")
         raw_specific = scoped_source.get("SPECIFIC_LEGISLATION_SAVE_DIR")
-        raw_log_dir = merged.get("LOG_DIR") or merged.get("ERROR_LOG_DIR")
+        raw_log_dir = merged.get("LOG_DIR")
         return cls(
             llm_model=merged.get("LLM_MODEL", ""),
             llm_pdf_input=merged.get("LLM_PDF_INPUT", "false").lower()

@@ -55,8 +55,7 @@ _TYPE_LABELS.update(
 class BahiaLegislaScraper(BaseScraper):
     """Webscraper for Bahia state legislation website (https://www.legislabahia.ba.gov.br/).
 
-    The site is a Drupal CMS serving static HTML — no JavaScript rendering needed,
-    so all fetches use pure aiohttp (no Playwright browser).
+    The site is a Drupal CMS serving static HTML fetched directly via aiohttp.
 
     **Listing**: a single year-only query (no type/situation filter) returns all
     document types via ``/documentos?data[min]=YYYY-01-01&data[max]=YYYY-12-31``.
@@ -345,7 +344,7 @@ class BahiaLegislaScraper(BaseScraper):
         html_link = doc_info.pop("_html_link")
         url = urljoin(self.base_url, html_link)
         resp = await self.http.request(url)
-        body, _ = (resp.content, resp)
+        body = resp.content
         soup = BeautifulSoup(body, "lxml")
         category = self._get_field_item_text(soup, "field--name-field-categoria-doc")
         if category:
@@ -388,10 +387,10 @@ class BahiaLegislaScraper(BaseScraper):
                 "raw_ext": ".html",
             }
         )
-        if result is not None and summary:
-            md = result.text_markdown
-            if md:
-                result.text_markdown = remove_summary_from_markdown(md, summary)
+        if summary and result.text_markdown:
+            result.text_markdown = remove_summary_from_markdown(
+                result.text_markdown, summary
+            )
         return result
 
     async def list_documents(self, year: int) -> AsyncIterator[dict]:

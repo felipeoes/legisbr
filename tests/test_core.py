@@ -4,7 +4,6 @@ Covers:
 - clean_md_tag utility
 - RateLimiter concurrency primitive
 - BaseScraper markdown utilities and helpers
-- RequestService (FailedRequest, detect_content_info)
 """
 
 from __future__ import annotations
@@ -430,14 +429,3 @@ class TestHtmlConversionFixes:
         assert "| ~~Col A~~ | ~~Col B~~ |" in md
         assert "| ~~Val 1~~ | ~~Val 2~~ |" in md
         assert "~~Item 1~~" in md and "~~Item 2~~" in md
-
-
-_VALID_DOC_KWARGS = dict(
-    year=2024,
-    title="Lei nº 1/2024",
-    type="Lei Ordinária",
-    situation="Não consta revogação expressa",
-    summary="",
-    text_markdown="# Art. 1º Fica criado o município.",
-    document_url="https://example.com/lei/1",
-)

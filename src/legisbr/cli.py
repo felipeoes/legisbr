@@ -192,10 +192,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     export.add_argument("--out", type=Path)
 
     # import-json
-    migration = commands.add_parser(
+    import_json = commands.add_parser(
         "import-json", help="Import data.json and JSON shards without deleting inputs"
     )
-    migration.add_argument("-s", "--scrapers", nargs="+", required=True)
+    import_json.add_argument("-s", "--scrapers", nargs="+", required=True)
 
     # stats
     stats = commands.add_parser(

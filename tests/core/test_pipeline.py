@@ -210,4 +210,3 @@ async def test_run_records_performance_stats():
     assert 0 <= stats["listing_seconds"] <= stats["seconds"]
     assert stats["fetch_p50"] <= stats["fetch_p95"] <= stats["fetch_max"]
     assert stats["http"] == {"requests": 0, "retries": 0, "bytes": 0}
-    assert "browser_navigations" not in stats

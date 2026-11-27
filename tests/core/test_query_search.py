@@ -1,4 +1,4 @@
-"""Unit tests for Phase 4 on-demand Query, SearchCapabilities, and native/fallback search."""
+"""Unit tests for on-demand Query, SearchCapabilities, and native/fallback search."""
 
 from __future__ import annotations
 

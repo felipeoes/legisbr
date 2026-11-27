@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-import mimetypes
 import re
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -290,14 +289,3 @@ def _detect_image_mime(data: bytes) -> str | None:
         if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head):
             return "image/svg+xml"
     return None
-
-
-def _guess_mime(url: str, data: bytes) -> str:
-    """Best-effort MIME type from magic bytes first, then URL extension."""
-    magic_mime = _detect_image_mime(data)
-    if magic_mime:
-        return magic_mime
-    mime, _ = mimetypes.guess_type(url.split("?")[0])
-    if mime:
-        return mime
-    return "image/png"

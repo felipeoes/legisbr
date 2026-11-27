@@ -141,9 +141,7 @@ class DFSinjScraper(BaseScraper):
     For **PDF** documents: step 1 is skipped (the download URL would trigger a
     binary PDF download, not an HTML page); starts from the text endpoint.
 
-    Raw content is saved as **HTML bytes** (``.html``) fetched via aiohttp.
-    Playwright/MHTML capture is not used — all SINJ pages are static HTML that
-    aiohttp can fetch directly, making the browser overhead unnecessary.
+    Raw content is saved as **HTML bytes** (``.html``) fetched directly via aiohttp.
 
     Markdown extraction (``_extract_html_markdown``)
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -654,13 +652,6 @@ class DFSinjScraper(BaseScraper):
         """
         await self.http.request(f"{self.base_url}/")
 
-    async def _get_docs_links(
-        self, url: str, payload: list[tuple[str, object]]
-    ) -> list[dict]:
-        "Template-method implementation — wraps ``_fetch_search_page`` and discards the total."
-        docs, _ = await self._fetch_search_page(payload)
-        return docs
-
     @classmethod
     def _check_markdown(cls, text_markdown: str) -> tuple[bool, str]:
         """Check if markdown is valid and free of SINJ site chrome.
@@ -682,12 +673,11 @@ class DFSinjScraper(BaseScraper):
 
     def _resolve_doc_urls(
         self, doc_info: dict
-    ) -> tuple[dict, str, str, str, str, bool, str] | None:
-        """Extract URLs from *doc_info* and check resume status.
+    ) -> tuple[dict, str, str, str, str, bool, str]:
+        """Extract candidate endpoints from *doc_info*.
 
         Returns ``(doc, title, fallback_url, text_url, download_url,
-        pdf_file, file_id)`` or ``None`` when the document was already
-        scraped.
+        pdf_file, file_id)``.
         """
         doc = dict(doc_info)
         document_url = doc.get("document_url", "")
@@ -710,9 +700,9 @@ class DFSinjScraper(BaseScraper):
     ) -> dict | None:
         """Attempt 1: fetch the download URL for non-PDF documents.
 
-        Returns the populated *doc* on success, ``None`` on maintenance
-        (hard stop), or the ``_ATTEMPT_FAILED`` sentinel when this path
-        did not produce a result.
+        Returns the populated ``Document`` on success, raises ``ValueError`` on
+        maintenance, or returns ``_ATTEMPT_FAILED`` when this path did not
+        produce a result.
         """
         if not download_url or pdf_file:
             return _ATTEMPT_FAILED
@@ -739,10 +729,10 @@ class DFSinjScraper(BaseScraper):
     ) -> dict | None:
         """Attempt 2: fetch the compiled text endpoint.
 
-        For PDF files only actual PDF binary is accepted.  For HTML files
-        markdown is extracted from the parsed content.  Returns the
-        populated *doc* on success, ``None`` on maintenance, or the
-        ``_ATTEMPT_FAILED`` sentinel otherwise.
+        For PDF files only actual PDF binary is accepted. For HTML files
+        markdown is extracted from the parsed content. Returns the populated
+        ``Document`` on success, raises ``ValueError`` on maintenance, or
+        returns ``_ATTEMPT_FAILED`` otherwise.
         """
         if not file_id:
             return _ATTEMPT_FAILED
@@ -879,10 +869,9 @@ class DFSinjScraper(BaseScraper):
         For **PDF** files (``file_name`` ends with ``.pdf``):
           Attempt 1 is skipped; starts from the text endpoint.
         """
-        resolved = self._resolve_doc_urls(doc_info)
-        if resolved is None:
-            return None
-        doc, title, fallback_url, text_url, download_url, pdf_file, file_id = resolved
+        doc, title, fallback_url, text_url, download_url, pdf_file, file_id = (
+            self._resolve_doc_urls(doc_info)
+        )
         try:
             result = await self._try_download_url_path(doc, download_url, pdf_file)
             if result is not _ATTEMPT_FAILED:

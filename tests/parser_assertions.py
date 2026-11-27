@@ -2,7 +2,7 @@
 
 Usage example::
 
-    from base_tests import TypesConstantTests, ScraperClassTests, SituationsConstantTests
+    from parser_assertions import TypesConstantTests, ScraperClassTests, SituationsConstantTests
 
     class TestTypesConstant(TypesConstantTests):
         TYPES = TYPES  # module-level TYPES dict
@@ -112,30 +112,3 @@ class ScraperClassTests:
             assert self.STATE_NAME.lower() in self.SCRAPER_CLS.__doc__.lower(), (
                 f"Expected '{self.STATE_NAME}' in docstring"
             )
-
-
-class FormatSearchUrlTests:
-    """Mixin for ``_format_search_url`` smoke tests.
-
-    Subclasses must set:
-        MAKE_SCRAPER  – callable returning a scraper instance
-        SAMPLE_ARGS   – tuple of (norm_type_id, year) for the URL builder
-        BASE_URL      – expected URL prefix
-    """
-
-    MAKE_SCRAPER = None
-    SAMPLE_ARGS: tuple = ("1", 2023)
-    BASE_URL: str = ""
-
-    def _url(self):
-        scraper = self.MAKE_SCRAPER()
-        return scraper._format_search_url(*self.SAMPLE_ARGS)
-
-    def test_starts_with_base_url(self):
-        assert self._url().startswith(self.BASE_URL)
-
-    def test_includes_year(self):
-        assert str(self.SAMPLE_ARGS[1]) in self._url()
-
-    def test_includes_type_id(self):
-        assert str(self.SAMPLE_ARGS[0]) in self._url()

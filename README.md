@@ -7,10 +7,10 @@
 
 High-performance, async Python library, CLI, and MCP server covering **30 official Brazilian legislation portals** — Federal legislation (Câmara dos Deputados), all **27 state jurisdictions**, CONAMA, and ICMBio.
 
-- **Pure HTTP & Zero Browser Overhead:** Zero Playwright, zero Chromium downloads — fast, headless, container-friendly scraping directly against official portals.
-- **100% Permissive MIT Core (~115 MB installed):** `pypdfium2` + `pypdf` + selective `pdfplumber` + `pillow` + `html-to-markdown` + `mammoth`. Zero AGPL/GPL dependencies in core (`PyMuPDF` and `unidecode` completely removed).
+- **Pure HTTP & Headless:** Fast, container-friendly async scraping directly against official portals with no browser runtime.
+- **100% Permissive MIT Core (~115 MB installed):** `pypdfium2` + `pypdf` + selective `pdfplumber` + `pillow` + `html-to-markdown` + `mammoth`, with zero AGPL/GPL dependencies in core.
 - **Python 3.11–3.14:** Typed (`py.typed`), lazy PEP 562 imports (~28 ms `legisbr.sources()`, ~55 ms `legisbr list` CLI startup with zero heavy imports), zero import-time `.env` or logging side effects.
-- **Stream, Search, Index & Export:** Zero-disk async streaming (`legisbr.Client`), native on-demand norm search, SQLite Schema v2 with Portuguese diacritic-insensitive FTS5, streaming ZSTD Parquet export, read-only multi-archive `ArchiveIndex`, and an optional MCP server for AI agents.
+- **Stream, Search, Index & Export:** Zero-disk async streaming (`legisbr.Client`), native on-demand norm search, SQLite archives with Portuguese diacritic-insensitive FTS5, streaming ZSTD Parquet export, read-only multi-archive `ArchiveIndex`, and an optional MCP server for AI agents.
 
 > This project queries official government portals directly and **does not scrape `leisestaduais.com.br`**.
 
@@ -101,7 +101,7 @@ async with legisbr.Client() as client:
 
 ### 4. Local SQLite Archive, FTS5 Search & Parquet Export
 
-Persist into SQLite Schema v2 with automatic Portuguese diacritic-insensitive FTS5 indexing (inline base64 images are automatically stripped before indexing), stream fixed-schema ZSTD Parquet, and query across multiple jurisdictions read-only with `ArchiveIndex`:
+Persist into local SQLite archives with automatic Portuguese diacritic-insensitive FTS5 indexing (inline base64 images are automatically stripped before indexing), stream fixed-schema ZSTD Parquet, and query across multiple jurisdictions read-only with `ArchiveIndex`:
 
 ```python
 from pathlib import Path
@@ -159,7 +159,7 @@ legisbr query "licenciamento ambiental" --year 2024 --limit 20
 legisbr export -s SP --format parquet --single-file --out exports/sp.parquet
 legisbr export -s Acre --format jsonl --out exports/acre
 
-# Import legacy JSON archives and inspect run performance stats
+# Import JSON archives and inspect run performance stats
 legisbr import-json -s Acre
 legisbr stats
 

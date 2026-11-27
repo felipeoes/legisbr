@@ -4,11 +4,8 @@ Covers:
 - TYPES constant: 8 types present, integer IDs
 - Class docstring accessible (__doc__ is not None)
 - _id_to_type reverse map built correctly
-- inherited SAPL URL formatting includes page_size=100
+- inherited SAPL year URL formatting includes page_size=100
 - inherited _get_docs_links parsing and missing-attachment reporting
-
-Run with:
-    .venv/bin/pytest tests/test_piaui_scraper.py -v
 """
 
 from __future__ import annotations
@@ -87,14 +84,6 @@ class TestClassAttributes(ScraperClassTests):
 
 
 class TestFormatUrls:
-    def test_format_search_url_includes_page_size(self):
-        scraper = _make_scraper()
-        url = scraper._format_search_url("10", 2025)
-        assert "tipo=10" in url
-        assert "ano=2025" in url
-        assert "page=1" in url
-        assert "page_size=100" in url
-
     def test_format_year_url_includes_page_size(self):
         scraper = _make_scraper()
         url = scraper._format_year_url(2025, page=3)

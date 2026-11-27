@@ -9,7 +9,7 @@ import pytest
 from pdf_fixtures import make_digital_pdf as _make_digital_pdf
 from pdf_fixtures import make_scanned_pdf as _make_scanned_pdf
 
-from legisbr.core.convert import is_pdf_scanned
+from legisbr.core.pdf import is_pdf_scanned, pdf_to_markdown
 from legisbr.core.pdf import run_pdf_task as REAL_RUN_PDF_TASK
 
 
@@ -52,21 +52,20 @@ class TestIsPdfScanned:
 
 
 async def test_digital_pdf_conversion_and_plain_fallback(monkeypatch):
-    from legisbr.core import convert, pdf as pdf_mod
+    from legisbr.core import pdf as pdf_mod
 
     pdf = _make_digital_pdf("Art. 1 - " + "Texto legal para a administracao. " * 8)
-    result = await convert.pdf_to_markdown(pdf)
+    result = await pdf_to_markdown(pdf)
     assert "Art." in result
     monkeypatch.setattr(
         pdf_mod, "_digital_pdf", lambda *a, **kw: "![page](data:image/png;base64,AAAA)"
     )
-    assert "Art." in await convert.pdf_to_markdown(pdf)
+    assert "Art." in await pdf_to_markdown(pdf)
 
 
 async def test_scan_requires_ocr_and_failure_propagates():
     from unittest.mock import AsyncMock
 
-    from legisbr.core.convert import pdf_to_markdown
     from legisbr.core.ocr import OCRError
 
     pdf = _make_scanned_pdf()
@@ -124,8 +123,6 @@ NAME_LIST = (
 async def test_garbage_text_layer_goes_to_ocr(text, ocr_called):
     from unittest.mock import AsyncMock
 
-    from legisbr.core.convert import pdf_to_markdown
-
     ocr = AsyncMock()
     ocr.pdf.return_value = "Art. 1º Texto reconhecido pelo modelo. " * 5
     result = await pdf_to_markdown(_make_digital_pdf(text), ocr)
@@ -134,8 +131,6 @@ async def test_garbage_text_layer_goes_to_ocr(text, ocr_called):
 
 
 async def test_garbage_text_layer_is_kept_without_ocr():
-    from legisbr.core.convert import pdf_to_markdown
-
     assert "DEPUTADO" in await pdf_to_markdown(_make_digital_pdf(GARBAGE_LAYER * 4))
 
 
@@ -210,8 +205,6 @@ async def test_html_conversion_has_no_metadata_front_matter():
 
 
 async def test_dense_pdf_legal_line_breaks_restored():
-    from legisbr.core import convert
-
     dense = (
         "Art. 1º Esta lei estabelece diretrizes gerais para a administração estadual. "
         "Parágrafo único. A regulamentação ocorrerá em trinta dias. "
@@ -219,7 +212,7 @@ async def test_dense_pdf_legal_line_breaks_restored():
         "I - transparência nos atos públicos; "
         "II - eficiência na gestão orçamentária."
     )
-    result = await convert.pdf_to_markdown(_make_digital_pdf(dense))
+    result = await pdf_to_markdown(_make_digital_pdf(dense))
     lines = [line.strip() for line in result.splitlines() if line.strip()]
     assert any(line.startswith("Art. 1º") for line in lines)
     assert any(line.startswith("Art. 2º") for line in lines)
@@ -254,14 +247,16 @@ async def test_pdf_work_runs_in_processes_and_survives_a_crashed_worker():
     from legisbr.core import pdf as pdf_mod
 
     pdf = _make_digital_pdf("Art. 1 - " + "Texto legal para a administracao. " * 8)
-    assert "Art." in await REAL_RUN_PDF_TASK(
-        pdf_mod._pdf_text_layer, pdf, 0.1, True, executor="process", max_workers=2
+    first = await REAL_RUN_PDF_TASK(
+        pdf_mod._extract_pdf_core, pdf, 0.1, True, executor="process", max_workers=2
     )
+    assert first.markdown is not None and "Art." in first.markdown
     with pytest.raises(BrokenProcessPool):
         await REAL_RUN_PDF_TASK(_crash_worker, executor="process", max_workers=2)
-    assert "Art." in await REAL_RUN_PDF_TASK(
-        pdf_mod._pdf_text_layer, pdf, 0.1, True, executor="process", max_workers=2
+    second = await REAL_RUN_PDF_TASK(
+        pdf_mod._extract_pdf_core, pdf, 0.1, True, executor="process", max_workers=2
     )
+    assert second.markdown is not None and "Art." in second.markdown
 
 
 async def test_line_breaks_between_inline_elements_survive():

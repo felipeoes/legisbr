@@ -169,8 +169,7 @@ class ESAlesScraper(BaseScraper):
     Document types:
       - "TEXTO COMPLETO" links (.html) — static Word HTML exports served at
         /Arquivo/Documents/legislacao/html/. All content is in the initial HTTP
-        response (zero AJAX), so these are fetched via plain aiohttp (get_soup),
-        not Playwright.
+        response and is fetched directly via aiohttp.
       - "NORMA ORIGINAL" links (.pdf) — scanned PDFs at
         /Arquivo/Documents/legislacao/image/. Downloaded and converted via
         pypdfium2 + selective pdfplumber with LLM OCR fallback.
@@ -332,15 +331,6 @@ class ESAlesScraper(BaseScraper):
                 "ctl00$ContentPlaceHolder1$ddl_ItensExibidos": items_per_page,
             },
         )
-
-    def _extract_total_count(self, soup: BeautifulSoup) -> int | None:
-        """Extract total result count from the listing page."""
-        tag = soup.find(id="ContentPlaceHolder1_contagem")
-        if tag:
-            m = re.search("(\\d+)", tag.text.replace(".", ""))
-            if m:
-                return int(m.group(1))
-        return None
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data from document link"""

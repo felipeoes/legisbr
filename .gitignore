@@ -164,16 +164,8 @@ cython_debug/
 
 
 # project
-# ignore all under csv-datasets folder
-csv-datasets
-csv-datasets/*
 .vscode
 logs/*
-*.ipynb
-test.py
-error_log.json
-artifacts/
-test_data/
 scripts/*
 !scripts/check_proxies.py
 !scripts/check_licenses.py

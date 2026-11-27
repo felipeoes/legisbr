@@ -22,16 +22,11 @@ def _make_scraper(**kwargs) -> MTAlmtScraper:
 
     return make_scraper(
         MTAlmtScraper,
-        historic_types=dict(HISTORIC_TYPES),
         max_year_historic=1978,
         token="test_token",
         regex_total_items=re.compile("Total de registros:\\s+([\\d.]+)"),
         **kwargs,
     )
-
-
-def _make_valid_md() -> str:
-    return "# Lei Estadual de Mato Grosso\n\nO governador do estado decreta. " * 30
 
 
 def _make_docs_html(count: int = 3, is_historic: bool = False) -> str:

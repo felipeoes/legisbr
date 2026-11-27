@@ -180,7 +180,7 @@ class TestGetDocDataStringKwarg:
 
 
 class TestFetchHtmlNorm:
-    async def test_stores_http_body_instead_of_browser_mhtml(self):
+    async def test_stores_raw_http_html_body(self):
         scraper = _make_scraper()
         meta = (
             "<html><body><table>"

@@ -37,7 +37,6 @@ _SEARCH_PATH = "/api/v2/pesquisa/legislacoes"
 _REDIRECT_MARKER = "Clique no link abaixo para acessar a:"
 _PDF_STUB_MIN_BODY_LEN = 150
 _TYPE_ID_TO_SUFFIX = {v["id"]: v["url_suffix"] for v in TYPES.values()}
-_NON_ALPHA_RE = re.compile("[^a-zA-ZÀ-ÿ]")
 _SPECIAL_RE = re.compile("[^a-zA-ZÀ-ÿ0-9\\s]")
 _SPACE_RE = re.compile("\\s+")
 _C1_RE = re.compile(r"[\x80-\x9f]")
@@ -348,7 +347,7 @@ class LegislaGoias(BaseScraper):
 
     async def _process_pdf_link(
         self, link: str, doc_id: str | int, doc_info: dict
-    ) -> dict | None:
+    ) -> Document | None:
         """Download a PDF fallback, convert it to markdown, and populate doc_info."""
         pdf_link = urljoin(_SITE_URL, link).strip()
         if not pdf_link:
@@ -366,9 +365,6 @@ class LegislaGoias(BaseScraper):
                 "raw_ext": content_ext or ".pdf",
             }
         )
-        if result is None:
-            logger.error(f"Failed to extract text from PDF for doc ID: {doc_id}")
-            return None
         summary = doc_info.get("summary", "")
         if summary and result.text_markdown:
             result.text_markdown = remove_summary_from_markdown(

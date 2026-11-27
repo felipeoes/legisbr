@@ -66,9 +66,6 @@ class SantaCatarinaScraper(BaseScraper):
     base_url = "https://leis.alesc.sc.gov.br"
     capabilities = SearchCapabilities(native_year=True, native_type=True)
 
-    def _format_search_url(self, norm_type_id: str, year: int) -> str:
-        return f"{self.base_url}/{norm_type_id}?ano={year}"
-
     @staticmethod
     def _title_case_type(raw: str) -> str:
         words = raw.split()

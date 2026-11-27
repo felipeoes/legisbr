@@ -170,7 +170,7 @@ class ArchiveIndex:
                             "path": str(db_path),
                             "documents": total,
                             "fts_enabled": fts_ready,
-                            "schema_version": meta.get("schema_version", "1"),
+                            "schema_version": meta.get("schema_version", "2"),
                             "min_year": min_year,
                             "max_year": max_year,
                             "immutable": immutable,
@@ -235,12 +235,8 @@ class ArchiveIndex:
             try:
                 if not _has_table(conn, "documents"):
                     return None
-                columns = {
-                    row[1] for row in conn.execute("PRAGMA table_info(documents)")
-                }
-                id_col = "id" if "id" in columns else "rowid"
                 row = conn.execute(
-                    f"SELECT * FROM documents WHERE {id_col} = ?",
+                    "SELECT * FROM documents WHERE id = ?",
                     (doc_id,),
                 ).fetchone()
                 return _row_to_dict(row, default_source=name) if row else None
@@ -289,13 +285,9 @@ class ArchiveIndex:
 
                     last_run: dict[str, Any] | None = None
                     if _has_table(conn, "runs"):
-                        run_cols = {
-                            r[1] for r in conn.execute("PRAGMA table_info(runs)")
-                        }
-                        stats_col = "stats" if "stats" in run_cols else "'{}' AS stats"
                         run_row = conn.execute(
-                            f"SELECT id, scraper, started_at, finished_at, docs, errors, "
-                            f"llm_usage, {stats_col} FROM runs ORDER BY id DESC LIMIT 1"
+                            "SELECT id, scraper, started_at, finished_at, docs, errors, "
+                            "llm_usage, stats FROM runs ORDER BY id DESC LIMIT 1"
                         ).fetchone()
                         if run_row is not None:
                             last_run = {
@@ -315,7 +307,7 @@ class ArchiveIndex:
                             "path": str(db_path),
                             "documents": total,
                             "fts_enabled": _has_table(conn, "documents_fts"),
-                            "schema_version": meta.get("schema_version", "1"),
+                            "schema_version": meta.get("schema_version", "2"),
                             "min_year": min_year,
                             "max_year": max_year,
                             "errors": error_count,

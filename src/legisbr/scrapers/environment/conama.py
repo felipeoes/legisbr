@@ -82,7 +82,6 @@ class ConamaScraper(BaseScraper):
     _LOCAL_FILE_FOOTER_RE = re.compile(
         "^file:///.+\\.(?:html|htm)\\s+\\d+/\\d+$", re.IGNORECASE
     )
-    _PAGE_NUMBER_BLOCK_RE = re.compile("^\\d{1,6}$")
     _DISCLAIMER_PATTERNS = [
         re.compile(
             r"(?:Est[ea]\s+(?:conte[uú]do|texto)|Ess[ea]\s+texto)\s+n[aã]o\s+substitu(?:i|to)\s+"

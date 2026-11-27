@@ -5,9 +5,6 @@ Covers:
 - Class docstring accessible (__doc__ is not None)
 - _id_to_type reverse map built correctly
 - _get_docs_links includes tipo_id field
-
-Run with:
-    .venv/bin/pytest tests/test_paraiba_scraper.py -v
 """
 
 from __future__ import annotations

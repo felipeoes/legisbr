@@ -108,12 +108,12 @@ async def test_export_import_round_trip_keeps_listing_keys(tmp_path):
         assert json.loads(extra) == {}
 
 
-async def test_import_reads_legacy_envelope_and_records_invalid_rows(tmp_path):
+async def test_import_records_invalid_rows_and_rejects_non_list(tmp_path):
     source = tmp_path / "2024/data.json"
     source.parent.mkdir()
     rows = [document().model_dump(), {**document(title="Lei 2").model_dump()}]
     rows[1]["situation"] = ""
-    source.write_text(json.dumps({"summary": {}, "documents": rows}))
+    source.write_text(json.dumps(rows))
     async with Store(tmp_path / "documents.db") as store:
         assert await store.import_json(tmp_path) == (1, 1)
         assert len(await store.keys()) == 1
@@ -121,6 +121,10 @@ async def test_import_reads_legacy_envelope_and_records_invalid_rows(tmp_path):
             "SELECT title, message FROM errors"
         ).fetchone()
         assert title == "Lei 2" and "situation" in message
+
+        source.write_text(json.dumps({"documents": rows}))
+        with pytest.raises(ValueError, match="JSON array"):
+            await store.import_json(tmp_path)
 
 
 async def test_error_runs(tmp_path):
@@ -202,21 +206,17 @@ async def test_failed_insert_removes_the_new_orphan_raw_file(tmp_path):
 
 
 async def test_replace_never_deletes_files_the_store_did_not_write(tmp_path):
-    foreign = tmp_path / "2024" / "legacy.pdf"
+    foreign = tmp_path / "2024" / "external.pdf"
     foreign.parent.mkdir()
-    foreign.write_bytes(b"legacy")
+    foreign.write_bytes(b"external")
     async with Store(tmp_path / "documents.db") as store:
         await store.save(document(), file_path=str(foreign))
         await store.save(document(raw=b"new", raw_ext=".pdf"))
-    assert foreign.read_bytes() == b"legacy"
+    assert foreign.read_bytes() == b"external"
 
 
-async def test_runs_keep_stats_and_old_archives_gain_the_column(tmp_path):
+async def test_runs_keep_stats(tmp_path):
     db = tmp_path / "documents.db"
-    with sqlite3.connect(db) as old:
-        old.execute(
-            "CREATE TABLE runs (id INTEGER PRIMARY KEY, scraper TEXT NOT NULL, started_at TEXT, finished_at TEXT, docs INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, llm_usage TEXT NOT NULL DEFAULT '{}')"
-        )
     async with Store(db) as store:
         run = await store.start_run("TEST")
         await store.finish_run(run, 1, 0, {}, {"seconds": 2.5})
@@ -337,7 +337,7 @@ async def test_json_and_jsonl_export_fall_back_to_store_source_when_empty(tmp_pa
     db_path = tmp_path / "ACRE" / "documents.db"
     async with Store(db_path, source="ACRE") as store:
         await store.save(document(title="Lei 1"))
-        # Simulate a v1-migrated row where the per-row source column is empty.
+        # Simulate a row where the per-row source column is empty.
         with store.connection:
             store.connection.execute("UPDATE documents SET source = ''")
         for fmt in ("json", "jsonl"):

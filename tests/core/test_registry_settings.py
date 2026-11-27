@@ -86,7 +86,6 @@ def test_pep562_lazy_exports():
 async def test_base_scraper_aenter_creates_no_log_dir(tmp_path: Path, monkeypatch):
     missing_log_dir = tmp_path / "should_not_exist"
     monkeypatch.setenv("LOG_DIR", str(missing_log_dir))
-    monkeypatch.setenv("ERROR_LOG_DIR", str(missing_log_dir))
 
     class DummyScraper(BaseScraper):
         name = "DUMMY"

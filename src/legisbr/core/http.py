@@ -163,8 +163,8 @@ class HttpClient:
         if not verify_ssl:
             self._ssl_ctx.check_hostname = False
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
-            # shortcut: legislabahia.ba.gov.br only offers TLS1.2 RSA key exchange, which
-            # OpenSSL's default security level rejects; revisit if Bahia upgrades TLS.
+            # legislabahia.ba.gov.br only offers TLS 1.2 RSA key exchange, which
+            # OpenSSL's default security level rejects.
             self._ssl_ctx.set_ciphers("DEFAULT@SECLEVEL=1")
         self.headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"

@@ -148,17 +148,6 @@ class MSAlemsScraper(BaseScraper):
         return year_index
 
     @staticmethod
-    def _decode_html_bytes(body: bytes, charset: str | None) -> str:
-        for encoding in dict.fromkeys([charset, "utf-8", "latin-1", "cp1252"]):
-            if not encoding:
-                continue
-            try:
-                return body.decode(encoding)
-            except (LookupError, UnicodeDecodeError):
-                continue
-        return body.decode("utf-8", errors="replace")
-
-    @staticmethod
     def _notes_container(body: Tag) -> Tag | None:
         notes_root = body.find("ul")
         if isinstance(notes_root, Tag):

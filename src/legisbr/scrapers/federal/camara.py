@@ -32,15 +32,6 @@ from legisbr.core.scraper import DEFAULT_VALID_SITUATION, BaseScraper
 
 logger = logging.getLogger(__name__)
 
-VALID_SITUATIONS = [
-    "Não consta revogação expressa",
-    "Não Informado",
-    "Convertida em Lei",
-    "Reeditada",
-    "Reeditada com alteração",
-]
-INVALID_SITUATIONS = ["Arquivada", "Rejeitada", "Revogada", "Sem Eficácia"]
-COVERAGE = ""
 TYPES = {
     "Alvará": "Álvará",
     "Ato": "Ato",
@@ -228,8 +219,6 @@ _OPERATIVE_CLAUSE_START_RE = re.compile(
     r"^(?:art\.?\s*\d|artigo\b|§|par[aá]grafo\b|o\s+presidente\b|a\s+presidenta\b|o\s+congresso\b|fa[çc]o\s+saber\b|decreta\s*:)",
     re.IGNORECASE,
 )
-ORDERING = "data%3AASC"
-YEAR_START = 1808
 EXPORT_MAX_DOCS = 300
 
 
@@ -416,9 +405,7 @@ class CamaraDepScraper(BaseScraper):
             logger.debug(f"No documents found for url: {url}")
         return documents_html_links_info
 
-    async def _get_document_text_link(
-        self, doc: dict, year: int, norm_type: str
-    ) -> dict | None:
+    async def _get_document_text_link(self, doc: dict, norm_type: str) -> dict:
         """Resolve the actual text URL from a document's metadata page.
 
         Priority: "texto - republicação" > "texto - publicação original"
@@ -497,7 +484,7 @@ class CamaraDepScraper(BaseScraper):
     async def fetch(self, doc: dict) -> Document | None:
         year = doc["year"]
         norm_type = doc["type"]
-        doc = {**doc, **await self._get_document_text_link(doc, year, norm_type)}
+        doc = {**doc, **await self._get_document_text_link(doc, norm_type)}
         title = doc.get("title", "")
         summary = doc.get("summary", "")
         metadata_url = doc.get("metadata_url", "")

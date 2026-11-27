@@ -180,7 +180,11 @@ class TestIsPdfScanned:
         pdf = make_scanned_pdf(
             full_bleed=True, metadata={"/Producer": producer, "/Creator": creator}
         )
-        assert pdf_mod._has_ocr_metadata_pypdf(pdf) is True
+        doc = pdf_mod._open_pdf(pdf)
+        try:
+            assert pdf_mod._has_ocr_metadata_doc(doc) is True
+        finally:
+            doc.close()
         scanned, confidence = is_pdf_scanned(pdf)
         assert scanned is True
         assert confidence == 1.0
@@ -348,8 +352,8 @@ class TestPdfToMarkdownAndExecutors:
         monkeypatch.setattr(pdf_mod, "ProcessPoolExecutor", _deny_pool)
         pdf = make_digital_pdf("Art. 1º " + "Texto legal estadual. " * 10)
         with caplog.at_level("WARNING", logger="legisbr.core.pdf"):
-            result = await runner.run(pdf_mod._pdf_text_layer, pdf, 0.1, True, True)
-        assert result is not None and "Art. 1º" in result
+            result = await runner.run(pdf_mod._extract_pdf_core, pdf, 0.1, True, True)
+        assert result.markdown is not None and "Art. 1º" in result.markdown
         assert runner._process_unavailable is True
         assert "falling back to thread mode" in caplog.text
 
@@ -364,13 +368,13 @@ class TestPdfToMarkdownAndExecutors:
         try:
             # Warm up spawn worker so startup cost isn't mixed with conversion tick test.
             warm = await runner.run(
-                pdf_mod._pdf_text_layer,
+                pdf_mod._extract_pdf_core,
                 make_digital_pdf("Art. 1º " + "Texto de aquecimento. " * 6),
                 0.1,
                 False,
                 False,
             )
-            assert warm is not None
+            assert warm.markdown is not None
 
             gaps_ms: list[float] = []
             stop = False
@@ -387,24 +391,24 @@ class TestPdfToMarkdownAndExecutors:
 
             hb = asyncio.create_task(heartbeat())
             await asyncio.sleep(0.015)
-            md = await runner.run(pdf_mod._pdf_text_layer, pdf, 0.1, False, True)
+            res = await runner.run(pdf_mod._extract_pdf_core, pdf, 0.1, False, True)
             stop = True
             await hb
 
-            assert md is not None and "Art. 1º" in md
+            assert res.markdown is not None and "Art. 1º" in res.markdown
             assert max(gaps_ms) < 50.0, f"Event loop stalled for {max(gaps_ms):.1f} ms"
 
             # BrokenProcessPool recovery: crashed worker fails only its own call.
             with pytest.raises(BrokenProcessPool):
                 await runner.run(_crash_worker)
             recovered = await runner.run(
-                pdf_mod._pdf_text_layer,
+                pdf_mod._extract_pdf_core,
                 make_digital_pdf("Art. 1º " + "Recuperacao apos falha. " * 6),
                 0.1,
                 False,
                 False,
             )
-            assert recovered is not None and "Art. 1º" in recovered
+            assert recovered.markdown is not None and "Art. 1º" in recovered.markdown
         finally:
             runner.shutdown(wait=True)
             shutdown_pdf_pool(wait=True)
@@ -504,8 +508,8 @@ class TestPdfToMarkdownAndExecutors:
 
         pdf = make_digital_pdf("Art. 1º " + "Texto legal estadual. " * 10)
         with caplog.at_level("WARNING", logger="legisbr.core.pdf"):
-            result = await runner.run(pdf_mod._pdf_text_layer, pdf, 0.1, True, True)
-        assert result is not None and "Art. 1º" in result
+            result = await runner.run(pdf_mod._extract_pdf_core, pdf, 0.1, True, True)
+        assert result.markdown is not None and "Art. 1º" in result.markdown
         assert shutdown_called is True
         assert runner._process_unavailable is True
         assert runner._pool is None

@@ -196,25 +196,6 @@ class TestParseDocsFromSoup:
         assert docs == []
 
 
-class TestExtractTotalCount:
-    def test_extracts_count_from_contagem_span(self):
-        scraper = _make_scraper()
-        html = '<html><body><span id="ContentPlaceHolder1_contagem">Localizada(s) 3730 resultados</span></body></html>'
-        soup = BeautifulSoup(html, "lxml")
-        assert scraper._extract_total_count(soup) == 3730
-
-    def test_returns_none_when_tag_absent(self):
-        scraper = _make_scraper()
-        soup = BeautifulSoup(b"<html><body></body></html>", "lxml")
-        assert scraper._extract_total_count(soup) is None
-
-    def test_handles_dot_thousands_separator(self):
-        scraper = _make_scraper()
-        html = '<html><body><span id="ContentPlaceHolder1_contagem">Localizada(s) 1.234 resultados</span></body></html>'
-        soup = BeautifulSoup(html, "lxml")
-        assert scraper._extract_total_count(soup) == 1234
-
-
 class TestHasNextPage:
     def test_returns_true_when_lbnext_active(self):
         scraper = _make_scraper()
@@ -266,8 +247,8 @@ class TestCleanMarkdown:
     _PAGE1_CONTENT = "ATO Nº\n\nA MESA DIRETORA DA ASSEMBLEIA LEGISLATIVA DO ESTADO DO ESPÍRITO SANTO,\nlegais, e considerando o previsto no Processo nº\nusando de suas atribuições\n000028031/2025, resolve:\n\nNOMEAR, na forma do artigo 12, inciso II, da Lei Complementar nº 46, de 31 de janeiro\nde 1994, CAROLINE QUEIROZ DOS SANTOS, para exercer o cargo em comissão de TÉCNICO\nSÊNIOR DE GABINETE DE REPRESENTAÇÃO PARLAMENTAR -\nII, no gabinete do(a)\nDeputado(a) HUDSON LEAL, por solicitação do(a) próprio Deputado(a).\n\nPalácio Domingos Martins,\n\nMARCELO SANTOS\nPresidente"
     _MANIFESTO_BLOCK = "MANIFESTO DE\nASSINATURAS\n\n\n\nAssinado digitalmente por:\nALEXANDRE MARCELO COUTINHO SANTOS\nCPF: ***.507.277-**\nCertificado emitido por AC SyngularID Multipla\nData: 09/12/2025 19:07:20 -03:00"
 
-    def test_pymupdf4llm_manifesto_stripped(self):
-        """pymupdf4llm-style output: content + manifesto in a single block."""
+    def test_single_block_manifesto_stripped(self):
+        """Content and signature manifesto in a single block."""
         raw = self._PAGE1_CONTENT + "\n\n\n" + self._MANIFESTO_BLOCK
         result = _clean_markdown(raw)
         assert result == self._PAGE1_CONTENT

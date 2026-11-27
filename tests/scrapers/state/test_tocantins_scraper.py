@@ -78,105 +78,7 @@ class TestFormatSearchPayload:
             assert key in payload
 
 
-def _make_row_html(
-    title: str = "Lei Ordinária 1/2023",
-    doc_link: str = "/legislacaoEstadual/detalhe?id=1",
-    date: str = "01/01/2023",
-    summary: str = "Dispõe sobre algo.",
-    pdf_href: str = "/arquivos/lei1.pdf",
-) -> str:
-    return f'<div class="row"><h4><a href="{doc_link}">{title}</a></h4><small>Data: {date}</small><em><strong>{summary}</strong></em><a href="{pdf_href}" title="Download">Download</a></div>'
-
-
-class TestExtractDocsFromSoup:
-    def test_empty_html_returns_empty(self):
-        scraper = _make_scraper()
-        result = scraper._extract_docs_from_soup(b"<html><body></body></html>")
-        assert result == []
-
-    def test_row_without_h4_skipped(self):
-        scraper = _make_scraper()
-        html = b'<html><body><div class="row"><p>No h4</p></div></body></html>'
-        result = scraper._extract_docs_from_soup(html)
-        assert result == []
-
-    def test_row_without_link_in_h4_skipped(self):
-        scraper = _make_scraper()
-        html = b'<html><body><div class="row"><h4>No link</h4></div></body></html>'
-        result = scraper._extract_docs_from_soup(html)
-        assert result == []
-
-    def test_valid_row_returns_doc(self):
-        scraper = _make_scraper()
-        html = _make_row_html().encode("utf-8")
-        result = scraper._extract_docs_from_soup(html)
-        assert len(result) == 1
-
-    def test_doc_has_expected_fields(self):
-        scraper = _make_scraper()
-        html = _make_row_html(
-            title="Lei Ordinária 42/2023",
-            doc_link="/legislacaoEstadual/detalhe?id=42",
-            date="15/06/2023",
-            summary="Dispõe sobre algo.",
-            pdf_href="/arquivos/lei42.pdf",
-        ).encode("utf-8")
-        result = scraper._extract_docs_from_soup(html)
-        doc = result[0]
-        assert doc["title"] == "Lei Ordinária 42/2023"
-        assert "15/06/2023" in doc["date"]
-        assert doc["summary"] == "Dispõe sobre algo."
-        assert doc["situation"] == "Não consta"
-        assert "_pdf_link" in doc
-
-    def test_relative_pdf_link_prefixed(self):
-        scraper = _make_scraper()
-        html = _make_row_html(pdf_href="/arquivos/lei1.pdf").encode("utf-8")
-        result = scraper._extract_docs_from_soup(html)
-        assert result[0]["_pdf_link"].startswith("https://www.al.to.leg.br")
-
-    def test_absolute_pdf_link_unchanged(self):
-        scraper = _make_scraper()
-        html = _make_row_html(pdf_href="https://cdn.example.com/lei1.pdf").encode(
-            "utf-8"
-        )
-        result = scraper._extract_docs_from_soup(html)
-        assert result[0]["_pdf_link"] == "https://cdn.example.com/lei1.pdf"
-
-    def test_multiple_rows(self):
-        scraper = _make_scraper()
-        html = (
-            _make_row_html(
-                title="Lei 1/2023", doc_link="/detalhe?id=1", pdf_href="/a1.pdf"
-            )
-            + _make_row_html(
-                title="Lei 2/2023", doc_link="/detalhe?id=2", pdf_href="/a2.pdf"
-            )
-        ).encode("utf-8")
-        result = scraper._extract_docs_from_soup(html)
-        assert len(result) == 2
-
-
-class TestExtractTotalCount:
-    def test_no_registros_div_returns_none(self):
-        soup = BeautifulSoup("<html><body><p>Sem resultados</p></body></html>", "lxml")
-        result = TocantinsScraper._extract_total_count(soup)
-        assert result is None
-
-    def test_extracts_count_from_strong(self):
-        html = "<html><body><div>Registros encontrados: <strong>42</strong></div></body></html>"
-        soup = BeautifulSoup(html, "lxml")
-        result = TocantinsScraper._extract_total_count(soup)
-        assert result == 42
-
-    def test_ignores_div_without_strong(self):
-        html = "<html><body><div>Registros encontrados: sem strong</div></body></html>"
-        soup = BeautifulSoup(html, "lxml")
-        result = TocantinsScraper._extract_total_count(soup)
-        assert result is None
-
-
-def _make_redesigned_listing_html(
+def _make_listing_html(
     *,
     count_banner: str = "138 resultados Mostrando 1–20",
     articles_html: str | None = None,
@@ -204,26 +106,56 @@ def _make_redesigned_listing_html(
     return f"<html><body>{banner}{articles_html}{nav_html}</body></html>".encode()
 
 
-class TestRedesignedPortalParsing:
-    def test_extracts_article_resultado_cards(self):
+class TestPortalParsing:
+    def test_empty_html_and_malformed_cards_return_empty(self):
         scraper = _make_scraper()
-        docs = scraper._extract_docs_from_soup(_make_redesigned_listing_html())
-        assert len(docs) == 1
-        assert docs[0] == {
-            "title": "Lei nº 2699 de 2012 (ordinária)",
-            "summary": "Altera a Lei 2.538/2011.",
-            "date": "2012-12-21",
-            "situation": "Não consta",
-            "_pdf_link": "https://www.al.to.leg.br/arquivo/31849",
-        }
+        assert scraper._extract_docs_from_soup(b"<html><body></body></html>") == []
+        malformed = (
+            b'<html><body><article class="resultado"><p>No heading</p></article>'
+            b'<article class="resultado"><h2>No link</h2></article></body></html>'
+        )
+        assert scraper._extract_docs_from_soup(malformed) == []
 
-    def test_extracts_total_count_from_busca_contagem(self):
-        soup = BeautifulSoup(_make_redesigned_listing_html(), "lxml")
+    def test_extracts_article_resultado_cards_with_relative_and_absolute_links(self):
+        scraper = _make_scraper()
+        docs = scraper._extract_docs_from_soup(_make_listing_html())
+        assert docs == [
+            {
+                "title": "Lei nº 2699 de 2012 (ordinária)",
+                "summary": "Altera a Lei 2.538/2011.",
+                "date": "2012-12-21",
+                "situation": "Não consta",
+                "_pdf_link": "https://www.al.to.leg.br/arquivo/31849",
+            }
+        ]
+        abs_html = _make_listing_html(
+            articles_html=(
+                '<article class="resultado">'
+                '<h2 class="resultado-titulo"><a href="https://cdn.example.com/lei1.pdf">'
+                "Lei 1/2023</a></h2></article>"
+                '<article class="resultado">'
+                '<h2 class="resultado-titulo"><a href="/arquivo/2">Lei 2/2023</a></h2>'
+                "</article>"
+            )
+        )
+        many = scraper._extract_docs_from_soup(abs_html)
+        assert len(many) == 2
+        assert many[0]["_pdf_link"] == "https://cdn.example.com/lei1.pdf"
+        assert many[1]["_pdf_link"] == "https://www.al.to.leg.br/arquivo/2"
+
+    def test_extracts_total_count_from_busca_contagem_or_paginacao_info(self):
+        soup = BeautifulSoup(_make_listing_html(), "lxml")
         assert TocantinsScraper._extract_total_count(soup) == 138
+        soup_no_banner = BeautifulSoup(_make_listing_html(count_banner=""), "lxml")
+        assert TocantinsScraper._extract_total_count(soup_no_banner) == 138
+        soup_empty = BeautifulSoup(
+            "<html><body><p>Sem resultados</p></body></html>", "lxml"
+        )
+        assert TocantinsScraper._extract_total_count(soup_empty) is None
 
-    def test_parse_total_pages_from_redesigned_nav_without_contagem(self):
+    def test_parse_total_pages_from_nav_without_contagem(self):
         scraper = _make_scraper()
-        html = _make_redesigned_listing_html(count_banner="")
+        html = _make_listing_html(count_banner="")
         soup = BeautifulSoup(html, "lxml")
         assert scraper._parse_total_pages(soup, first_page_size=20) == 7
 
@@ -235,7 +167,7 @@ class TestRedesignedPortalParsing:
 
     def test_raises_when_count_positive_but_zero_items_parsed(self):
         scraper = _make_scraper()
-        html = _make_redesigned_listing_html(articles_html="")
+        html = _make_listing_html(articles_html="")
         soup = BeautifulSoup(html, "lxml")
         with pytest.raises(ValueError, match="reported 138 results but parsed 0 items"):
             scraper._parse_total_pages(soup, first_page_size=0)
@@ -331,9 +263,7 @@ class TestRedesignedPortalParsing:
     async def test_search_refs_narrows_to_requested_type_only(self):
         assert TocantinsScraper.list_documents is BaseScraper.list_documents
         scraper = _make_scraper(years=range(1989, 2026))
-        html = _make_redesigned_listing_html(
-            count_banner="1 resultado Mostrando 1–1", nav_html=""
-        )
+        html = _make_listing_html(count_banner="1 resultado Mostrando 1–1", nav_html="")
         scraper.http.request = AsyncMock(return_value=make_mock_response(html))
 
         refs = [

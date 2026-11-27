@@ -99,8 +99,6 @@ _TITLE_SITUATION_PATTERNS = [
     (re.compile("\\(tornada sem efeito\\)$", re.I), "Tornada sem efeito"),
     (re.compile("\\(efeitos cessados\\)$", re.I), "Efeitos cessados"),
 ]
-_TEXT_PAGE_ATTEMPTS = 4
-_TEXT_PAGE_RETRY_SLEEP_SECONDS = 1.0
 _PDF_OBSERVATION_PATTERN = re.compile(
     r"(?:obs(?:erva(?:c|ç)(?:a|ã)o)?:?\s*)?a\s+imagem\s+d[ao]s?\s+.+?est[aá]\s+dispon[ií]vel\s+em:?",
     re.IGNORECASE,
@@ -442,13 +440,8 @@ class MGAlmgScraper(BaseScraper):
             return True
         return len(clean_text) >= 350
 
-    @staticmethod
-    def _is_mg_error_page(page_title: str) -> bool:
-        """Check if a page title indicates an ALMG error/access-denied page."""
-        return "Acesso Proibido" in page_title or "Erro" in page_title
-
     async def _resolve_mg_text_page(
-        self, text_links: list[str], title: str
+        self, text_links: list[str]
     ) -> tuple[str, Tag | None, bytes | None, str]:
         "Iterate candidate text-page URLs and return the first with textNorma."
         last_error = "Failed to fetch document text page"
@@ -459,9 +452,9 @@ class MGAlmgScraper(BaseScraper):
                     "Document link resolves to base URL (no document text available)"
                 )
                 continue
-            span, mhtml, error = await self._try_fetch_text_norma(candidate_url, title)
+            span, page_raw, error = await self._try_fetch_text_norma(candidate_url)
             if span is not None:
-                return (candidate_url, span, mhtml, "")
+                return (candidate_url, span, page_raw, "")
             if error:
                 last_error = error
         return ("", None, None, last_error)
@@ -472,7 +465,6 @@ class MGAlmgScraper(BaseScraper):
         document_page_url: str,
         page_raw: bytes | None,
         title: str,
-        norm_type: str,
         data: dict,
         year: int,
     ) -> Document | None:
@@ -517,7 +509,6 @@ class MGAlmgScraper(BaseScraper):
         detail_link = doc_info.get("_html_link", "")
         title = doc_info.get("title", "Unknown")
         detail_url = urljoin(self.base_url, detail_link)
-        norm_type = doc_info.get("type", "")
         soup_data = (await self.http.request(detail_url)).soup()
         if not soup_data:
             raise ValueError("Failed to fetch document page (soup is None)")
@@ -544,7 +535,7 @@ class MGAlmgScraper(BaseScraper):
             text_norm_span,
             page_raw,
             error,
-        ) = await self._resolve_mg_text_page(text_links, title)
+        ) = await self._resolve_mg_text_page(text_links)
         if text_norm_span is None:
             if error:
                 raise ValueError(error)
@@ -554,7 +545,6 @@ class MGAlmgScraper(BaseScraper):
             document_page_url,
             page_raw,
             title,
-            norm_type,
             data,
             doc_info.get("year", 0),
         )
@@ -667,7 +657,7 @@ class MGAlmgScraper(BaseScraper):
                         return
 
     async def _try_fetch_text_norma(
-        self, url: str, title: str
+        self, url: str
     ) -> tuple[Tag | None, bytes | None, str]:
         response = await self.http.request(url)
         span = response.soup().find("span", class_="textNorma")

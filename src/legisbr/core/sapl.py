@@ -51,13 +51,7 @@ def norm_line(raw: str) -> tuple[str, str]:
 class SAPLBaseScraper(BaseScraper):
     """Base scraper for SAPL API-based state legislation sites.
 
-    Subclasses must set:
-        - ``TYPES``: dict mapping norm type names to API IDs
-        - ``base_url`` (via ``__init__`` default)
-        - ``name`` (via ``__init__`` default)
-
-    Subclasses may override:
-        - ``_process_pdf`` for state-specific PDF handling strategies
+    Subclasses must define class attributes ``types``, ``base_url``, and ``name``.
     """
 
     _SEI_NOISE_PATTERNS: tuple[str, ...] = (
@@ -184,12 +178,6 @@ class SAPLBaseScraper(BaseScraper):
             or (self._SEI_VERSION_RE.match(compact) and "v" in lower)
             or lower.startswith("roraima, em ")
         )
-
-    def _format_search_url(
-        self, norm_type_id: str | int, year: int, page: int = 1
-    ) -> str:
-        """Format URL for SAPL norm search API (single type)."""
-        return f"{self.base_url}/api/norma/normajuridica/?tipo={norm_type_id}&page={page}&ano={year}&page_size={self._page_size}"
 
     def _format_year_url(self, year: int, page: int = 1) -> str:
         """Format URL for all-types SAPL API query for a given year."""

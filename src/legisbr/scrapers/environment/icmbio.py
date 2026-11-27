@@ -65,11 +65,9 @@ class ICMBioScraper(BaseScraper):
 
     Year start (earliest on source): 2016
 
-    Instead of driving a Playwright browser through the PowerBI dashboard,
-    this scraper calls the underlying REST API directly.  Each API request
-    returns up to ``PAGE_SIZE`` (500) rows of structured data — including
-    the ``link_dou`` field — so there is no need for clipboard-based URL
-    extraction or virtual-scroll DOM interaction.
+    Calls the underlying PowerBI querydata REST API directly. Each API request
+    returns up to ``PAGE_SIZE`` (500) rows of structured data, including the
+    ``link_dou`` field.
     """
 
     name = "ICMBIO"

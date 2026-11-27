@@ -17,41 +17,26 @@ from html_to_markdown import convert as html_to_md
 
 from legisbr.core.http import HttpClient, Response
 from legisbr.core.images import ImageCache, _detect_image_mime, inline_images_in_html
-from legisbr.core.pdf import (
-    PdfExecutor,
-    _pdf_text_layer,
-    default_pdf_workers,
-    is_pdf_scanned,
-    pdf_page_count,
-    pdf_to_markdown,
-    readable_text,
-    slice_pdf_pages,
-)
+from legisbr.core.pdf import PdfExecutor, pdf_to_markdown
 
 if TYPE_CHECKING:
     from legisbr.core.ocr import OCR
 
 __all__ = [
-    "_pdf_text_layer",
     "bytes_to_markdown",
     "calc_pages",
     "clean_markdown",
     "clean_md_tag",
     "clean_norm_soup",
-    "default_pdf_workers",
     "detect_extension",
     "html_to_markdown",
     "infer_type_by_prefix",
     "infer_type_from_title",
     "is_pdf",
-    "is_pdf_scanned",
     "normalize_type",
-    "pdf_page_count",
     "pdf_to_markdown",
-    "readable_text",
     "remove_summary_element",
     "remove_summary_from_markdown",
-    "slice_pdf_pages",
     "sniff_extension",
     "strip_html_chrome",
     "valid_markdown",
@@ -579,7 +564,7 @@ async def bytes_to_markdown(
         result = await asyncio.to_thread(mammoth.convert_to_html, io.BytesIO(data))
         return await html_to_markdown(result.value, url, fetch_image, cache=image_cache)
     if sniffed == ".doc":
-        # shortcut: no pure-Python Word 97 converter; add one if .doc norms become common.
+        # OLE2 binary Word 97 (.doc) has no pure-Python converter; fail explicitly.
         raise ValueError(f"Legacy Word/Office (OLE2) file is not supported: {url}")
     response = Response(url, 200, {"Content-Type": content_type}, data)
     if sniffed is None and response.content_type == "text/plain":

@@ -32,10 +32,6 @@ def _make_scraper(**kwargs) -> CearaAleceScraper:
     return make_scraper(CearaAleceScraper, **defaults)
 
 
-def _make_valid_md() -> str:
-    return "# Lei Estadual\n\nO governador do estado decreta a presente lei. " * 30
-
-
 def _make_paginated_html(count: int = 3, norm_type: str = "Ato Normativo") -> str:
     """Build HTML for paginated scraper pages (6-td rows)."""
     rows = ""

@@ -13,7 +13,7 @@ TYPES: dict[str, int] = {"Lei Ordinária": 2, "Lei Complementar": 1, "Decreto": 
 
 
 def _make_scraper(**kwargs) -> SAPLBaseScraper:
-    """Create a SAPLBaseScraper instance bypassing __init__."""
+    """Instantiate SAPLBaseScraper with injected dependencies."""
     kwargs.setdefault("subjects", {})
     kwargs.setdefault("_id_to_type", {v: k for k, v in TYPES.items()})
     kwargs.setdefault("_page_size", 100)

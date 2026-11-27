@@ -165,9 +165,7 @@ class PernambucoAlepeScraper(BaseScraper):
         response = await self.http.request(
             self.search_url, method="POST", data=payload, timeout=60
         )
-        client_response = response
-        html = client_response.text
-        return BeautifulSoup(html, "lxml")
+        return response.soup()
 
     @staticmethod
     def _extract_text_version(url: str) -> str:
@@ -382,7 +380,6 @@ class PernambucoAlepeScraper(BaseScraper):
 
     async def fetch(self, doc_info: dict) -> Document | None:
         year = doc_info["year"]
-        title = doc_info.get("title", "")
         norm_type = doc_info.get("type", "")
         candidate_urls = list(
             dict.fromkeys(
@@ -435,9 +432,7 @@ class PernambucoAlepeScraper(BaseScraper):
             raise ValueError(last_failure_reason)
         reference_page: BeautifulSoup | None = None
         if additional_data_url:
-            reference_page = await self._fetch_reference_page(
-                additional_data_url, title=title
-            )
+            reference_page = await self._fetch_reference_page(additional_data_url)
         result = {
             **doc_info,
             "year": year,
@@ -498,5 +493,5 @@ class PernambucoAlepeScraper(BaseScraper):
                 raise ValueError("Pernambuco pagination did not advance")
             soup = next_soup
 
-    async def _fetch_reference_page(self, url: str, *, title: str) -> BeautifulSoup:
+    async def _fetch_reference_page(self, url: str) -> BeautifulSoup:
         return (await self.http.request(url, timeout=60)).soup()

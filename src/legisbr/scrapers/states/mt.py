@@ -97,7 +97,6 @@ class MTAlmtScraper(BaseScraper):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.historic_types = HISTORIC_TYPES
         self.max_year_historic = 1978
         self.token = None
         self.regex_total_items = re.compile("Total de registros:\\s+([\\d.]+)")

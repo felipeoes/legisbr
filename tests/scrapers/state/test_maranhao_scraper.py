@@ -1,8 +1,4 @@
-"""Tests for MaranhaoAlemaScraper.
-
-Run with:
-    .venv/bin/pytest tests/test_maranhao_scraper.py -v
-"""
+"""Tests for MaranhaoAlemaScraper."""
 
 from __future__ import annotations
 
@@ -13,21 +9,9 @@ from parser_assertions import TypesConstantTests
 from legisbr.scrapers.states.ma import TYPES, JSFFormState, MaranhaoAlemaScraper
 
 
-class FakeResponse:
-    def __init__(self, text: str):
-        self._text = text
-
-    async def text(self, errors: str = "replace") -> str:
-        return self._text
-
-
 def _make_scraper(**kwargs) -> MaranhaoAlemaScraper:
     defaults = {"_rows_per_page": 10}
     return make_scraper(MaranhaoAlemaScraper, **{**defaults, **kwargs})
-
-
-def _make_valid_md() -> str:
-    return "# Decreto\n\nTexto do decreto. " * 30
 
 
 def _make_result_rows_html(
@@ -62,16 +46,6 @@ def _make_search_page_html(
 
 def _make_subtype_panel_html(field_name: str = "j_idt54") -> str:
     return f'\n    <div id="painel_tipo_doc">\n        <table id="{field_name}" role="presentation" class="ui-selectmanycheckbox ui-widget">\n            <tr>\n                <td>\n                    <input id="{field_name}:0" name="{field_name}" type="checkbox" value="2" checked="checked" />\n                    <label for="{field_name}:0">Lei Ordinária</label>\n                </td>\n            </tr>\n            <tr>\n                <td>\n                    <input id="{field_name}:1" name="{field_name}" type="checkbox" value="3" checked="checked" />\n                    <label for="{field_name}:1">Lei Complementar</label>\n                </td>\n            </tr>\n        </table>\n    </div>'
-
-
-def _make_partial_xml(*updates: tuple[str, str]) -> str:
-    inner = "".join(
-        (
-            f'<update id="{update_id}"><![CDATA[{value}]]></update>'
-            for update_id, value in updates
-        )
-    )
-    return f"<?xml version='1.0' encoding='UTF-8'?><partial-response><changes>{inner}</changes></partial-response>"
 
 
 class TestTypesConstant(TypesConstantTests):

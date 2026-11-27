@@ -298,7 +298,6 @@ async def test_source_line_breaks_do_not_glue_words():
         "https://www.almg.gov.br/legislacao-mineira/texto/DEC/45993/2012/original",
         b"raw",
         "Decreto nº 45.993",
-        "Decreto",
         {"title": "Decreto nº 45.993", "type": "Decreto", "situation": "Vigente"},
         2012,
     )
@@ -334,7 +333,6 @@ async def test_strips_update_footer_variants_dividers_and_annex_observation_sibl
             "https://www.almg.gov.br/legislacao-mineira/texto/DEC/46083/2012/original",
             b"raw",
             "Decreto nº 46.083",
-            "Decreto",
             {"title": "Decreto nº 46.083", "type": "Decreto", "situation": "Vigente"},
             2012,
         )
@@ -369,7 +367,6 @@ async def test_almg_link_followed_by_compartilhar_preserves_intervening_articles
         "https://www.almg.gov.br/legislacao-mineira/texto/LEI/123/2024/original",
         b"raw",
         "Lei nº 123",
-        "Lei",
         {"title": "Lei nº 123", "type": "Lei", "situation": DEFAULT_VALID_SITUATION},
         2024,
     )

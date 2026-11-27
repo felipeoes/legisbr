@@ -1,4 +1,4 @@
-"""Transactional SQLite Schema v2 storage, safe FTS5 search, and streaming export."""
+"""Transactional SQLite storage, safe FTS5 search, and streaming export."""
 
 from __future__ import annotations
 
@@ -31,26 +31,6 @@ CREATE TABLE IF NOT EXISTS meta (
 
 _CREATE_DOCUMENTS_SQL = """
 CREATE TABLE IF NOT EXISTS documents (
-    id INTEGER PRIMARY KEY,
-    ref_url TEXT NOT NULL,
-    ref_title TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT '',
-    document_url TEXT NOT NULL,
-    title TEXT NOT NULL,
-    year INTEGER NOT NULL,
-    type TEXT NOT NULL,
-    situation TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    text_markdown TEXT NOT NULL,
-    file_path TEXT,
-    extra TEXT NOT NULL,
-    scraped_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    UNIQUE(ref_url, ref_title)
-)
-"""
-
-_CREATE_DOCUMENTS_V2_TMP_SQL = """
-CREATE TABLE documents_v2 (
     id INTEGER PRIMARY KEY,
     ref_url TEXT NOT NULL,
     ref_title TEXT NOT NULL,
@@ -276,50 +256,6 @@ class Store:
                 raise
 
     @staticmethod
-    def _migrate_v1_to_v2(
-        connection: sqlite3.Connection, doc_columns: set[str]
-    ) -> None:
-        source_expr = "source" if "source" in doc_columns else "''"
-        scraped_expr = (
-            "scraped_at"
-            if "scraped_at" in doc_columns
-            else "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
-        )
-        with connection:
-            connection.execute("DROP TABLE IF EXISTS documents_v2")
-            connection.execute(_CREATE_DOCUMENTS_V2_TMP_SQL)
-            connection.execute(
-                f"""
-                INSERT INTO documents_v2 (
-                    ref_url, ref_title, source, document_url, title, year,
-                    type, situation, summary, text_markdown, file_path, extra, scraped_at
-                )
-                SELECT
-                    ref_url, ref_title, {source_expr}, document_url, title, year,
-                    type, situation, summary, text_markdown, file_path, extra, {scraped_expr}
-                FROM documents
-                ORDER BY rowid
-                """
-            )
-            connection.execute("DROP TABLE documents")
-            connection.execute("ALTER TABLE documents_v2 RENAME TO documents")
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS documents_year ON documents(year)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS documents_type ON documents(type)"
-            )
-            connection.execute(_CREATE_META_SQL)
-            connection.execute(
-                "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (_SCHEMA_VERSION,),
-            )
-            connection.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('fts_enabled', '0')"
-            )
-
-    @staticmethod
     def _rebuild_fts_sync(connection: sqlite3.Connection) -> int:
         _check_fts5_available(connection)
         indexed = 0
@@ -368,18 +304,6 @@ class Store:
             cache_kb = -4000 if self.low_memory else -16000
             connection.execute(f"PRAGMA cache_size={cache_kb}")
 
-            if _has_table(connection, "documents"):
-                doc_columns = {
-                    row[1] for row in connection.execute("PRAGMA table_info(documents)")
-                }
-                if "id" not in doc_columns:
-                    self._migrate_v1_to_v2(connection, doc_columns)
-                elif "source" not in doc_columns:
-                    with connection:
-                        connection.execute(
-                            "ALTER TABLE documents ADD COLUMN source TEXT NOT NULL DEFAULT ''"
-                        )
-
             with connection:
                 connection.execute(_CREATE_META_SQL)
                 connection.execute(_CREATE_DOCUMENTS_SQL)
@@ -391,13 +315,6 @@ class Store:
                 )
                 connection.execute(_CREATE_ERRORS_SQL)
                 connection.execute(_CREATE_RUNS_SQL)
-                run_columns = {
-                    row[1] for row in connection.execute("PRAGMA table_info(runs)")
-                }
-                if "stats" not in run_columns:  # archives created before run stats
-                    connection.execute(
-                        "ALTER TABLE runs ADD COLUMN stats TEXT NOT NULL DEFAULT '{}'"
-                    )
                 connection.execute(
                     "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -555,11 +472,6 @@ class Store:
         """The raw file behind file_path, only if this store wrote it."""
         if not file_path:
             return None
-        path = Path(file_path)
-        if path.is_absolute():  # archives written before paths became relative
-            if not path.is_relative_to(self.root):
-                return None
-            file_path = path.relative_to(self.root).as_posix()
         return self.root / file_path if _OWNED_RAW_RE.fullmatch(file_path) else None
 
     def _save(
@@ -1026,8 +938,6 @@ class Store:
             )
             for path in paths:
                 rows = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(rows, dict):  # legacy saver: {"summary", "documents"}
-                    rows = rows.get("documents")
                 if not isinstance(rows, list):
                     raise ValueError(f"Expected a JSON array of documents in {path}")
                 with self.connection:

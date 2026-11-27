@@ -51,10 +51,6 @@ class TocantinsScraper(BaseScraper):
         super().__init__(**kwargs)
         self.search_url = f"{self.base_url}/legislacaoEstadual"
 
-    def _format_search_url(self, _norm_type_id: str, _year: int, _page: int = 1) -> str:
-        """Format url for search request - returns the search URL"""
-        return self.search_url
-
     def _format_search_payload(
         self, norm_type_id: str, year: int, page: int = 1
     ) -> dict:
@@ -94,16 +90,9 @@ class TocantinsScraper(BaseScraper):
         return self._extract_docs_from_soup_obj(BeautifulSoup(html_content, "lxml"))
 
     def _extract_docs_from_soup_obj(self, soup: BeautifulSoup) -> list[dict]:
-        """Extract document entries supporting both current and legacy portal layouts."""
-        articles = soup.find_all("article", class_="resultado")
-        if articles:
-            return self._extract_articles(articles)
-        return self._extract_legacy_rows(soup)
-
-    def _extract_articles(self, articles: list[Tag]) -> list[dict]:
-        """Parse the redesigned `<article class="resultado">` cards."""
+        """Parse `<article class="resultado">` cards from search result HTML."""
         docs: list[dict] = []
-        for article in articles:
+        for article in soup.find_all("article", class_="resultado"):
             title_heading = article.find(
                 ["h2", "h3", "h4"], class_=re.compile(r"resultado-titulo")
             ) or article.find(["h2", "h3", "h4"])
@@ -158,61 +147,6 @@ class TocantinsScraper(BaseScraper):
             )
         return docs
 
-    def _extract_legacy_rows(self, soup: BeautifulSoup) -> list[dict]:
-        """Parse legacy `<div class="row">` -> `<h4><a>` markup."""
-        docs: list[dict] = []
-        for row in soup.find_all("div", class_="row"):
-            try:
-                title_link = row.find("h4")
-                if not title_link or not isinstance(title_link, Tag):
-                    continue
-                link_tag = title_link.find("a")
-                if not link_tag or not isinstance(link_tag, Tag):
-                    continue
-                title = link_tag.get_text(strip=True)
-                doc_link = link_tag.get("href", "")
-                if not isinstance(doc_link, str):
-                    continue
-                if not doc_link.startswith("http"):
-                    doc_link = f"{self.base_url}{doc_link}"
-                date_text = ""
-                for small in row.find_all("small"):
-                    if isinstance(small, Tag):
-                        text = small.get_text(strip=True)
-                        if "Data:" in text:
-                            date_text = text.replace("Data:", "").strip()
-                            date_text = date_text.replace("|", "").strip()
-                            break
-                summary = ""
-                em_tag = row.find("em")
-                if em_tag and isinstance(em_tag, Tag):
-                    strong_tag = em_tag.find("strong")
-                    if strong_tag and isinstance(strong_tag, Tag):
-                        summary = strong_tag.get_text(strip=True)
-                pdf_link = ""
-                pdf_link_tag = row.find("a", {"title": "Download"})
-                if pdf_link_tag and isinstance(pdf_link_tag, Tag):
-                    pdf_href = pdf_link_tag.get("href", "")
-                    if isinstance(pdf_href, str):
-                        pdf_link = (
-                            pdf_href
-                            if pdf_href.startswith("http")
-                            else f"{self.base_url}{pdf_href}"
-                        )
-                docs.append(
-                    {
-                        "title": title,
-                        "summary": summary,
-                        "date": date_text,
-                        "situation": VALID_SITUATIONS[0],
-                        "_pdf_link": pdf_link,
-                    }
-                )
-            except Exception as e:
-                logger.error(f"Error extracting document from box: {e}")
-                continue
-        return docs
-
     @staticmethod
     def _is_empty_results(soup: BeautifulSoup) -> bool:
         """Return True when the page explicitly reports zero search results."""
@@ -237,16 +171,6 @@ class TocantinsScraper(BaseScraper):
             match = _PAGE_INFO_COUNT_RE.search(pag_info.get_text(" ", strip=True))
             if match:
                 return int(match.group(1).replace(".", ""))
-        for div in soup.find_all("div"):
-            text = div.get_text(" ", strip=True)
-            if "Registros encontrados" not in text:
-                continue
-            strong_tag = div.find("strong")
-            if not strong_tag or not isinstance(strong_tag, Tag):
-                continue
-            digits = re.sub("\\D", "", strong_tag.get_text(strip=True))
-            if digits:
-                return int(digits)
         return None
 
     def _parse_total_pages(self, soup: BeautifulSoup, first_page_size: int) -> int:
@@ -289,14 +213,6 @@ class TocantinsScraper(BaseScraper):
                 if m:
                     max_page = max(max_page, int(m.group(1)))
         return max_page
-
-    async def _get_total_pages(self, norm_type_id: str, year: int) -> int:
-        """Get total number of pages for a search."""
-        payload = self._format_search_payload(norm_type_id, year, 1)
-        response = await self.http.request(self.search_url, method="POST", data=payload)
-        soup = BeautifulSoup(response.content, "lxml")
-        first_page_docs = self._extract_docs_from_soup_obj(soup)
-        return self._parse_total_pages(soup, len(first_page_docs))
 
     async def fetch(self, doc_info: dict) -> Document | None:
         """Get document data by downloading PDF and converting to markdown"""

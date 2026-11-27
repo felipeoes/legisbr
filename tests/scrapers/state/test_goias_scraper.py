@@ -28,13 +28,6 @@ def _make_scraper(**kwargs) -> LegislaGoias:
     return make_scraper(LegislaGoias, **kwargs)
 
 
-def _make_valid_md() -> str:
-    return (
-        "# Lei Estadual\n\nO governador do estado de Goiás decreta a presente lei. "
-        * 30
-    )
-
-
 def _make_doc_detail(
     doc_id: int = 1,
     numero: str = "001",

@@ -382,18 +382,6 @@ def _has_ocr_metadata_doc(doc: pdfium.PdfDocument) -> bool:
         return False
 
 
-def _has_ocr_metadata_pypdf(content: bytes) -> bool:
-    """Inspect ``/Producer`` and ``/Creator`` in the PDF Info dict."""
-    try:
-        doc = _open_pdf(content)
-        try:
-            return _has_ocr_metadata_doc(doc)
-        finally:
-            doc.close()
-    except Exception:
-        return False
-
-
 def pdf_page_count(data: bytes) -> int:
     """Return the exact number of pages in a PDF, raising ``ValueError`` if invalid."""
     try:
@@ -420,7 +408,6 @@ class _ImageInfo:
     bpp: int
     sha256: bytes
     vis_text_overlaps: int
-    any_text_overlaps: int
     total_vis_text: int
     raw_len: int
     is_jpeg: bool
@@ -620,7 +607,6 @@ def _populate_page_objects(
                 bpp=bpp,
                 sha256=sha,
                 vis_text_overlaps=inside_vis,
-                any_text_overlaps=inside_any,
                 total_vis_text=total_vis,
                 raw_len=raw_len,
                 is_jpeg=is_jpeg,
@@ -1342,7 +1328,7 @@ def _digital_pdf(
 
 
 # ---------------------------------------------------------------------------
-# Main extraction pipeline (_pdf_text_layer & selective per-page OCR support)
+# Main extraction pipeline (_extract_pdf_core & selective per-page OCR support)
 # ---------------------------------------------------------------------------
 @dataclass
 class _ExtractionResult:
@@ -1557,28 +1543,6 @@ def _extract_pdf_core(
         return _ExtractionResult(markdown=fallback if long_enough(fallback) else None)
     finally:
         doc.close()
-
-
-def _pdf_text_layer(
-    data: bytes,
-    image_size_limit: float = 0.1,
-    check_readable: bool = True,
-    embed_images: bool = True,
-    *,
-    yield_between_pages: bool = False,
-) -> str | None:
-    """Extract best embedded text via ``pypdfium2`` + selective ``pdfplumber``; ``None`` means OCR.
-
-    Safe to execute in a ``spawn`` worker subprocess (no logging side effects).
-    """
-    res = _extract_pdf_core(
-        data,
-        image_size_limit=image_size_limit,
-        check_readable=check_readable,
-        embed_images=embed_images,
-        yield_between_pages=yield_between_pages,
-    )
-    return res.markdown
 
 
 def slice_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> bytes:

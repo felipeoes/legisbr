@@ -1,4 +1,4 @@
-"""Tests for Schema v2 migration, UPSERT/VACUUM stability, FTS5, Parquet, and ArchiveIndex."""
+"""Tests for SQLite schema initialization, UPSERT/VACUUM stability, FTS5, Parquet, and ArchiveIndex."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import os
 import sqlite3
 import sys
 import tracemalloc
-from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -36,85 +35,9 @@ def make_doc(**kwargs) -> Document:
     return Document(**defaults)
 
 
-def _create_v1_archive(db_path: Path) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE documents (
-                ref_url TEXT NOT NULL, ref_title TEXT NOT NULL,
-                document_url TEXT NOT NULL, title TEXT NOT NULL, year INTEGER NOT NULL,
-                type TEXT NOT NULL, situation TEXT NOT NULL, summary TEXT NOT NULL,
-                text_markdown TEXT NOT NULL, file_path TEXT, extra TEXT NOT NULL,
-                scraped_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                PRIMARY KEY (ref_url, ref_title)
-            );
-            CREATE INDEX documents_year ON documents(year);
-            CREATE TABLE errors (
-                run_id INTEGER, at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                year INTEGER, type TEXT, situation TEXT, title TEXT, url TEXT, message TEXT NOT NULL
-            );
-            CREATE TABLE runs (
-                id INTEGER PRIMARY KEY, scraper TEXT NOT NULL,
-                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                finished_at TEXT, docs INTEGER NOT NULL DEFAULT 0,
-                errors INTEGER NOT NULL DEFAULT 0, llm_usage TEXT NOT NULL DEFAULT '{}',
-                stats TEXT NOT NULL DEFAULT '{}'
-            );
-            """
-        )
-        conn.execute(
-            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "https://example.org/list/1",
-                "Lei 10",
-                "https://example.org/doc/10",
-                "Lei nº 10/2020",
-                2020,
-                "Lei",
-                "Vigente",
-                "Ementa antiga",
-                "Art. 1º Texto preservado da migração v1 para v2 com detalhes.",
-                "2020/docs/legacy.pdf",
-                json.dumps({"numero": "10", "orgao": "AL"}),
-                "2024-01-15T12:34:56.789Z",
-            ),
-        )
-        conn.execute(
-            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "https://example.org/list/2",
-                "Decreto 20",
-                "https://example.org/doc/20",
-                "Decreto nº 20/2021",
-                2021,
-                "Decreto",
-                "Revogada",
-                "Segundo documento",
-                "Art. 1º Segundo texto preservado integralmente na tabela.",
-                None,
-                json.dumps({"codigo": 20}),
-                "2024-02-20T00:00:00.000Z",
-            ),
-        )
-        conn.execute(
-            "INSERT INTO runs(scraper, docs, errors, stats) VALUES (?, ?, ?, ?)",
-            ("ACRE", 2, 1, json.dumps({"seconds": 4.2})),
-        )
-        conn.execute(
-            "INSERT INTO errors(run_id, year, title, message) VALUES (?, ?, ?, ?)",
-            (1, 2021, "Lei quebrada", "timeout"),
-        )
-
-
-async def test_v1_to_v2_migration_preserves_data_and_is_idempotent(tmp_path):
+async def test_fresh_store_initializes_schema_meta_and_indexes(tmp_path):
     db_path = tmp_path / "documents.db"
-    raw_file = tmp_path / "2020/docs/legacy.pdf"
-    raw_file.parent.mkdir(parents=True)
-    raw_file.write_bytes(b"%PDF-1.4 legacy")
-    _create_v1_archive(db_path)
-
-    async with Store(db_path) as store:
+    async with Store(db_path, source="ACRE") as store:
         meta = dict(store.connection.execute("SELECT key, value FROM meta").fetchall())
         assert meta["schema_version"] == "2"
         assert meta["fts_enabled"] == "0"
@@ -129,32 +52,17 @@ async def test_v1_to_v2_migration_preserves_data_and_is_idempotent(tmp_path):
         assert "documents_year" in indexes
         assert "documents_type" in indexes
 
+        await store.save(
+            make_doc(title="Lei nº 10/2020", year=2020),
+            ref_url="https://example.org/list/1",
+            ref_title="Lei 10",
+        )
         doc1 = await store.get_document(1)
-        doc2 = await store.get_document(2)
-        assert doc1 is not None and doc2 is not None
-        assert doc1["scraped_at"] == "2024-01-15T12:34:56.789Z"
-        assert doc1["file_path"] == "2020/docs/legacy.pdf"
-        assert doc1["extra"] == {"numero": "10", "orgao": "AL"}
-        assert doc2["scraped_at"] == "2024-02-20T00:00:00.000Z"
-        assert doc2["extra"] == {"codigo": 20}
-        assert raw_file.read_bytes() == b"%PDF-1.4 legacy"
+        assert doc1 is not None and doc1["source"] == "ACRE"
 
-        run_row = store.connection.execute(
-            "SELECT scraper, docs, stats FROM runs"
-        ).fetchone()
-        assert run_row["scraper"] == "ACRE" and run_row["docs"] == 2
-        assert json.loads(run_row["stats"]) == {"seconds": 4.2}
-        err_row = store.connection.execute(
-            "SELECT title, message FROM errors"
-        ).fetchone()
-        assert err_row["title"] == "Lei quebrada" and err_row["message"] == "timeout"
-
-    # Re-opening must be idempotent and keep the exact assigned integer IDs.
+    # Re-opening must be idempotent and keep the assigned integer ID.
     async with Store(db_path) as store:
-        assert await store.keys() == {
-            ("https://example.org/list/1", "Lei 10"),
-            ("https://example.org/list/2", "Decreto 20"),
-        }
+        assert await store.keys() == {("https://example.org/list/1", "Lei 10")}
         reopened = await store.get_document(1)
         assert reopened is not None and reopened["title"] == "Lei nº 10/2020"
 
