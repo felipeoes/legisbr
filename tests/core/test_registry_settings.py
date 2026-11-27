@@ -64,10 +64,11 @@ def test_database_path_routes_by_scope(tmp_path: Path):
 
 def test_import_legisbr_and_sources_is_lazy_without_heavy_imports():
     code = (
-        "import sys, legisbr; "
+        "import sys, threading, legisbr; "
         "infos = legisbr.sources(); "
         "assert len(infos) == 30; "
-        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pypdfium2', 'pdfplumber', 'PIL', 'pypdf', 'pydantic_ai'); "
+        "assert threading.active_count() == 1; "
+        "forbidden = ('aiohttp', 'bs4', 'pydantic', 'pypdfium2', 'pdfplumber', 'PIL', 'pypdf', 'pydantic_ai', 'pyarrow', 'mcp'); "
         "loaded = [m for m in forbidden if m in sys.modules]; "
         "scrapers = [m for m in sys.modules if m.startswith('legisbr.scrapers')]; "
         "assert not loaded, f'Heavy modules loaded: {loaded}'; "
@@ -79,6 +80,8 @@ def test_import_legisbr_and_sources_is_lazy_without_heavy_imports():
 def test_pep562_lazy_exports():
     assert legisbr.Store is Store
     assert legisbr.Settings is Settings
+    assert legisbr.Client is not legisbr.AsyncClient
+    assert legisbr.ArchiveIndex is not legisbr.AsyncArchiveIndex
     with pytest.raises(AttributeError):
         getattr(legisbr, "NotARealExport")
 

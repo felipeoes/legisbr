@@ -245,6 +245,28 @@ class Store:
         self._lock = asyncio.Lock()
         self._connection: sqlite3.Connection | None = None
 
+    @classmethod
+    def for_source(
+        cls,
+        source: str,
+        data_dir: str | Path = "outputs/legislation",
+        *,
+        save_raw: bool = True,
+        fts: bool = False,
+        low_memory: bool = False,
+    ) -> Store:
+        """Build a ``Store`` for *source* (code, name, or alias) under *data_dir*."""
+        from legisbr.registry import get_spec
+
+        spec = get_spec(source)
+        return cls(
+            spec.database_path(Path(data_dir)),
+            save_raw=save_raw,
+            fts=fts,
+            source=spec.name,
+            low_memory=low_memory,
+        )
+
     async def _call(self, operation: Callable[..., _T], *args: Any) -> _T:
         async with self._lock:
             task = asyncio.create_task(asyncio.to_thread(operation, *args))
@@ -738,136 +760,26 @@ class Store:
     def _export_json_target(
         self, target: Path, fmt: str, sql: str, params: tuple[Any, ...]
     ) -> int:
-        count = 0
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + ".tmp")
-        try:
-            with temporary.open("w", encoding="utf-8") as output:
-                if fmt == "json":
-                    output.write("[\n")
-                first = True
-                for row in self.connection.execute(sql, params):
-                    data = dict(row)
-                    extra = json.loads(data.pop("extra"))
-                    if not data.get("source"):
-                        if self.source:
-                            data["source"] = self.source
-                        else:
-                            data.pop("source", None)
-                    if fmt == "json" and not first:
-                        output.write(",\n")
-                    output.write(json.dumps({**extra, **data}, ensure_ascii=False))
-                    if fmt == "jsonl":
-                        output.write("\n")
-                    first = False
-                    count += 1
-                if fmt == "json":
-                    output.write("\n]\n")
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return count
+        return _export_json_target(
+            self.connection, target, fmt, sql, params, default_source=self.source
+        )
 
     def _export_parquet(
         self,
         out_dir: Path,
         *,
         single_file: bool,
-        batch_size: int,
+        year: int | None = None,
+        batch_size: int = 2000,
     ) -> int:
-        try:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-        except ImportError as exc:
-            raise ImportError(
-                "Install Parquet support with: pip install 'legisbr[parquet]'"
-            ) from exc
-
-        schema = pa.schema(
-            [
-                pa.field("id", pa.int64(), nullable=False),
-                pa.field("source", pa.string(), nullable=False),
-                pa.field("ref_url", pa.string(), nullable=False),
-                pa.field("ref_title", pa.string(), nullable=False),
-                pa.field("document_url", pa.string(), nullable=False),
-                pa.field("title", pa.string(), nullable=False),
-                pa.field("year", pa.int32(), nullable=False),
-                pa.field("type", pa.string(), nullable=False),
-                pa.field("situation", pa.string(), nullable=False),
-                pa.field("summary", pa.string(), nullable=False),
-                pa.field("text_markdown", pa.string(), nullable=False),
-                pa.field("file_path", pa.string(), nullable=True),
-                pa.field("extra_json", pa.string(), nullable=False),
-            ]
+        return _export_parquet_connection(
+            self.connection,
+            out_dir,
+            default_source=self.source,
+            single_file=single_file,
+            year=year,
+            batch_size=batch_size,
         )
-
-        select_cols = (
-            "id, source, ref_url, ref_title, document_url, title, year, "
-            "type, situation, summary, text_markdown, file_path, extra"
-        )
-
-        def write_query(target: Path, sql: str, params: tuple[Any, ...]) -> int:
-            written = 0
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(target.name + ".tmp")
-            try:
-                with pq.ParquetWriter(temporary, schema, compression="zstd") as writer:
-                    cursor = self.connection.execute(sql, params)
-                    while True:
-                        rows = cursor.fetchmany(batch_size)
-                        if not rows:
-                            break
-                        columns = {
-                            "id": [int(r["id"]) for r in rows],
-                            "source": [str(r["source"] or self.source) for r in rows],
-                            "ref_url": [str(r["ref_url"]) for r in rows],
-                            "ref_title": [str(r["ref_title"]) for r in rows],
-                            "document_url": [str(r["document_url"]) for r in rows],
-                            "title": [str(r["title"]) for r in rows],
-                            "year": [int(r["year"]) for r in rows],
-                            "type": [str(r["type"]) for r in rows],
-                            "situation": [str(r["situation"]) for r in rows],
-                            "summary": [str(r["summary"] or "") for r in rows],
-                            "text_markdown": [str(r["text_markdown"]) for r in rows],
-                            "file_path": [
-                                None if r["file_path"] is None else str(r["file_path"])
-                                for r in rows
-                            ],
-                            "extra_json": [str(r["extra"] or "{}") for r in rows],
-                        }
-                        batch = pa.RecordBatch.from_pydict(columns, schema=schema)
-                        writer.write_batch(batch)
-                        written += len(rows)
-                os.replace(temporary, target)
-            finally:
-                temporary.unlink(missing_ok=True)
-            return written
-
-        if single_file:
-            target = (
-                out_dir if out_dir.suffix == ".parquet" else out_dir / "data.parquet"
-            )
-            return write_query(
-                target,
-                f"SELECT {select_cols} FROM documents ORDER BY year, ref_url, ref_title",
-                (),
-            )
-
-        total = 0
-        years = [
-            row[0]
-            for row in self.connection.execute(
-                "SELECT DISTINCT year FROM documents ORDER BY year"
-            )
-        ]
-        for year in years:
-            target = out_dir / str(year) / "data.parquet"
-            total += write_query(
-                target,
-                f"SELECT {select_cols} FROM documents WHERE year=? ORDER BY ref_url, ref_title",
-                (year,),
-            )
-        return total
 
     async def export(
         self,
@@ -875,6 +787,7 @@ class Store:
         fmt: str = "jsonl",
         *,
         single_file: bool = False,
+        year: int | None = None,
         batch_size: int = 2000,
     ) -> int:
         if fmt not in {"json", "jsonl", "parquet"}:
@@ -885,47 +798,26 @@ class Store:
 
         if fmt == "parquet":
             return await self._call(
-                lambda: self._export_parquet(
-                    out_path, single_file=single_file, batch_size=batch_size
+                lambda: _export_parquet_connection(
+                    self.connection,
+                    out_path,
+                    default_source=self.source,
+                    single_file=single_file,
+                    year=year,
+                    batch_size=batch_size,
                 )
             )
 
-        select_cols = (
-            "ref_url, ref_title, source, document_url, title, year, "
-            "type, situation, summary, text_markdown, file_path, extra"
+        return await self._call(
+            lambda: _export_json_connection(
+                self.connection,
+                out_path,
+                fmt,
+                default_source=self.source,
+                single_file=single_file,
+                year=year,
+            )
         )
-
-        def export_json() -> int:
-            if single_file:
-                target = (
-                    out_path
-                    if out_path.suffix == f".{fmt}"
-                    else out_path / f"data.{fmt}"
-                )
-                return self._export_json_target(
-                    target,
-                    fmt,
-                    f"SELECT {select_cols} FROM documents ORDER BY year, ref_url, ref_title",
-                    (),
-                )
-            count = 0
-            years = [
-                row[0]
-                for row in self.connection.execute(
-                    "SELECT DISTINCT year FROM documents ORDER BY year"
-                )
-            ]
-            for year in years:
-                target = out_path / str(year) / f"data.{fmt}"
-                count += self._export_json_target(
-                    target,
-                    fmt,
-                    f"SELECT {select_cols} FROM documents WHERE year=? ORDER BY ref_url, ref_title",
-                    (year,),
-                )
-            return count
-
-        return await self._call(export_json)
 
     async def import_json(self, directory: str | Path) -> tuple[int, int]:
         """Import JSON archives; returns (imported, rejected). Rejected rows go to errors."""
@@ -976,3 +868,346 @@ class Store:
             return imported, rejected
 
         return await self._call(import_files)
+
+
+_EXPORT_SUFFIX_TO_FMT: dict[str, str] = {
+    ".parquet": "parquet",
+    ".jsonl": "jsonl",
+    ".json": "json",
+}
+
+
+def _export_json_target(
+    connection: sqlite3.Connection,
+    target: Path,
+    fmt: str,
+    sql: str,
+    params: tuple[Any, ...],
+    *,
+    default_source: str = "",
+) -> int:
+    count = 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            if fmt == "json":
+                output.write("[\n")
+            first = True
+            for row in connection.execute(sql, params):
+                data = dict(row)
+                extra = json.loads(data.pop("extra"))
+                if not data.get("source"):
+                    if default_source:
+                        data["source"] = default_source
+                    else:
+                        data.pop("source", None)
+                if fmt == "json" and not first:
+                    output.write(",\n")
+                output.write(json.dumps({**extra, **data}, ensure_ascii=False))
+                if fmt == "jsonl":
+                    output.write("\n")
+                first = False
+                count += 1
+            if fmt == "json":
+                output.write("\n]\n")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return count
+
+
+def _export_json_connection(
+    connection: sqlite3.Connection,
+    out_path: Path,
+    fmt: str,
+    *,
+    default_source: str = "",
+    single_file: bool = False,
+    year: int | None = None,
+) -> int:
+    select_cols = (
+        "ref_url, ref_title, source, document_url, title, year, "
+        "type, situation, summary, text_markdown, file_path, extra"
+    )
+    if single_file:
+        target = (
+            out_path
+            if out_path.suffix.lower() == f".{fmt}"
+            else out_path / f"data.{fmt}"
+        )
+        if year is None:
+            sql = (
+                f"SELECT {select_cols} FROM documents ORDER BY year, ref_url, ref_title"
+            )
+            params: tuple[Any, ...] = ()
+        else:
+            sql = (
+                f"SELECT {select_cols} FROM documents "
+                "WHERE year=? ORDER BY ref_url, ref_title"
+            )
+            params = (year,)
+        return _export_json_target(
+            connection, target, fmt, sql, params, default_source=default_source
+        )
+
+    count = 0
+    if year is None:
+        years = [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT year FROM documents ORDER BY year"
+            )
+        ]
+    else:
+        years = [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT year FROM documents WHERE year=? ORDER BY year",
+                (year,),
+            )
+        ]
+    for yr in years:
+        target = out_path / str(yr) / f"data.{fmt}"
+        count += _export_json_target(
+            connection,
+            target,
+            fmt,
+            f"SELECT {select_cols} FROM documents WHERE year=? ORDER BY ref_url, ref_title",
+            (yr,),
+            default_source=default_source,
+        )
+    return count
+
+
+def _export_parquet_connection(
+    connection: sqlite3.Connection,
+    out_dir: Path,
+    *,
+    default_source: str = "",
+    single_file: bool = False,
+    year: int | None = None,
+    batch_size: int = 2000,
+) -> int:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise ImportError(
+            "Install Parquet support with: pip install 'legisbr[parquet]'"
+        ) from exc
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("source", pa.string(), nullable=False),
+            pa.field("ref_url", pa.string(), nullable=False),
+            pa.field("ref_title", pa.string(), nullable=False),
+            pa.field("document_url", pa.string(), nullable=False),
+            pa.field("title", pa.string(), nullable=False),
+            pa.field("year", pa.int32(), nullable=False),
+            pa.field("type", pa.string(), nullable=False),
+            pa.field("situation", pa.string(), nullable=False),
+            pa.field("summary", pa.string(), nullable=False),
+            pa.field("text_markdown", pa.string(), nullable=False),
+            pa.field("file_path", pa.string(), nullable=True),
+            pa.field("extra_json", pa.string(), nullable=False),
+        ]
+    )
+
+    select_cols = (
+        "id, source, ref_url, ref_title, document_url, title, year, "
+        "type, situation, summary, text_markdown, file_path, extra"
+    )
+
+    def write_query(target: Path, sql: str, params: tuple[Any, ...]) -> int:
+        written = 0
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".tmp")
+        try:
+            with pq.ParquetWriter(temporary, schema, compression="zstd") as writer:
+                cursor = connection.execute(sql, params)
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    columns = {
+                        "id": [int(r["id"]) for r in rows],
+                        "source": [str(r["source"] or default_source) for r in rows],
+                        "ref_url": [str(r["ref_url"]) for r in rows],
+                        "ref_title": [str(r["ref_title"]) for r in rows],
+                        "document_url": [str(r["document_url"]) for r in rows],
+                        "title": [str(r["title"]) for r in rows],
+                        "year": [int(r["year"]) for r in rows],
+                        "type": [str(r["type"]) for r in rows],
+                        "situation": [str(r["situation"]) for r in rows],
+                        "summary": [str(r["summary"] or "") for r in rows],
+                        "text_markdown": [str(r["text_markdown"]) for r in rows],
+                        "file_path": [
+                            None if r["file_path"] is None else str(r["file_path"])
+                            for r in rows
+                        ],
+                        "extra_json": [str(r["extra"] or "{}") for r in rows],
+                    }
+                    batch = pa.RecordBatch.from_pydict(columns, schema=schema)
+                    writer.write_batch(batch)
+                    written += len(rows)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return written
+
+    if single_file:
+        target = (
+            out_dir
+            if out_dir.suffix.lower() == ".parquet"
+            else out_dir / "data.parquet"
+        )
+        if year is None:
+            sql = (
+                f"SELECT {select_cols} FROM documents ORDER BY year, ref_url, ref_title"
+            )
+            params: tuple[Any, ...] = ()
+        else:
+            sql = (
+                f"SELECT {select_cols} FROM documents "
+                "WHERE year=? ORDER BY ref_url, ref_title"
+            )
+            params = (year,)
+        return write_query(target, sql, params)
+
+    total = 0
+    if year is None:
+        years = [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT year FROM documents ORDER BY year"
+            )
+        ]
+    else:
+        years = [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT year FROM documents WHERE year=? ORDER BY year",
+                (year,),
+            )
+        ]
+    for yr in years:
+        target = out_dir / str(yr) / "data.parquet"
+        total += write_query(
+            target,
+            f"SELECT {select_cols} FROM documents WHERE year=? ORDER BY ref_url, ref_title",
+            (yr,),
+        )
+    return total
+
+
+def export_archive(
+    source_or_db: Store | str | Path,
+    out: str | Path,
+    *,
+    fmt: str | None = None,
+    single_file: bool | None = None,
+    year: int | None = None,
+    batch_size: int = 2000,
+) -> Path:
+    """Synchronously export a SQLite legislation archive to Parquet, JSONL, or JSON.
+
+    Automatically infers *fmt* from ``.parquet`` / ``.jsonl`` / ``.json`` suffixes on *out*
+    and sets ``single_file=True`` when *out* has a known file extension.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+
+    out_path = Path(out)
+    inferred_fmt = _EXPORT_SUFFIX_TO_FMT.get(out_path.suffix.lower())
+    if fmt is None:
+        resolved_fmt = inferred_fmt or "jsonl"
+    else:
+        resolved_fmt = fmt.lower()
+        if resolved_fmt not in {"json", "jsonl", "parquet"}:
+            raise ValueError("Export format must be json, jsonl, or parquet")
+
+    resolved_single = (inferred_fmt is not None) if single_file is None else single_file
+    if resolved_single:
+        result_path = (
+            out_path
+            if out_path.suffix.lower() == f".{resolved_fmt}"
+            else out_path / f"data.{resolved_fmt}"
+        )
+    else:
+        result_path = out_path
+
+    borrowed_conn: sqlite3.Connection | None = None
+    owned_conn: sqlite3.Connection | None = None
+    default_source = ""
+
+    if isinstance(source_or_db, Store):
+        default_source = source_or_db.source
+        if source_or_db._connection is not None:
+            borrowed_conn = source_or_db._connection
+        else:
+            if source_or_db.path == ":memory:":
+                raise RuntimeError("In-memory Store must be open to export")
+            db_path = Path(source_or_db.path)
+            if not db_path.exists():
+                raise FileNotFoundError(db_path)
+            from legisbr.core.archive import _open_readonly
+
+            owned_conn, _ = _open_readonly(db_path)
+    else:
+        candidate = Path(source_or_db)
+        if candidate.is_dir() and (candidate / "documents.db").is_file():
+            db_path = candidate / "documents.db"
+        elif candidate.is_file():
+            db_path = candidate
+        elif isinstance(source_or_db, str):
+            from legisbr.registry import get_spec
+
+            try:
+                spec = get_spec(source_or_db)
+            except ValueError as exc:
+                raise FileNotFoundError(candidate) from exc
+            db_path = spec.database_path(Path("outputs/legislation"))
+            default_source = spec.name
+            if not db_path.is_file():
+                raise FileNotFoundError(db_path)
+        else:
+            raise FileNotFoundError(candidate)
+
+        if (
+            not default_source
+            and db_path.name == "documents.db"
+            and db_path.parent.name
+        ):
+            default_source = db_path.parent.name
+        from legisbr.core.archive import _open_readonly
+
+        owned_conn, _ = _open_readonly(db_path)
+
+    conn = borrowed_conn if borrowed_conn is not None else owned_conn
+    assert conn is not None
+    try:
+        if resolved_fmt == "parquet":
+            _export_parquet_connection(
+                conn,
+                out_path,
+                default_source=default_source,
+                single_file=resolved_single,
+                year=year,
+                batch_size=batch_size,
+            )
+        else:
+            _export_json_connection(
+                conn,
+                out_path,
+                resolved_fmt,
+                default_source=default_source,
+                single_file=resolved_single,
+                year=year,
+            )
+    finally:
+        if owned_conn is not None:
+            owned_conn.close()
+
+    return result_path

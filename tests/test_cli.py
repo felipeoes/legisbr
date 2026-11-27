@@ -438,28 +438,34 @@ async def test_index_and_query_commands_over_real_fts5_archive(tmp_path, capsys)
 
 
 async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
-    fake_ref = {
-        "year": 2021,
-        "type": "Lei Ordinária",
-        "title": "Lei nº 14.133/2021",
-        "summary": "Lei de Licitações e Contratos Administrativos.",
-        "situation": "Não consta revogação expressa",
-        "document_url": "https://www2.camara.leg.br/legin/fed/lei/2021/lei-14133.html",
-    }
+    from legisbr.core.query import NormRef, Query, SearchResults
+
+    fake_ref = NormRef.from_raw(
+        "camara",
+        {
+            "year": 2021,
+            "type": "Lei Ordinária",
+            "title": "Lei nº 14.133/2021",
+            "summary": "Lei de Licitações e Contratos Administrativos.",
+            "situation": "Não consta revogação expressa",
+            "document_url": "https://www2.camara.leg.br/legin/fed/lei/2021/lei-14133.html",
+        },
+    )
     fake_doc = document(
         year=2021,
         type="Lei Ordinária",
         title="Lei nº 14.133/2021",
         summary="Lei de Licitações.",
         text_markdown="# Lei nº 14.133/2021\n\nArt. 1º Esta Lei estabelece normas gerais de licitação e contratação.",
-        document_url=fake_ref["document_url"],
+        document_url=fake_ref.url,
     )
 
-    created_clients: list[FakeClient] = []
+    created_clients: list[FakeAsyncClient] = []
 
-    class FakeClient:
+    class FakeAsyncClient:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.fetch_many_calls: list[list[NormRef]] = []
             created_clients.append(self)
 
         async def __aenter__(self):
@@ -468,13 +474,14 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
         async def __aexit__(self, *exc):
             return None
 
-        async def search_refs(self, source, **kwargs):
-            yield fake_ref
+        async def search(self, source, **kwargs):
+            return SearchResults(source=source, query=Query(), items=(fake_ref,))
 
-        async def fetch_ref(self, source, ref):
-            return fake_doc
+        async def fetch_many(self, refs, *, concurrency=None):
+            self.fetch_many_calls.append(list(refs))
+            return [fake_doc]
 
-    monkeypatch.setattr("legisbr.client.Client", FakeClient)
+    monkeypatch.setattr("legisbr.client.AsyncClient", FakeAsyncClient)
     cfg = Settings(llm_model="anthropic:claude-haiku-5-5")
 
     assert (
@@ -497,7 +504,7 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
     )
     out = json.loads(capsys.readouterr().out)
     assert len(out) == 1 and out[0]["title"] == "Lei nº 14.133/2021"
-    # Metadata-only search never passes an OCR model to Client.
+    # Metadata-only search never passes an OCR model to AsyncClient.
     assert created_clients[-1].kwargs["ocr"] is None
 
     assert (
@@ -510,6 +517,7 @@ async def test_search_command_with_and_without_fetch(monkeypatch, capsys):
     assert "# Lei nº 14.133/2021" in md
     assert "normas gerais de licitação" in md
     assert created_clients[-1].kwargs["ocr"] == "anthropic:claude-haiku-5-5"
+    assert len(created_clients[-1].fetch_many_calls) == 1
 
 
 def test_load_settings_exports_dotenv_provider_keys_and_respects_save_dir(

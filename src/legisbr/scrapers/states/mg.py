@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import replace
 from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
@@ -589,6 +590,9 @@ class MGAlmgScraper(BaseScraper):
         if query.limit == 0:
             return
 
+        # ALMG's `q=` parameter searches full norm bodies natively; trust native
+        # text matching instead of dropping hits whose short ementa omits the term.
+        filter_query = replace(query, text=None)
         norm_type_code = ""
         if query.type is not None:
             matched = match_type_entry(_TYPE_NAME_TO_CODE, query.type)
@@ -649,7 +653,7 @@ class MGAlmgScraper(BaseScraper):
                         "title": clean_title(raw["title"]),
                         "document_url": urljoin(self.base_url, raw["_html_link"]),
                     }
-                    if not matches_query(ref, query):
+                    if not matches_query(ref, filter_query):
                         continue
                     yield ref
                     yielded += 1

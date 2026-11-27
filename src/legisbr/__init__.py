@@ -11,53 +11,83 @@ from legisbr.registry import SourceInfo, sources
 __version__ = "0.1.0"
 __all__ = [
     "ArchiveIndex",
+    "AsyncArchiveIndex",
+    "AsyncClient",
     "Client",
     "Document",
     "DocumentSink",
+    "DocumentStream",
     "ErrorRecord",
+    "NormNotFoundError",
+    "NormRef",
     "NullSink",
     "OCR",
     "Query",
+    "RunResult",
     "SearchCapabilities",
     "SearchHit",
+    "SearchResults",
     "Settings",
     "SourceInfo",
     "Store",
     "UnsupportedQueryError",
     "__version__",
+    "export",
+    "get",
+    "query",
     "scrape",
-    "search_refs",
+    "search",
     "sources",
 ]
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 if TYPE_CHECKING:
-    from legisbr.client import Client, scrape, search_refs
-    from legisbr.core.archive import ArchiveIndex
+    from legisbr._sync import DocumentStream
+    from legisbr.client import AsyncClient, Client, get, scrape, search
+    from legisbr.core.archive import ArchiveIndex, AsyncArchiveIndex, query
     from legisbr.core.document import Document
     from legisbr.core.ocr import OCR
-    from legisbr.core.query import Query, SearchCapabilities, UnsupportedQueryError
+    from legisbr.core.query import (
+        NormNotFoundError,
+        NormRef,
+        Query,
+        SearchCapabilities,
+        SearchResults,
+        UnsupportedQueryError,
+    )
+    from legisbr.core.scraper import RunResult
     from legisbr.core.sink import DocumentSink, ErrorRecord, NullSink
     from legisbr.core.store import SearchHit, Store
+    from legisbr.core.store import export_archive as export
     from legisbr.settings import Settings
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArchiveIndex": ("legisbr.core.archive", "ArchiveIndex"),
+    "AsyncArchiveIndex": ("legisbr.core.archive", "AsyncArchiveIndex"),
+    "AsyncClient": ("legisbr.client", "AsyncClient"),
     "Client": ("legisbr.client", "Client"),
     "Document": ("legisbr.core.document", "Document"),
     "DocumentSink": ("legisbr.core.sink", "DocumentSink"),
+    "DocumentStream": ("legisbr._sync", "DocumentStream"),
     "ErrorRecord": ("legisbr.core.sink", "ErrorRecord"),
+    "NormNotFoundError": ("legisbr.core.query", "NormNotFoundError"),
+    "NormRef": ("legisbr.core.query", "NormRef"),
     "NullSink": ("legisbr.core.sink", "NullSink"),
     "OCR": ("legisbr.core.ocr", "OCR"),
     "Query": ("legisbr.core.query", "Query"),
+    "RunResult": ("legisbr.core.scraper", "RunResult"),
     "SearchCapabilities": ("legisbr.core.query", "SearchCapabilities"),
     "SearchHit": ("legisbr.core.store", "SearchHit"),
+    "SearchResults": ("legisbr.core.query", "SearchResults"),
     "Settings": ("legisbr.settings", "Settings"),
     "Store": ("legisbr.core.store", "Store"),
     "UnsupportedQueryError": ("legisbr.core.query", "UnsupportedQueryError"),
+    "export": ("legisbr.core.store", "export_archive"),
+    "get": ("legisbr.client", "get"),
+    "query": ("legisbr.core.archive", "query"),
     "scrape": ("legisbr.client", "scrape"),
-    "search_refs": ("legisbr.client", "search_refs"),
+    "search": ("legisbr.client", "search"),
 }
 
 

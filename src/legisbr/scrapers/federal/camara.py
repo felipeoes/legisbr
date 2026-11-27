@@ -848,7 +848,9 @@ class CamaraDepScraper(BaseScraper):
         if query.limit == 0:
             return
 
-        effective_query = query
+        # Câmara's `geral=` parameter searches full norm bodies and subject indexes,
+        # not just title/summary; trust native text matching instead of dropping body hits.
+        effective_query = replace(query, text=None)
         norm_type_id = ""
         if query.type is not None:
             matched = match_type_entry(TYPES, query.type)
@@ -856,7 +858,7 @@ class CamaraDepScraper(BaseScraper):
                 matched = ("Lei Ordinária", TYPES["Lei Ordinária"])
             if matched is not None:
                 norm_type_id = matched[1]
-                effective_query = replace(query, type=matched[0])
+                effective_query = replace(effective_query, type=matched[0])
             else:
                 norm_type_id = quote_plus(query.type)
 

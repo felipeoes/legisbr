@@ -502,16 +502,16 @@ async def print_stats(specs: list[ScraperSpec], settings: Settings) -> None:
 async def _run_search(args: argparse.Namespace, cfg: Settings) -> int:
     import json
 
-    from legisbr.client import Client
+    from legisbr.client import AsyncClient
 
     years = _resolve_years(args.year, args.years, default=None)
     items: list[dict[str, Any]] = []
-    async with Client(
+    async with AsyncClient(
         ocr=(cfg.llm_model or None) if args.fetch else None,
         proxy_file=cfg.proxy_file_path,
         proxy_endpoint=cfg.proxy_endpoint,
     ) as client:
-        async for ref in client.search_refs(
+        results = await client.search(
             args.source,
             years=years,
             number=args.number,
@@ -520,12 +520,12 @@ async def _run_search(args: argparse.Namespace, cfg: Settings) -> int:
             situation=args.situation,
             limit=args.limit,
             strict_native=args.strict_native,
-        ):
-            if args.fetch:
-                doc = await client.fetch_ref(args.source, ref)
-                items.append(doc.model_dump(exclude={"raw", "raw_ext"}))
-            else:
-                items.append(dict(ref))
+        )
+        if args.fetch:
+            docs = await client.fetch_many(results)
+            items = [doc.model_dump(exclude={"raw", "raw_ext"}) for doc in docs]
+        else:
+            items = results.to_dicts()
 
     if args.format == "json":
         print(json.dumps(items, ensure_ascii=False, indent=2))
@@ -548,9 +548,10 @@ async def _run_search(args: argparse.Namespace, cfg: Settings) -> int:
     else:
         for idx, item in enumerate(items, 1):
             summary = f" — {item['summary']}" if item.get("summary") else ""
+            url = item.get("url") or item.get("document_url", "")
             print(
                 f"{idx}. **{item.get('title', '')}** ({item.get('year', '?')}, "
-                f"{item.get('type', '')}){summary}\n   {item.get('document_url', '')}"
+                f"{item.get('type', '')}){summary}\n   {url}"
             )
     return 0
 
@@ -558,7 +559,7 @@ async def _run_search(args: argparse.Namespace, cfg: Settings) -> int:
 async def _run_query(args: argparse.Namespace, cfg: Settings) -> int:
     import json
 
-    from legisbr.core.archive import ArchiveIndex
+    from legisbr.core.archive import AsyncArchiveIndex
 
     data_dir = args.data_dir or cfg.save_dir
     resolved_sources: list[str] | None = None
@@ -569,7 +570,7 @@ async def _run_query(args: argparse.Namespace, cfg: Settings) -> int:
                 resolved_sources.append(get_spec(raw).name)
             except ValueError:
                 resolved_sources.append(raw)
-    index = ArchiveIndex(data_dir)
+    index = AsyncArchiveIndex(data_dir)
     hits = await index.query(
         args.query,
         sources=resolved_sources,

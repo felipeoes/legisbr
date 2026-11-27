@@ -42,7 +42,7 @@ jobs:
           CONCURRENCY = 6
 
 
-          async def check_one(client: legisbr.Client, info: object, gate: asyncio.Semaphore) -> dict[str, str]:
+          async def check_one(client: legisbr.AsyncClient, info: object, gate: asyncio.Semaphore) -> dict[str, str]:
               name = info.name
               scope = getattr(info, "scope", "-")
               target_year = datetime.now(UTC).year
@@ -50,7 +50,7 @@ jobs:
               async with gate:
                   try:
                       async def first_ref():
-                          async for ref in client.list_refs(name, years=target_year):
+                          async for ref in client.list_refs(name, year=target_year):
                               return ref
                           return None
 
@@ -64,13 +64,13 @@ jobs:
                               "latency": f"{ms} ms",
                               "detail": f"0 refs listed for {target_year}",
                           }
-                      title = str(ref.get("title", "")).replace("|", "/")[:60]
+                      title = str(ref.title or "").replace("|", "/")[:60]
                       return {
                           "source": name,
                           "scope": str(scope),
                           "status": "OK",
                           "latency": f"{ms} ms",
-                          "detail": title or str(ref.get("document_url", ""))[:60],
+                          "detail": title or str(ref.url or "")[:60],
                       }
                   except asyncio.TimeoutError:
                       return {
@@ -108,7 +108,7 @@ jobs:
                   selected = list(all_sources)
 
               gate = asyncio.Semaphore(CONCURRENCY)
-              async with legisbr.Client() as client:
+              async with legisbr.AsyncClient() as client:
                   rows = await asyncio.gather(
                       *(check_one(client, info, gate) for info in selected)
                   )

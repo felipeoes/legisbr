@@ -501,43 +501,50 @@ async def test_archive_index_multi_source_query_stats_and_readonly_immutable_fal
             )
         )
 
-    index = ArchiveIndex(data_dir)
-    sources = await index.sources()
-    assert [s["source"] for s in sources] == ["ACRE", "RIO", "SAO_PAULO"]
-    by_name = {s["source"]: s for s in sources}
-    assert by_name["ACRE"]["fts_enabled"] is True and by_name["ACRE"]["documents"] == 1
-    assert by_name["RIO"]["fts_enabled"] is False and by_name["RIO"]["documents"] == 1
-    assert by_name["SAO_PAULO"]["documents"] == 2
+    with ArchiveIndex(data_dir) as index:
+        sources = index.sources()
+        assert [s["source"] for s in sources] == ["ACRE", "RIO", "SAO_PAULO"]
+        by_name = {s["source"]: s for s in sources}
+        assert (
+            by_name["ACRE"]["fts_enabled"] is True and by_name["ACRE"]["documents"] == 1
+        )
+        assert (
+            by_name["RIO"]["fts_enabled"] is False and by_name["RIO"]["documents"] == 1
+        )
+        assert by_name["SAO_PAULO"]["documents"] == 2
 
-    # Cross-jurisdiction query merges BM25 hits and skips unindexed RIO cleanly.
-    hits = await index.query("ambiental")
-    assert len(hits) == 2
-    assert {h.source for h in hits} == {"ACRE", "SAO_PAULO"}
-    assert hits[0].rank <= hits[1].rank
+        # Cross-jurisdiction query merges BM25 hits and skips unindexed RIO cleanly.
+        hits = index.query("ambiental")
+        assert len(hits) == 2
+        assert {h.source for h in hits} == {"ACRE", "SAO_PAULO"}
+        assert hits[0].rank <= hits[1].rank
 
-    # Source / year / doc_type filters.
-    ac_only = await index.query("ambiental", sources=["acre"])
-    assert len(ac_only) == 1 and ac_only[0].source == "ACRE"
-    assert len(await index.query("ambiental", year=2024)) == 1
-    assert len(await index.query("tributario", doc_type="Decreto")) == 1
-    assert await index.query("tributario", doc_type="Lei") == []
+        # Source / alias / year / doc_type filters.
+        ac_only = index.query("ambiental", sources=["acre"])
+        assert len(ac_only) == 1 and ac_only[0].source == "ACRE"
+        sp_alias = index.query("ambiental", sources=["SP"])
+        assert len(sp_alias) == 1 and sp_alias[0].source == "SAO_PAULO"
+        assert len(index.query("ambiental", year=2024)) == 1
+        assert len(index.query("tributario", doc_type="Decreto")) == 1
+        assert index.query("tributario", doc_type="Lei") == []
 
-    # get_document by source + id.
-    doc = await index.get_document(
-        "sao_paulo", hits[0].id if hits[0].source == "SAO_PAULO" else hits[1].id
-    )
-    assert doc is not None and "ambiental" in doc["text_markdown"].lower()
-    assert await index.get_document("NONEXISTENT", 1) is None
+        # get() by source (canonical or alias) + id.
+        sp_id = hits[0].id if hits[0].source == "SAO_PAULO" else hits[1].id
+        doc = index.get("sao_paulo", sp_id)
+        assert doc is not None and "ambiental" in doc["text_markdown"].lower()
+        doc_by_alias = index.get("SP", sp_id)
+        assert doc_by_alias is not None and doc_by_alias["id"] == sp_id
+        assert index.get("NONEXISTENT", 1) is None
 
-    # stats() across archives.
-    stats = await index.stats()
-    stats_by_name = {s["source"]: s for s in stats}
-    assert stats_by_name["ACRE"]["last_run"]["docs"] == 1
-    assert stats_by_name["SAO_PAULO"]["by_year"] == [{"year": 2024, "documents": 2}]
+        # stats() across archives.
+        stats = index.stats()
+        stats_by_name = {s["source"]: s for s in stats}
+        assert stats_by_name["ACRE"]["last_run"]["docs"] == 1
+        assert stats_by_name["SAO_PAULO"]["by_year"] == [{"year": 2024, "documents": 2}]
 
     # Explicit database paths support.
     explicit = ArchiveIndex(databases=[data_dir / "ACRE" / "documents.db"])
-    assert [s["source"] for s in await explicit.sources()] == ["ACRE"]
+    assert [s["source"] for s in explicit.sources()] == ["ACRE"]
 
     # Simulate a read-only mount (chmod 0555 dir + 0444 files) on a clean WAL archive:
     # mode=ro fails trying to create/write -shm, and ArchiveIndex falls back to immutable=1.
@@ -562,16 +569,16 @@ async def test_archive_index_multi_source_query_stats_and_readonly_immutable_fal
     os.chmod(ro_dir, 0o555)
     try:
         ro_index = ArchiveIndex(ro_dir.parent)
-        ro_sources = await ro_index.sources()
+        ro_sources = ro_index.sources()
         assert len(ro_sources) == 1
         assert ro_sources[0]["documents"] == 1
         if hasattr(os, "geteuid") and os.geteuid() != 0:
             assert ro_sources[0]["immutable"] is True
-        ro_hits = await ro_index.query("floresta")
+        ro_hits = ro_index.query("floresta")
         assert len(ro_hits) == 1 and ro_hits[0].source == "ACRE"
-        ro_doc = await ro_index.get_document("ACRE", ro_hits[0].id)
+        ro_doc = ro_index.get("ACRE", ro_hits[0].id)
         assert ro_doc is not None and "amazônica" in ro_doc["text_markdown"]
-        ro_stats = await ro_index.stats()
+        ro_stats = ro_index.stats()
         assert ro_stats[0]["documents"] == 1
     finally:
         os.chmod(ro_dir, 0o755)
@@ -605,7 +612,7 @@ async def test_archive_index_immutable_fallback_on_operational_error(
     monkeypatch.setattr(archive_mod.sqlite3, "connect", fake_connect)
 
     index = ArchiveIndex(databases={"ACRE": db_path})
-    hits = await index.query("hidrograficas")
+    hits = index.query("hidrograficas")
     assert len(hits) == 1 and hits[0].source == "ACRE"
     assert any("mode=ro" in uri for uri in seen_uris)
     assert any("immutable=1" in uri for uri in seen_uris)
@@ -642,7 +649,7 @@ async def test_archive_index_busy_or_locked_never_falls_back_to_immutable(
 
     index = ArchiveIndex(databases={"ACRE": db_path})
     with pytest.raises(sqlite3.OperationalError, match="locked"):
-        await index.query("administracao")
+        index.query("administracao")
 
     assert len(seen_calls) == 1
     uri, kwargs = seen_calls[0]

@@ -5,13 +5,13 @@ from __future__ import annotations
 import builtins
 import json
 import sys
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from legisbr.core.document import Document
+from legisbr.core.query import NormRef, Query, SearchResults
 from legisbr.core.store import Store
 from legisbr.mcp_server import create_mcp_server, run_mcp_server
 
@@ -107,22 +107,24 @@ class _FakeClient:
     async def __aexit__(self, *exc: Any) -> None:
         self.exit_count += 1
 
-    async def search_refs(
+    async def search(
         self,
         source: str,
         *,
+        year: int | None = None,
         years: int | range | None = None,
-        number: str | None = None,
+        number: str | int | None = None,
         type: str | None = None,
         text: str | None = None,
         situation: str | None = None,
         limit: int | None = 20,
         strict_native: bool = False,
-    ) -> AsyncIterator[dict[str, Any]]:
+    ) -> SearchResults:
+        effective_year = year if year is not None else years
         self.search_calls.append(
             {
                 "source": source,
-                "years": years,
+                "year": year,
                 "number": number,
                 "type": type,
                 "text": text,
@@ -131,14 +133,40 @@ class _FakeClient:
                 "strict_native": strict_native,
             }
         )
-        for idx in range(1, 30):
-            yield {
-                "title": f"Lei nº {number or idx}/{years or 2024}",
-                "year": years or 2024,
-                "type": type or "Lei",
-                "situation": "Vigente",
-                "document_url": f"https://www2.camara.leg.br/legin/fed/lei/{years or 2024}/lei-{idx}.html",
-            }
+        items = [
+            NormRef.from_raw(
+                source,
+                {
+                    "title": f"Lei nº {number or idx}/{effective_year or 2024}",
+                    "year": effective_year or 2024,
+                    "type": type or "Lei",
+                    "situation": "Vigente",
+                    "document_url": (
+                        f"https://www2.camara.leg.br/legin/fed/lei/"
+                        f"{effective_year or 2024}/lei-{idx}.html"
+                    ),
+                    "_internal_link": (
+                        f"https://www2.camara.leg.br/legin/fed/lei/"
+                        f"{effective_year or 2024}/lei-{idx}-texto.html"
+                    ),
+                },
+            )
+            for idx in range(1, 30)
+        ]
+        if limit is not None:
+            items = items[:limit]
+        return SearchResults(
+            source=source,
+            query=Query(
+                years=effective_year,
+                number=number,
+                type=type,
+                text=text,
+                situation=situation,
+                limit=limit,
+            ),
+            items=tuple(items),
+        )
 
     async def fetch_ref(self, source: str, ref: dict[str, Any]) -> Document:
         self.fetch_calls.append((source, dict(ref)))
@@ -299,7 +327,7 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
     assert len(fake_client.search_calls) == 1
     assert fake_client.search_calls[0] == {
         "source": "camara",
-        "years": 2024,
+        "year": 2024,
         "number": "123",
         "type": "Lei",
         "text": "educacao",
@@ -310,8 +338,9 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
     assert factory_calls == 1
     assert fake_client.enter_count == 1
     assert fake_client.exit_count == 0
+    assert "_internal_link" not in refs[0]
 
-    # live_fetch_norm reuses the same Client, excludes raw, and enforces max_chars.
+    # live_fetch_norm reuses the same AsyncClient, restores cached raw keys, excludes raw, and enforces max_chars.
     fetched = _extract_tool_result(
         await live_server.call_tool(
             "live_fetch_norm",
@@ -322,10 +351,25 @@ async def test_mcp_live_tools_disabled_by_default_and_strict_native_when_enabled
     assert fake_client.enter_count == 1
     assert len(fake_client.fetch_calls) == 1
     assert "_ref_id" not in fake_client.fetch_calls[0][1]
+    assert "_internal_link" in fake_client.fetch_calls[0][1]
     assert "raw" not in fetched and "raw_ext" not in fetched
     assert fetched["truncated"] is True
     assert len(fetched["text_markdown"]) == 80
     assert fetched["total_chars"] > 80
+
+    # Tampered URL alongside valid _ref_id is still rejected by SSRF validation!
+    with pytest.raises(Exception):
+        await live_server.call_tool(
+            "live_fetch_norm",
+            {
+                "source": "camara",
+                "ref": {
+                    "_ref_id": refs[0]["_ref_id"],
+                    "document_url": "http://169.254.169.254/latest/meta-data/",
+                },
+            },
+        )
+    assert len(fake_client.fetch_calls) == 1
 
     # Server-issued opaque ref handle works cleanly without repeating ref URLs.
     by_handle = _extract_tool_result(

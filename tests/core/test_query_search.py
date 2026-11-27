@@ -535,3 +535,53 @@ async def test_icmbio_strict_native_rejects_year_filter_and_am_accepts_year_type
     assert refs == []
     am.http.request.assert_awaited_once()
     assert "/diario_am/12/2024?page=1" in am.http.request.await_args.args[0]
+
+
+async def test_camara_and_mg_preserve_native_full_text_body_hits():
+    """Native full-text queries (`geral=` / `q=`) must not be dropped when the term is only in the body."""
+    camara = make_scraper(CamaraDepScraper)
+    camara_html = """
+    <html><body>
+      <div class="busca-info__resultado busca-info__resultado--informado">Mostrando 1-1 de 1</div>
+      <ul>
+        <li class="busca-resultados__item">
+          <h3 class="busca-resultados__cabecalho">
+            <a href="https://www2.camara.leg.br/legin/fed/lei/2024/lei-14850-2-maio-2024.html">Lei nº 14.850, de 2 de Maio de 2024</a>
+          </h3>
+          <p class="busca-resultados__descricao">Ementa: Institui a Política Nacional de Qualidade do Ar.</p>
+          <p class="busca-resultados__situacao">Situação: Não consta revogação expressa</p>
+        </li>
+      </ul>
+    </body></html>
+    """
+    camara.http.request = AsyncMock(return_value=make_mock_response(camara_html))
+    camara_refs = [
+        ref
+        async for ref in camara.search_refs(
+            Query(years=2024, type="Lei Ordinária", text="energia", limit=5),
+            strict_native=True,
+        )
+    ]
+    assert len(camara_refs) == 1
+    assert "14.850" in camara_refs[0]["title"]
+
+    mg = make_scraper(MGAlmgScraper)
+    mg_html = """
+    <html><body>
+      <p>1 artigo encontrado</p>
+      <article>
+        <a href="/legislacao-mineira/LEI/24600/2024/">Lei nº 24.600, de 2024</a>
+        Dispõe sobre diretrizes de qualidade do ar no Estado.
+      </article>
+    </body></html>
+    """
+    mg.http.request = AsyncMock(return_value=make_mock_response(mg_html))
+    mg_refs = [
+        ref
+        async for ref in mg.search_refs(
+            Query(years=2024, type="Lei", text="energia", limit=5),
+            strict_native=True,
+        )
+    ]
+    assert len(mg_refs) == 1
+    assert "24.600" in mg_refs[0]["title"]

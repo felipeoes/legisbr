@@ -1,4 +1,4 @@
-"""Tests for PEP 789-safe BaseScraper.stream() and the public legisbr.Client facade."""
+"""Tests for PEP 789-safe BaseScraper.stream() and the public AsyncClient / sync helpers."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ import pytest
 from test_store import document
 
 import legisbr
-from legisbr.client import Client
+from legisbr.client import AsyncClient
 from legisbr.core.http import HttpClient, Response
-from legisbr.core.query import SearchCapabilities, UnsupportedQueryError
+from legisbr.core.query import NormRef, SearchCapabilities, UnsupportedQueryError
 from legisbr.core.scraper import BaseScraper
 from legisbr.core.sink import ErrorRecord, NullSink
 from legisbr.core.store import Store
@@ -277,7 +277,7 @@ async def test_client_scrape_null_sink_on_error_and_low_memory(
     monkeypatch.setenv("LOG_DIR", str(missing_log))
     before_env = dict(os.environ)
 
-    async with Client(low_memory=True, on_error=on_error) as client:
+    async with AsyncClient(low_memory=True, on_error=on_error) as client:
         assert client.workers == 4
         assert client.pdf_executor == "thread"
         assert client.pdf_workers == 1
@@ -305,7 +305,7 @@ async def test_client_scrape_null_sink_on_error_and_low_memory(
             saved_docs = [doc async for doc in docs]
         assert len(saved_docs) == 2
         assert all(doc.raw is not None for doc in saved_docs)
-        # Store was unopened when passed -> Client closed it after scrape().
+        # Store was unopened when passed -> AsyncClient closed it after scrape().
         assert store._connection is None
 
     assert not missing_log.exists()
@@ -313,7 +313,7 @@ async def test_client_scrape_null_sink_on_error_and_low_memory(
 
 
 async def test_client_per_source_http_isolation_rps_clamping_and_tls():
-    async with Client(rps=50) as client:
+    async with AsyncClient(rps=50) as client:
         pr = get_spec("pr")  # rps=0.3, insecure_tls=False
         ba = get_spec("ba")  # rps=1, insecure_tls=True
         ac = get_spec("ac")  # rps=10, insecure_tls=True
@@ -337,7 +337,7 @@ async def test_client_per_source_http_isolation_rps_clamping_and_tls():
         assert http_pr.verify_ssl is True
 
     # force_rps=True and explicit verify_ssl=True override defaults.
-    async with Client(rps=50, force_rps=True, verify_ssl=True) as client:
+    async with AsyncClient(rps=50, force_rps=True, verify_ssl=True) as client:
         http_ba = client._get_http_client(get_spec("ba"))
         assert http_ba.limiter.requests_per_second == pytest.approx(50.0)
         assert http_ba.verify_ssl is True
@@ -366,17 +366,18 @@ async def test_client_caches_setup_across_fetch_ref_list_refs_and_search_refs(
     )
     monkeypatch.setattr("legisbr.client.get_spec", lambda name: fake_spec)
 
-    async with Client() as client:
+    async with AsyncClient() as client:
         refs = [
             ref async for ref in client.list_refs("stateful", years=2024, types=["Lei"])
         ]
         assert len(refs) == 10
+        assert all(isinstance(r, NormRef) for r in refs)
         assert setup_counter == 1
 
-        # Repeated fetch_ref calls reuse the cached set-up scraper (setup NOT re-run!).
-        d1 = await client.fetch_ref("stateful", refs[0])
+        # Repeated fetch / fetch_ref calls reuse the cached set-up scraper (setup NOT re-run!).
+        d1 = await client.fetch(refs[0])
         d2 = await client.fetch_ref("stateful", refs[1])
-        d3 = await client.fetch_ref("stateful", refs[2])
+        d3 = await refs[2].afetch()
         assert [d1.title, d2.title, d3.title] == [
             "Lei nº 0/2024",
             "Lei nº 1/2024",
@@ -384,20 +385,25 @@ async def test_client_caches_setup_across_fetch_ref_list_refs_and_search_refs(
         ]
         assert setup_counter == 1
 
-        # search_refs delegates cleanly with limit
+        # search_refs and search delegate cleanly with limit and typed NormRef
         found = [
             ref
             async for ref in client.search_refs(
                 "stateful", years=2024, type="Lei", number="5", limit=2
             )
         ]
-        assert len(found) == 1 and found[0]["title"] == "Lei nº 5/2024"
+        assert len(found) == 1 and found[0].title == "Lei nº 5/2024"
+
+        results = await client.search(
+            "stateful", year=2024, type="Lei", number=5, limit=2
+        )
+        assert len(results) == 1 and results.one().title == "Lei nº 5/2024"
 
 
 async def test_client_search_refs_strict_native_rejects_ce_without_setup(monkeypatch):
     setup_spy = AsyncMock()
     monkeypatch.setattr("legisbr.scrapers.states.ce.CearaAleceScraper.setup", setup_spy)
-    async with Client() as client:
+    async with AsyncClient() as client:
         with pytest.raises(UnsupportedQueryError):
             [
                 ref
@@ -439,7 +445,7 @@ async def test_client_search_refs_runs_df_setup_and_skips_sapl_and_heavy_fetch_s
     monkeypatch.setattr("legisbr.scrapers.states.ce.CearaAleceScraper.setup", ce_setup)
     monkeypatch.setattr("legisbr.scrapers.states.ce.CearaAleceScraper.fetch", ce_fetch)
 
-    async with Client() as client:
+    async with AsyncClient() as client:
         # DF relies on BaseScraper.search_refs -> list_documents, so setup() MUST run.
         df_refs = [
             ref
@@ -448,7 +454,7 @@ async def test_client_search_refs_runs_df_setup_and_skips_sapl_and_heavy_fetch_s
             )
         ]
         assert len(df_refs) == 1
-        assert df_refs[0]["title"] == "Lei nº 7.400/2024"
+        assert df_refs[0].title == "Lei nº 7.400/2024"
         df_setup.assert_awaited_once()
 
         # Subsequent search_refs reuses cached setup.
@@ -489,24 +495,24 @@ async def test_client_search_refs_runs_df_setup_and_skips_sapl_and_heavy_fetch_s
         ce_setup.assert_not_awaited()
 
 
-async def test_top_level_convenience_scrape_and_search_refs(monkeypatch):
+def test_top_level_convenience_scrape_search_and_get(monkeypatch):
     fake_spec = _make_fake_spec(_StreamingDummyScraper, code="conv", name="CONV")
     monkeypatch.setattr("legisbr.client.get_spec", lambda name: fake_spec)
 
-    async with legisbr.scrape("conv", years=2024, types=["Decreto"], limit=2) as docs:
-        got = [doc async for doc in docs]
+    with legisbr.scrape("conv", year=2024, types=["Decreto"], limit=2) as docs:
+        got = list(docs)
     assert len(got) == 2 and all(d.type == "Decreto" for d in got)
 
-    refs = [
-        ref
-        async for ref in legisbr.search_refs("conv", years=2024, type="Lei", limit=3)
-    ]
-    assert len(refs) == 3
-    assert all(r["type"] == "Lei" for r in refs)
+    results = legisbr.search("conv", year=2024, type="Lei", limit=3)
+    assert len(results) == 3
+    assert all(isinstance(r, NormRef) and r.type == "Lei" for r in results)
+
+    law = legisbr.get("conv", year=2024, type="Lei", number=4)
+    assert law.title == "Lei nº 4/2024"
 
 
 async def test_client_closes_per_source_http_clients():
-    client = Client()
+    client = AsyncClient()
     async with client:
         http_sp = client._get_http_client(get_spec("sp"))
         http_sp.close = AsyncMock()
@@ -584,7 +590,7 @@ async def test_client_defers_ocr_construction_until_fetch_or_scrape(monkeypatch)
     monkeypatch.setattr("legisbr.client.get_spec", lambda name: fake_spec)
     monkeypatch.setattr("legisbr.client.OCR", FakeOCR)
 
-    async with Client(ocr="anthropic:claude-haiku-5-5") as client:
+    async with AsyncClient(ocr="anthropic:claude-haiku-5-5") as client:
         # Metadata-only list_refs() and search_refs() must NEVER construct OCR.
         refs = [
             ref async for ref in client.list_refs("ocrsrc", years=2024, types=["Lei"])
@@ -603,9 +609,9 @@ async def test_client_defers_ocr_construction_until_fetch_or_scrape(monkeypatch)
         assert created_ocr == []
         assert client._scrapers["ocrsrc"].ocr is None
 
-        # Only fetch_ref() triggers OCR construction and attaches it to cached scraper.
-        doc1 = await client.fetch_ref("ocrsrc", found[0])
-        assert doc1.title == found[0]["title"]
+        # Only fetch() / fetch_ref() triggers OCR construction and attaches it to cached scraper.
+        doc1 = await client.fetch(found[0])
+        assert doc1.title == found[0].title
         assert len(created_ocr) == 1
         assert created_ocr[0]["models"] == "anthropic:claude-haiku-5-5"
         assert isinstance(client._scrapers["ocrsrc"].ocr, FakeOCR)
@@ -614,9 +620,9 @@ async def test_client_defers_ocr_construction_until_fetch_or_scrape(monkeypatch)
         await client.fetch_ref("ocrsrc", found[1])
         assert len(created_ocr) == 1
 
-    # Fresh Client calling scrape() constructs OCR once.
+    # Fresh AsyncClient calling scrape() constructs OCR once.
     created_ocr.clear()
-    async with Client(ocr="anthropic:claude-haiku-5-5") as client:
+    async with AsyncClient(ocr="anthropic:claude-haiku-5-5") as client:
         async with client.scrape("ocrsrc", years=2024, types=["Lei"], limit=1) as docs:
             got = [doc async for doc in docs]
         assert len(got) == 1

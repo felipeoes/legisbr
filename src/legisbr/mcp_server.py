@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
-from legisbr.core.archive import ArchiveIndex
+from legisbr.core.archive import AsyncArchiveIndex
+from legisbr.core.query import NormRef
 from legisbr.registry import ScraperSpec, get_spec
 from legisbr.registry import sources as registry_sources
 
@@ -213,9 +214,9 @@ def _load_mcp_server_class() -> tuple[type[Any], int]:
 
 
 def _default_client_factory() -> Any:
-    from legisbr.client import Client
+    from legisbr.client import AsyncClient
 
-    return Client()
+    return AsyncClient()
 
 
 def _clamp_max_chars(max_chars: int) -> int:
@@ -262,7 +263,7 @@ def create_mcp_server(
 ) -> Any:
     """Build a configured MCP server exposing local archive and optional live tools."""
     server_cls, _ = _load_mcp_server_class()
-    index = ArchiveIndex(data_dir)
+    index = AsyncArchiveIndex(data_dir)
     make_client = client_factory or _default_client_factory
 
     shared_client: Any | None = None
@@ -379,7 +380,7 @@ def create_mcp_server(
         capped_chars = _clamp_max_chars(max_chars)
         available = _available_archive_map()
         resolved = _resolve_archive_source(source, available)
-        doc = await index.get_document(resolved, int(doc_id))
+        doc = await index.get(resolved, int(doc_id))
         if doc is None:
             return None
         return _truncate_markdown(doc, max_chars=capped_chars)
@@ -400,21 +401,27 @@ def create_mcp_server(
         capped_limit = max(1, min(int(limit), _MAX_LIVE_SEARCH_LIMIT))
         refs: list[dict[str, Any]] = []
         client = await _get_live_client()
-        async for ref in client.search_refs(
+        results = await client.search(
             source,
-            years=year,
+            year=year,
             number=number,
             type=doc_type,
             text=text,
             limit=capped_limit,
             strict_native=True,
-        ):
-            stored = dict(ref)
+        )
+        for ref in results:
+            if isinstance(ref, NormRef):
+                stored = ref.raw_payload()
+                public = ref.to_dict()
+            else:
+                stored = dict(ref)
+                public = dict(ref)
             token = secrets.token_urlsafe(16)
             ref_cache[token] = (spec.code, stored)
             while len(ref_cache) > _MAX_CACHED_REFS:
                 ref_cache.popitem(last=False)
-            refs.append({**stored, "_ref_id": token})
+            refs.append({**public, "_ref_id": token})
             if len(refs) >= capped_limit:
                 break
         return refs
@@ -439,6 +446,8 @@ def create_mcp_server(
         ref_id = ref_payload.pop("_ref_id", None)
         if ref_id is None and set(ref_payload.keys()) == {"ref_id"}:
             ref_id = ref_payload.pop("ref_id", None)
+
+        allowed_domains = _allowed_domains_for_source(spec)
         if ref_id is not None and not ref_payload:
             cached = ref_cache.get(str(ref_id))
             if cached is None or cached[0] != spec.code:
@@ -447,8 +456,29 @@ def create_mcp_server(
                 )
             ref_cache.move_to_end(str(ref_id))
             ref_payload = dict(cached[1])
+        else:
+            _validate_ref_urls(ref_payload, spec=spec, allowed_domains=allowed_domains)
+            if ref_id is not None:
+                cached = ref_cache.get(str(ref_id))
+                if cached is not None and cached[0] == spec.code:
+                    cached_raw = cached[1]
+                    cached_url = str(
+                        cached_raw.get("document_url") or cached_raw.get("url") or ""
+                    )
+                    provided_url = str(
+                        ref_payload.get("document_url") or ref_payload.get("url") or ""
+                    )
+                    if not provided_url or provided_url == cached_url:
+                        ref_cache.move_to_end(str(ref_id))
+                        merged = dict(cached_raw)
+                        for key, value in ref_payload.items():
+                            if key != "extra":
+                                merged[key] = value
+                        ref_payload = merged
 
-        allowed_domains = _allowed_domains_for_source(spec)
+        if "document_url" not in ref_payload and "url" in ref_payload:
+            ref_payload["document_url"] = ref_payload["url"]
+
         _validate_ref_urls(ref_payload, spec=spec, allowed_domains=allowed_domains)
 
         client = await _get_live_client()
