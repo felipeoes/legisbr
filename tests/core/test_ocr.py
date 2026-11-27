@@ -236,3 +236,193 @@ async def test_ocr_images_sniffs_mime_types_and_transcodes_bmp_and_tiff() -> Non
     with ocr.agent.override(model=FunctionModel(respond)):
         with pytest.raises(OCRError):
             await ocr.images([b"not an image payload"])
+
+
+def _pdf_with_pages(n: int) -> bytes:
+    writer = pypdf.PdfWriter()
+    for _ in range(n):
+        writer.add_blank_page(width=595, height=842)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+async def test_ocr_default_model_settings_anthropic_caching_and_overrides(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+
+    # 1. Generic/non-Anthropic models default to thinking=False with no Anthropic cache key.
+    generic = OCR("test")
+    assert generic.model_settings == {"thinking": False}
+    assert generic.agent.model_settings == {"thinking": False}
+
+    openai_only = OCR("openai:gpt-4.1-mini")
+    assert openai_only.model_settings == {"thinking": False}
+    assert "anthropic_cache_instructions" not in openai_only.model_settings
+
+    # 2. Pure Anthropic model(s) auto-enable anthropic_cache_instructions=True.
+    anthropic_single = OCR("anthropic:claude-haiku-4-5")
+    assert anthropic_single.model_settings == {
+        "thinking": False,
+        "anthropic_cache_instructions": True,
+    }
+    anthropic_fallback = OCR("anthropic:claude-haiku-4-5,anthropic:claude-sonnet-4-6")
+    assert anthropic_fallback.model_settings == {
+        "thinking": False,
+        "anthropic_cache_instructions": True,
+    }
+
+    # 3. Mixed fallback (Anthropic + OpenAI) must NOT enable Anthropic-only cache setting.
+    mixed = OCR("anthropic:claude-haiku-4-5,openai:gpt-4.1-mini")
+    assert mixed.model_settings == {"thinking": False}
+    assert "anthropic_cache_instructions" not in mixed.model_settings
+
+    # 4. Caller model_settings overrides take precedence over defaults.
+    custom = OCR(
+        "anthropic:claude-haiku-4-5",
+        model_settings={
+            "thinking": True,
+            "anthropic_cache_instructions": False,
+            "temperature": 0.0,
+        },
+    )
+    assert custom.model_settings == {
+        "thinking": True,
+        "anthropic_cache_instructions": False,
+        "temperature": 0.0,
+    }
+
+    # 5. Model settings are forwarded through Agent -> model.prepare_request() & agent.run().
+    from pydantic_ai.models import ModelRequestParameters
+
+    prepared_settings, prepared_params = anthropic_single.agent.model.prepare_request(
+        anthropic_single.agent.model_settings, ModelRequestParameters()
+    )
+    assert prepared_params.thinking is False
+    assert prepared_settings == {"anthropic_cache_instructions": True}
+
+    seen_settings: list[dict | None] = []
+
+    async def respond(messages, info):
+        seen_settings.append(dict(info.model_settings) if info.model_settings else None)
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"text_markdown": "ok"})]
+        )
+
+    with custom.agent.override(model=FunctionModel(respond)):
+        assert await custom.pdf(_pdf_with_pages(1)) == "ok"
+    assert seen_settings == [
+        {"anthropic_cache_instructions": False, "temperature": 0.0}
+    ]
+
+
+async def test_ocr_pdf_sliding_window_does_not_block_on_slow_straggler(
+    monkeypatch,
+) -> None:
+    ocr = OCR("test", batch_size=1, concurrency=2)
+    monkeypatch.setattr(
+        ocr,
+        "_render_batch",
+        lambda data, start, end: [
+            ocr._binary_content(data=f"batch-{start}".encode(), media_type="image/png")
+        ],
+    )
+    release_batch_0 = asyncio.Event()
+    later_batches_done = asyncio.Event()
+    completed: list[int] = []
+    active = peak = 0
+
+    async def respond(messages, info):
+        nonlocal active, peak
+        batch_idx = -1
+        for msg in messages:
+            for part in getattr(msg, "parts", ()):
+                content = getattr(part, "content", None)
+                if isinstance(content, list):
+                    for item in content:
+                        if hasattr(item, "data") and item.data.startswith(b"batch-"):
+                            batch_idx = int(item.data.decode().split("-")[1])
+        active += 1
+        peak = max(peak, active)
+        try:
+            if batch_idx == 0:
+                await asyncio.wait_for(release_batch_0.wait(), timeout=2.0)
+            else:
+                await asyncio.sleep(0.005)
+                completed.append(batch_idx)
+                # Batches 1, 2, AND 3 must all finish while batch 0 is still blocked!
+                if set(completed) == {1, 2, 3}:
+                    later_batches_done.set()
+                    release_batch_0.set()
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        info.output_tools[0].name, {"text_markdown": f"p{batch_idx}"}
+                    )
+                ]
+            )
+        finally:
+            active -= 1
+
+    with ocr.agent.override(model=FunctionModel(respond)):
+        result = await asyncio.wait_for(ocr.pdf(_pdf_with_pages(4)), timeout=3.0)
+
+    assert later_batches_done.is_set()
+    assert peak == 2
+    assert result == "p0\n\np1\n\np2\n\np3"
+
+
+async def test_ocr_pdf_sliding_window_all_or_nothing_cancels_in_flight_batches(
+    monkeypatch,
+) -> None:
+    ocr = OCR("test", batch_size=1, concurrency=2)
+    monkeypatch.setattr(
+        ocr,
+        "_render_batch",
+        lambda data, start, end: [
+            ocr._binary_content(data=f"batch-{start}".encode(), media_type="image/png")
+        ],
+    )
+    batch_0_started = asyncio.Event()
+    batch_0_cancelled = asyncio.Event()
+    started_batches: list[int] = []
+
+    async def respond(messages, info):
+        batch_idx = -1
+        for msg in messages:
+            for part in getattr(msg, "parts", ()):
+                content = getattr(part, "content", None)
+                if isinstance(content, list):
+                    for item in content:
+                        if hasattr(item, "data") and item.data.startswith(b"batch-"):
+                            batch_idx = int(item.data.decode().split("-")[1])
+        started_batches.append(batch_idx)
+        if batch_idx == 0:
+            batch_0_started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                batch_0_cancelled.set()
+                raise
+        if batch_idx == 1:
+            await asyncio.wait_for(batch_0_started.wait(), timeout=2.0)
+            raise ValueError("batch 1 exploded")
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name, {"text_markdown": f"p{batch_idx}"}
+                )
+            ]
+        )
+
+    before_tasks = set(asyncio.all_tasks())
+    with ocr.agent.override(model=FunctionModel(respond)):
+        with pytest.raises(OCRError) as exc_info:
+            await asyncio.wait_for(ocr.pdf(_pdf_with_pages(5)), timeout=3.0)
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert "batch 1 exploded" in str(exc_info.value.__cause__)
+    assert batch_0_cancelled.is_set()
+    assert not (set(asyncio.all_tasks()) - before_tasks)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import io
 import re
 import string
@@ -68,7 +69,10 @@ _DISCLAIMER_RE = re.compile(
     "(Est[ea]\\s+(texto|conte[uú]do)|Ess[ea]\\s+texto)\\s+n[aã]o\\s+substitui",
     re.IGNORECASE,
 )
+_BOILERPLATE_TAGS = frozenset({"p", "span", "div"})
 _CLEAN_NORM_EMPTY_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "div", "span", "b"]
+_CLEAN_NORM_EMPTY_TAGS_SET = frozenset(_CLEAN_NORM_EMPTY_TAGS)
+_MAIN_STRING_TYPES = Tag.MAIN_CONTENT_STRING_TYPES
 
 
 def is_pdf(body: bytes, content_type: str = "") -> bool:
@@ -184,6 +188,21 @@ _OPERATIVE_CLAUSE_START_RE = re.compile(
 )
 _PRE_BLOCK_RE = re.compile(r"(<pre\b[^>]*>)(.*?)(</pre>)", re.IGNORECASE | re.DOTALL)
 _PRE_NEWLINE_SENTINEL = "\ue000LEGISBR_PRE_NL\ue000"
+_MD_LINK_RE = re.compile(r"(?<!\!)\[([^\]]*)\]\([^)]*\)")
+_QUAD_TILDE_RE = re.compile(r"(?<!~)~~~~(?!~)")
+_STRIKE_TOKEN_RE = re.compile(r"<(/?)(?:s|del|strike)\b[^>]*>", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+_ORDINAL_CHARS = frozenset("ºª°")
+_THREAD_OFFLOAD_THRESHOLD = 65_536
+_HTML_TO_MD_OPTIONS = ConversionOptions(
+    heading_style="atx",
+    strip_tags=["script", "style", "svg"],
+    extract_metadata=False,
+    # ASP.NET/JSF/Domino pages wrap the whole law in a <form>.
+    preprocessing=PreprocessingOptions(remove_forms=False),
+    hidden_content="all",
+    strip_newlines=True,
+)
 
 
 def _from_cp1252(match: re.Match[str]) -> str:
@@ -196,10 +215,12 @@ def clean_markdown(text: str, replace: list[tuple[str, str]] | None = None) -> s
     # Sources that decode cp1252 as Latin-1 leave C1 controls for dashes and quotes.
     text = _C1_RE.sub(_from_cp1252, text)
     text = text.replace("\u00a0", " ").replace("\u00ad", "")
-    text = re.sub("(?<!!)\\[([^\\]]*)\\]\\([^)]*\\)", "\\1", text)
+    if "](" in text:
+        text = _MD_LINK_RE.sub("\\1", text)
     # Collapse adjacent strikethrough boundaries (e.g. ``<span><s>a</s></span><s>b</s>``
     # or stripped ``[~~a~~](url)~~b~~``) so CommonMark ``~~~~`` fences never appear.
-    text = re.sub(r"(?<!~)~~~~(?!~)", "", text)
+    if "~~~~" in text:
+        text = _QUAD_TILDE_RE.sub("", text)
     if replace:
         for find, replacement in replace:
             text = re.sub(find, replacement, text)
@@ -237,13 +258,89 @@ def _remove_unwanted_tags(soup: BeautifulSoup | Tag, tag_names: list[str]) -> No
             tag.decompose()
 
 
-def _strip_boilerplate(soup: BeautifulSoup | Tag) -> None:
+def _bounded_text(tag: Tag, limit: int) -> str | None:
+    """Return ``tag.get_text(strip=True)`` if shorter than *limit*, else ``None``."""
+    parts: list[str] = []
+    total = 0
+    for piece in tag._all_strings(strip=True):
+        total += len(piece)
+        if total >= limit:
+            return None
+        parts.append(piece)
+    return "".join(parts)
+
+
+def _has_text_or_img(tag: Tag) -> bool:
+    """Return True if *tag* contains any non-empty visible text or ``<img>`` descendant."""
+    stack: list[Any] = list(tag.contents)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Tag):
+            if node.name == "img":
+                return True
+            if node.contents:
+                stack.extend(node.contents)
+        elif type(node) in _MAIN_STRING_TYPES and node.strip():
+            return True
+    return False
+
+
+def _has_img_descendant(tag: Tag) -> bool:
+    """Return True if *tag* contains any ``<img>`` descendant."""
+    stack: list[Tag] = [child for child in tag.contents if isinstance(child, Tag)]
+    while stack:
+        node = stack.pop()
+        if node.name == "img":
+            return True
+        if node.contents:
+            for child in node.contents:
+                if isinstance(child, Tag):
+                    stack.append(child)
+    return False
+
+
+def _is_empty_or_ordinal_only(tag: Tag) -> bool:
+    """Return True if *tag* has only ordinal markers (``º``/``ª``/``°``) or is empty without ``<img>``."""
+    saw_text = False
+    for piece in tag._all_strings(strip=True):
+        saw_text = True
+        for ch in piece:
+            if ch not in _ORDINAL_CHARS:
+                return False
+    if saw_text:
+        return True
+    return not _has_img_descendant(tag)
+
+
+def _strip_boilerplate(
+    soup: BeautifulSoup | Tag, *, raw_html: str | None = None
+) -> None:
     """Remove disclaimer paragraphs common in Brazilian legislation pages."""
-    for tag in list(soup.find_all(["p", "span", "div"])):
+    if raw_html is not None and "substitui" not in raw_html.lower():
+        return
+    matching_nodes = [node for node in soup.strings if "substitui" in node.lower()]
+    if not matching_nodes:
+        return
+    candidates: list[Tag] = []
+    seen: set[int] = set()
+    for node in matching_nodes:
+        ancestors: list[Tag] = []
+        cur = node.parent
+        while cur is not None and cur is not soup:
+            if isinstance(cur, Tag) and cur.name in _BOILERPLATE_TAGS:
+                ancestors.append(cur)
+            cur = cur.parent
+        # Check outermost first so outer containers decompose before inner ones.
+        for ancestor in reversed(ancestors):
+            key = id(ancestor)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(ancestor)
+    for tag in candidates:
         if tag.decomposed:
             continue
-        txt = tag.get_text(strip=True)
-        if _DISCLAIMER_RE.search(txt) and len(txt) < 300:
+        txt = _bounded_text(tag, 300)
+        if txt is not None and _DISCLAIMER_RE.search(txt):
             tag.decompose()
 
 
@@ -252,7 +349,7 @@ def _clean_links(soup: BeautifulSoup | Tag) -> None:
     for tag in list(soup.find_all("a")):
         if tag.decomposed:
             continue
-        if not tag.get_text(strip=True) and (not tag.find("img")):
+        if not _has_text_or_img(tag):
             tag.decompose()
         else:
             tag.unwrap()
@@ -266,11 +363,35 @@ def _unwrap_font_tags(soup: BeautifulSoup | Tag) -> None:
 
 
 def _remove_empty_elements(soup: BeautifulSoup | Tag) -> None:
-    """Remove empty heading, div, span, and bold tags."""
-    for tag in list(soup.find_all(_CLEAN_NORM_EMPTY_TAGS)):
-        if tag.decomposed:
+    """Remove empty heading, div, span, and bold tags in a single O(N) bottom-up pass."""
+    tags: list[Tag] = []
+    stack: list[Tag] = [child for child in soup.contents if isinstance(child, Tag)]
+    while stack:
+        node = stack.pop()
+        tags.append(node)
+        if node.contents:
+            for child in node.contents:
+                if isinstance(child, Tag):
+                    stack.append(child)
+    if not tags:
+        return
+    non_empty: set[int] = set()
+    for tag in reversed(tags):
+        if tag.name == "img":
+            non_empty.add(id(tag))
             continue
-        if not tag.get_text(strip=True) and (not tag.find("img")):
+        has_content = False
+        for child in tag.contents:
+            if isinstance(child, Tag):
+                if id(child) in non_empty:
+                    has_content = True
+                    break
+            elif type(child) in _MAIN_STRING_TYPES and child.strip():
+                has_content = True
+                break
+        if has_content:
+            non_empty.add(id(tag))
+        elif tag.name in _CLEAN_NORM_EMPTY_TAGS_SET:
             tag.decompose()
 
 
@@ -370,34 +491,71 @@ def _apply_strikethrough(tag: Tag) -> None:
         tag.wrap(Tag(name="s"))
 
 
-def _normalize_strikethrough_soup(soup: BeautifulSoup | Tag) -> None:
+def _normalize_strikethrough_soup(
+    soup: BeautifulSoup | Tag, *, raw_html: str | None = None
+) -> None:
     """Normalize CSS line-through, nested strikethroughs, and ordinal-only ``<s>`` tags."""
+    if raw_html is not None and not _STRIKETHROUGH_HINT_RE.search(raw_html):
+        return
+
+    # Single upfront document-order pass to skip all 4 walks on non-revoked norms.
+    styled_tags: list[Tag] = []
+    strike_tags: list[Tag] = []
+    stack: list[Tag] = [
+        child for child in reversed(soup.contents) if isinstance(child, Tag)
+    ]
+    while stack:
+        node = stack.pop()
+        if node.name in _STRIKE_TAGS:
+            strike_tags.append(node)
+        style = node.attrs.get("style")
+        if (
+            isinstance(style, str)
+            and "line-through" in style.lower()
+            and _LINE_THROUGH_RE.search(style)
+        ):
+            styled_tags.append(node)
+        if node.contents:
+            for child in reversed(node.contents):
+                if isinstance(child, Tag):
+                    stack.append(child)
+
+    if not styled_tags and not strike_tags:
+        return
+
     # 1. Convert CSS text-decoration: line-through elements into <s>.
-    for tag in list(soup.find_all(style=_LINE_THROUGH_RE)):
-        if tag.decomposed:
-            continue
-        _apply_strikethrough(tag)
+    if styled_tags:
+        for tag in styled_tags:
+            if tag.decomposed:
+                continue
+            _apply_strikethrough(tag)
+        strike_tags = list(soup.find_all(_STRIKE_TAGS))
 
     # 2. Collapse nested <s>/<del>/<strike> tags so revoked norms never emit ``~~~~`` fences.
-    for tag in list(soup.find_all(_STRIKE_TAGS)):
-        if tag.decomposed:
+    remaining: list[Tag] = []
+    for tag in strike_tags:
+        if tag.decomposed or tag.parent is None:
             continue
         if tag.find_parent(_STRIKE_TAGS):
             tag.unwrap()
+        else:
+            remaining.append(tag)
 
     # 3. Unwrap ordinal-only <s>º</s> / <s>ª</s> / <s>°</s> Word/Tika artifacts
     #    and empty/whitespace-only strike tags (e.g. ``<s><span><o:p></o:p></span></s>``).
-    for tag in list(soup.find_all(_STRIKE_TAGS)):
-        if tag.decomposed:
+    survivors: list[Tag] = []
+    for tag in remaining:
+        if tag.decomposed or tag.parent is None:
             continue
-        txt = tag.get_text(strip=True)
-        if _ORDINAL_ONLY_RE.fullmatch(txt) or (not txt and not tag.find("img")):
+        if _is_empty_or_ordinal_only(tag):
             tag.unwrap()
+        else:
+            survivors.append(tag)
 
     # 4. Merge adjacent sibling <s>/<del>/<strike> tags so ``<s>a</s><s>b</s>``
     #    never emits CommonMark ``~~~~`` fenced code blocks.
-    for tag in list(soup.find_all(_STRIKE_TAGS)):
-        if tag.decomposed:
+    for tag in survivors:
+        if tag.decomposed or tag.parent is None:
             continue
         while True:
             sib = tag.next_sibling
@@ -411,8 +569,15 @@ def _normalize_strikethrough_soup(soup: BeautifulSoup | Tag) -> None:
 
 def _clean_attributes(soup: BeautifulSoup | Tag) -> None:
     """Strip inline ``style`` attributes from all remaining tags."""
-    for tag in soup.find_all(style=True):
-        del tag["style"]
+    stack: list[Tag] = [child for child in soup.contents if isinstance(child, Tag)]
+    while stack:
+        node = stack.pop()
+        if "style" in node.attrs:
+            del node.attrs["style"]
+        if node.contents:
+            for child in node.contents:
+                if isinstance(child, Tag):
+                    stack.append(child)
 
 
 def clean_norm_soup(
@@ -426,6 +591,7 @@ def clean_norm_soup(
     strip_styles: bool = False,
     remove_style_tags: bool = False,
     remove_script_tags: bool = False,
+    raw_html: str | None = None,
 ) -> BeautifulSoup | Tag:
     """Content-level cleaning for norm text HTML.
 
@@ -442,12 +608,12 @@ def clean_norm_soup(
         tags_to_remove.append("script")
     _remove_unwanted_tags(soup, tags_to_remove)
     if remove_disclaimers:
-        _strip_boilerplate(soup)
+        _strip_boilerplate(soup, raw_html=raw_html)
     if unwrap_links:
         _clean_links(soup)
     if unwrap_fonts:
         _unwrap_font_tags(soup)
-    _normalize_strikethrough_soup(soup)
+    _normalize_strikethrough_soup(soup, raw_html=raw_html)
     if remove_empty_tags:
         _remove_empty_elements(soup)
     if strip_styles:
@@ -488,19 +654,51 @@ def valid_markdown(text_markdown: str | None, min_length: int = 50) -> tuple[boo
     return (True, "")
 
 
-async def html_to_markdown(
-    html: str,
-    base_url: str,
-    fetch_image: Callable[[str], Awaitable[bytes | None]],
-    *,
-    cache: ImageCache | None = None,
+def _needs_strikethrough_normalization(html: str) -> bool:
+    """Return True only when *html* actually requires BS4 strikethrough normalization."""
+    if not _STRIKETHROUGH_HINT_RE.search(html):
+        return False
+    if "line-through" in html.lower():
+        return True
+    depth = 0
+    open_end = -1
+    prev_close_end = -1
+    for match in _STRIKE_TOKEN_RE.finditer(html):
+        is_close = bool(match.group(1))
+        if not is_close:
+            if depth > 0 or match.start() == prev_close_end:
+                return True
+            if match.group(0).rstrip().endswith("/>"):
+                return True
+            depth = 1
+            open_end = match.end()
+        else:
+            if depth == 0:
+                return True
+            depth = 0
+            inner = html[open_end : match.start()]
+            if "<!--" in inner:
+                return True
+            txt = _HTML_TAG_RE.sub("", inner)
+            if "&" in txt:
+                txt = html_lib.unescape(txt)
+            txt = txt.strip()
+            if _ORDINAL_ONLY_RE.fullmatch(txt):
+                return True
+            if not txt and "<img" not in inner.lower():
+                return True
+            prev_close_end = match.end()
+    return depth != 0
+
+
+def _convert_html_to_markdown_sync(
+    html: str, *, strikethrough_normalized: bool = False
 ) -> str:
-    html = await inline_images_in_html(html, base_url, fetch_image, cache=cache)
-    if _STRIKETHROUGH_HINT_RE.search(html):
+    if not strikethrough_normalized and _needs_strikethrough_normalization(html):
         soup = BeautifulSoup(html, "lxml")
         _normalize_strikethrough_soup(soup)
         html = str(soup)
-    has_pre = bool(_PRE_BLOCK_RE.search(html))
+    has_pre = "<pre" in html.lower() and bool(_PRE_BLOCK_RE.search(html))
     if has_pre:
         html = _PRE_BLOCK_RE.sub(
             lambda m: (
@@ -513,23 +711,31 @@ async def html_to_markdown(
             ),
             html,
         )
-    result = await asyncio.to_thread(
-        html_to_md,
-        html,
-        ConversionOptions(
-            heading_style="atx",
-            strip_tags=["script", "style", "svg"],
-            extract_metadata=False,
-            # ASP.NET/JSF/Domino pages wrap the whole law in a <form>.
-            preprocessing=PreprocessingOptions(remove_forms=False),
-            hidden_content="all",
-            strip_newlines=True,
-        ),
-    )
+    result = html_to_md(html, _HTML_TO_MD_OPTIONS)
     content = result.content or ""
     if has_pre:
         content = content.replace(_PRE_NEWLINE_SENTINEL, "\n")
     return clean_markdown(content)
+
+
+async def html_to_markdown(
+    html: str,
+    base_url: str,
+    fetch_image: Callable[[str], Awaitable[bytes | None]],
+    *,
+    cache: ImageCache | None = None,
+    strikethrough_normalized: bool = False,
+) -> str:
+    html = await inline_images_in_html(html, base_url, fetch_image, cache=cache)
+    if len(html) >= _THREAD_OFFLOAD_THRESHOLD:
+        return await asyncio.to_thread(
+            _convert_html_to_markdown_sync,
+            html,
+            strikethrough_normalized=strikethrough_normalized,
+        )
+    return _convert_html_to_markdown_sync(
+        html, strikethrough_normalized=strikethrough_normalized
+    )
 
 
 async def bytes_to_markdown(

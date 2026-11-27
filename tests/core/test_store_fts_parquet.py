@@ -657,3 +657,135 @@ async def test_archive_index_busy_or_locked_never_falls_back_to_immutable(
     assert "mode=ro" in uri
     assert "immutable=1" not in uri
     assert kwargs.get("timeout") == 5.0
+
+
+async def test_archive_index_cache_invalidation_on_external_modification_and_close(
+    tmp_path,
+):
+    import gc
+
+    db_path = tmp_path / "ACRE" / "documents.db"
+    async with Store(db_path, fts=False, source="ACRE") as store:
+        await store.save(
+            make_doc(
+                title="Lei Inicial",
+                document_url="https://ac.gov.br/lei/1",
+                text_markdown=(
+                    "Art. 1º Norma estadual inicial sem índice textual de busca "
+                    "construído na base de dados."
+                ),
+            )
+        )
+
+    index = ArchiveIndex(tmp_path)
+    resolved = db_path.resolve()
+    # First access caches the connection with has_fts=False.
+    assert index.query("florestal") == []
+    assert resolved in index._conn_cache
+    first_entry = index._conn_cache[resolved]
+    first_conn = first_entry.conn
+    assert first_entry.has_fts is False
+
+    # Repeated query reuses the exact same cached connection.
+    assert index.query("florestal") == []
+    assert index._conn_cache[resolved] is first_entry
+
+    # External writer adds a document and builds FTS5 -> invalidates cached entry!
+    async with Store(db_path, fts=True, source="ACRE") as store:
+        await store.save(
+            make_doc(
+                title="Lei Florestal Nova",
+                document_url="https://ac.gov.br/lei/2",
+                text_markdown=(
+                    "Art. 1º Estabelece diretrizes de proteção florestal e manejo "
+                    "sustentável no território estadual."
+                ),
+            )
+        )
+
+    hits = index.query("florestal")
+    assert len(hits) == 1
+    assert hits[0].title == "Lei Florestal Nova"
+    second_entry = index._conn_cache[resolved]
+    assert second_entry is not first_entry
+    assert second_entry.conn is not first_conn
+    assert second_entry.has_fts is True
+    # Old invalidated connection must already be closed.
+    with pytest.raises(sqlite3.ProgrammingError):
+        first_conn.execute("SELECT 1")
+
+    # Explicit close() releases and closes all cached connections cleanly.
+    index.close()
+    assert index._conn_cache == {}
+    with pytest.raises(sqlite3.ProgrammingError):
+        second_entry.conn.execute("SELECT 1")
+
+    # weakref.finalize cleans up even when close() is not called explicitly.
+    temp_index = ArchiveIndex(tmp_path)
+    assert len(temp_index.query("florestal")) == 1
+    leaked_conn = temp_index._conn_cache[resolved].conn
+    del temp_index
+    gc.collect()
+    with pytest.raises(sqlite3.ProgrammingError):
+        leaked_conn.execute("SELECT 1")
+
+
+async def test_archive_index_parallel_multi_archive_bm25_parity_and_thread_safety(
+    tmp_path,
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    data_dir = tmp_path / "multi"
+    # Build 12 archives (> max_workers=8) to exercise parallel ThreadPoolExecutor fan-out.
+    for i in range(12):
+        name = f"ESTADO_{i:02d}"
+        async with Store(data_dir / name / "documents.db", fts=True, source=name) as s:
+            for j in range(3):
+                repeats = "ambiental " * ((i + j) % 5 + 1)
+                await s.save(
+                    make_doc(
+                        year=2020 + (i % 4),
+                        title=f"Lei {i}-{j} Ambiental",
+                        document_url=f"https://example.org/{i}/{j}",
+                        text_markdown=(
+                            f"Art. 1º Estabelece a política pública {repeats}"
+                            f"aplicável no território do estado {i}."
+                        ),
+                    )
+                )
+
+    with ArchiveIndex(data_dir) as parallel_idx:
+        parallel_hits = parallel_idx.query("ambiental", limit=15)
+        parallel_sources = parallel_idx.sources()
+        parallel_stats = parallel_idx.stats()
+        assert len(parallel_idx._conn_cache) == 12
+
+        # Exact BM25 ranking parity against single-archive sequential queries.
+        sequential_hits: list[SearchHit] = []
+        for i in range(12):
+            name = f"ESTADO_{i:02d}"
+            with ArchiveIndex(databases={name: data_dir / name / "documents.db"}) as si:
+                sequential_hits.extend(si.query("ambiental", limit=15))
+        sequential_hits.sort(key=lambda h: (h.rank, h.source, h.id))
+        expected = sequential_hits[:15]
+
+        assert parallel_hits == expected
+        assert [s["source"] for s in parallel_sources] == [
+            f"ESTADO_{i:02d}" for i in range(12)
+        ]
+        assert [s["source"] for s in parallel_stats] == [
+            f"ESTADO_{i:02d}" for i in range(12)
+        ]
+        assert all(s["documents"] == 3 for s in parallel_sources)
+
+        # Concurrent multi-threaded callers sharing the same ArchiveIndex must stay safe & exact.
+        with ThreadPoolExecutor(max_workers=6) as callers:
+            futures = [
+                callers.submit(parallel_idx.query, "ambiental", limit=15)
+                for _ in range(12)
+            ]
+            for fut in futures:
+                assert fut.result() == expected
+
+    # Exiting context manager closed all 12 cached connections.
+    assert parallel_idx._conn_cache == {}

@@ -462,6 +462,7 @@ SCRAPERS: list[ScraperSpec] = [
         1830,
         uses_pdf=True,
         needs_ocr=True,
+        workers=32,
         capabilities=_CAP_YEAR_ONLY,
     ),
     _state(

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import ssl
 import time
 from dataclasses import dataclass
 from email.message import Message
+from functools import cached_property
 from typing import Any
 
 import aiohttp
@@ -71,6 +73,18 @@ class _RetryableError(HttpError):
     pass
 
 
+_CHARSET_HEAD_BYTES = 8192
+_VALID_MEDIA_TYPE_RE = re.compile(
+    r"^[!#$%&'*+\-.^_`|~0-9a-zA-Z]+/[!#$%&'*+\-.^_`|~0-9a-zA-Z]+$"
+)
+_HEADER_CHARSET_RE = re.compile(
+    r';\s*charset\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s;]+))', re.IGNORECASE
+)
+_HEADER_FILENAME_RE = re.compile(
+    r';\s*filename\s*=\s*(?:"([^"\\]*)"|([^\s;]+))', re.IGNORECASE
+)
+
+
 @dataclass(frozen=True)
 class Response:
     url: str
@@ -78,20 +92,49 @@ class Response:
     headers: dict[str, str]
     content: bytes
 
-    def _message(self) -> Message:
-        message = Message()
-        for key, value in self.headers.items():
-            message[key] = value
-        return message
+    def _get_header(self, name: str) -> str | None:
+        if isinstance(self.headers, CIMultiDict):
+            return self.headers.get(name)
+        value = self.headers.get(name)
+        if value is not None:
+            return value
+        target = name.lower()
+        for key, val in self.headers.items():
+            if key.lower() == target:
+                return val
+        return None
 
-    @property
+    def _header_charset(self) -> str | None:
+        raw_ct = self._get_header("content-type")
+        if not raw_ct or ";" not in raw_ct:
+            return None
+        if "charset*=" in raw_ct.lower():
+            msg = Message()
+            msg["Content-Type"] = raw_ct
+            return msg.get_content_charset()
+        match = _HEADER_CHARSET_RE.search(raw_ct)
+        if not match:
+            return None
+        value = (
+            match.group(1)
+            if match.group(1) is not None
+            else match.group(2)
+            if match.group(2) is not None
+            else match.group(3)
+        )
+        cleaned = value.strip().lower()
+        return cleaned or None
+
+    @cached_property
     def charset(self) -> str:
+        head = self.content[:_CHARSET_HEAD_BYTES]
+        is_html = "json" not in self.content_type
         charset = (
-            self._message().get_content_charset()
-            or EncodingDetector.strip_byte_order_mark(self.content)[1]
+            self._header_charset()
+            or EncodingDetector.strip_byte_order_mark(head)[1]
             # JSON may embed whole HTML documents; their <meta> doesn't describe the JSON.
             or EncodingDetector.find_declared_encoding(
-                self.content, is_html="json" not in self.content_type
+                head, is_html=is_html, search_entire_document=is_html
             )
         )
         if not charset:
@@ -122,13 +165,30 @@ class Response:
     def soup(self) -> BeautifulSoup:
         return BeautifulSoup(self.content, "lxml", from_encoding=self.charset)
 
-    @property
+    @cached_property
     def content_type(self) -> str:
-        return self._message().get_content_type()
+        raw_ct = self._get_header("content-type")
+        if not raw_ct:
+            return "text/plain"
+        media_type = raw_ct.split(";", 1)[0].strip().lower()
+        if _VALID_MEDIA_TYPE_RE.fullmatch(media_type):
+            return media_type
+        return "text/plain"
 
-    @property
+    @cached_property
     def filename(self) -> str:
-        return self._message().get_filename() or "document"
+        raw_cd = self._get_header("content-disposition")
+        if not raw_cd:
+            return "document"
+        if "filename*=" not in raw_cd.lower() and "\\" not in raw_cd:
+            match = _HEADER_FILENAME_RE.search(raw_cd)
+            if match:
+                name = match.group(1) if match.group(1) is not None else match.group(2)
+                return name or "document"
+            return "document"
+        msg = Message()
+        msg["Content-Disposition"] = raw_cd
+        return msg.get_filename() or "document"
 
 
 class HttpClient:

@@ -248,9 +248,29 @@ async def test_low_memory_and_default_cache_pragmas(tmp_path):
     async with Store(tmp_path / "default.db") as store:
         (cache_size,) = store.connection.execute("PRAGMA cache_size").fetchone()
         assert cache_size == -16000
+        (busy_timeout,) = store.connection.execute("PRAGMA busy_timeout").fetchone()
+        assert busy_timeout == 5000
     async with Store(tmp_path / "low.db", low_memory=True) as store:
         (cache_size,) = store.connection.execute("PRAGMA cache_size").fetchone()
         assert cache_size == -4000
+        (busy_timeout,) = store.connection.execute("PRAGMA busy_timeout").fetchone()
+        assert busy_timeout == 5000
+
+
+async def test_save_raw_false_skips_pre_insert_file_path_select(tmp_path):
+    async with Store(tmp_path / "no_raw.db", save_raw=False) as store:
+        seen_sql: list[str] = []
+        store.connection.set_trace_callback(seen_sql.append)
+        await store.save(document(title="Lei 1", raw=b"pdf-bytes", raw_ext=".pdf"))
+        store.connection.set_trace_callback(None)
+        assert not any("SELECT file_path FROM documents" in sql for sql in seen_sql)
+
+    async with Store(tmp_path / "with_raw.db", save_raw=True) as store:
+        seen_sql_raw: list[str] = []
+        store.connection.set_trace_callback(seen_sql_raw.append)
+        await store.save(document(title="Lei 1", raw=b"pdf-bytes", raw_ext=".pdf"))
+        store.connection.set_trace_callback(None)
+        assert any("SELECT file_path FROM documents" in sql for sql in seen_sql_raw)
 
 
 async def test_iter_keys_streams_in_batches_and_filters_year(tmp_path):

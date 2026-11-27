@@ -99,6 +99,85 @@ async def test_failed_page_is_recorded_and_later_pages_still_listed():
         )
 
 
+async def test_paginate_sliding_window_does_not_block_on_slow_page_1():
+    async with Store(":memory:") as store:
+        scraper = Scraper(
+            store=store, http=HttpClient(), years=range(2024, 2025), workers=2
+        )
+        release_page_1 = asyncio.Event()
+        page_3_started = asyncio.Event()
+        active = peak = 0
+
+        async def fetch_page(number: int):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                if number == 1:
+                    # Must not deadlock: page 3 (workers + 1) must start while page 1 is blocked!
+                    await asyncio.wait_for(release_page_1.wait(), timeout=2.0)
+                elif number == 3:
+                    page_3_started.set()
+                    release_page_1.set()
+                else:
+                    await asyncio.sleep(0.005)
+                return [{"document_url": f"page/{number}", "title": str(number)}]
+            finally:
+                active -= 1
+
+        refs = await asyncio.wait_for(
+            _collect_async(scraper.paginate(fetch_page, 5)), 3.0
+        )
+        assert page_3_started.is_set()
+        assert peak == 2
+        assert [ref["title"] for ref in refs] == ["1", "2", "3", "4", "5"]
+
+        # Empty page range yields nothing.
+        assert [ref async for ref in scraper.paginate(fetch_page, 0)] == []
+
+
+async def _collect_async(ait):
+    return [item async for item in ait]
+
+
+async def test_paginate_early_stop_cancels_in_flight_tasks_cleanly():
+    async with Store(":memory:") as store:
+        scraper = Scraper(
+            store=store, http=HttpClient(), years=range(2024, 2025), workers=2
+        )
+        page_2_cancelled = asyncio.Event()
+        page_2_started = asyncio.Event()
+
+        async def fetch_page(number: int):
+            if number == 1:
+                await asyncio.wait_for(page_2_started.wait(), timeout=2.0)
+                return [{"document_url": "page/1", "title": "1"}]
+            if number == 2:
+                page_2_started.set()
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    page_2_cancelled.set()
+                    raise
+            if number == 3:
+                raise RuntimeError("page 3 failed before break")
+            return [{"document_url": f"page/{number}", "title": str(number)}]
+
+        before_tasks = set(asyncio.all_tasks())
+        got = []
+        gen = scraper.paginate(fetch_page, 6)
+        try:
+            async for ref in gen:
+                got.append(ref["title"])
+                break
+        finally:
+            await gen.aclose()
+
+        assert got == ["1"]
+        assert page_2_cancelled.is_set()
+        assert not (set(asyncio.all_tasks()) - before_tasks)
+
+
 async def test_overwrite_rescrapes_without_deleting_rows():
     async with Store(":memory:") as store:
         scraper = Scraper(store=store, http=HttpClient(), years=range(2024, 2025))

@@ -289,12 +289,18 @@ def create_mcp_server(
         if client is not None:
             await client.__aexit__(None, None, None)
 
+    async def _close_resources() -> None:
+        try:
+            await _close_live_client()
+        finally:
+            await index.aclose()
+
     @asynccontextmanager
     async def _lifespan(_server: Any) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            await _close_live_client()
+            await _close_resources()
 
     instructions = (
         "Query archived Brazilian federal, state, and environmental legislation "
@@ -304,7 +310,7 @@ def create_mcp_server(
     )
     server = server_cls("legisbr", instructions=instructions, lifespan=_lifespan)
     # Expose explicit async cleanup hook for callers/tests invoking tools outside run().
-    server.aclose = _close_live_client
+    server.aclose = _close_resources
 
     def _available_archive_map() -> dict[str, str]:
         return {name.lower(): name for name in index._discover()}

@@ -9,6 +9,7 @@ import inspect
 import logging
 import math
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -583,27 +584,47 @@ class BaseScraper:
         total_pages: int,
         start: int = 1,
     ) -> AsyncIterator[DocRef]:
-        """Fetch pages in bounded batches; a failed page is recorded and skipped."""
-        for first in range(start, total_pages + 1, self.workers):
-            tasks = [
-                asyncio.create_task(fetch_page(page))
-                for page in range(first, min(first + self.workers, total_pages + 1))
-            ]
-            try:
-                pages = await asyncio.gather(*tasks, return_exceptions=True)
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-            for page, refs in enumerate(pages, first):
-                if isinstance(refs, Exception):
-                    await self.error({"title": f"listing page {page}"}, refs)
+        """Fetch pages via a semaphore-bounded sliding window; failed pages are recorded and skipped."""
+        if total_pages < start:
+            return
+        sem = asyncio.Semaphore(self.workers)
+        window = self.workers * 2
+        next_page = start
+        pending: deque[tuple[int, asyncio.Task[list[DocRef]]]] = deque()
+
+        async def _run_page(page: int) -> list[DocRef]:
+            async with sem:
+                return await fetch_page(page)
+
+        def _fill_window() -> None:
+            nonlocal next_page
+            while next_page <= total_pages and len(pending) < window:
+                page = next_page
+                next_page += 1
+                pending.append((page, asyncio.create_task(_run_page(page))))
+
+        try:
+            _fill_window()
+            while pending:
+                page, task = pending[0]
+                try:
+                    refs = await task
+                except Exception as exc:
+                    pending.popleft()
+                    await self.error({"title": f"listing page {page}"}, exc)
+                    _fill_window()
                     continue
-                if isinstance(refs, BaseException):
-                    raise refs
+                pending.popleft()
                 for ref in refs:
                     yield ref
+                _fill_window()
+        finally:
+            remaining = [task for _, task in pending]
+            for task in remaining:
+                if not task.done():
+                    task.cancel()
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
 
     async def download(self, url: str) -> tuple[str, bytes, str]:
         response = await self.http.request(url)

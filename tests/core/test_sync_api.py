@@ -506,7 +506,7 @@ async def test_store_for_source_export_archive_and_sync_async_archive_index(
         got_alias = idx.get("SaoPaulo", sp_hits[0].id)
         assert got_alias is not None and got_alias["id"] == sp_hits[0].id
 
-    # 2. AsyncArchiveIndex parity with Source enum.
+    # 2. AsyncArchiveIndex parity with Source enum and aclose() cleanup.
     async with AsyncArchiveIndex(data_dir) as aidx:
         ahits = await aidx.query("mobilidade", sources=[Source.SP])
         assert len(ahits) == 1 and ahits[0].source == "SAO_PAULO"
@@ -516,6 +516,14 @@ async def test_store_for_source_export_archive_and_sync_async_archive_index(
         assert {s["source"] for s in asources} == {"ACRE", "SAO_PAULO"}
         astats = await aidx.stats()
         assert len(astats) == 2
+        assert len(aidx._index._conn_cache) == 2
+    assert aidx._index._conn_cache == {}
+
+    aidx2 = AsyncArchiveIndex(data_dir)
+    assert len(await aidx2.sources()) == 2
+    assert len(aidx2._index._conn_cache) == 2
+    await aidx2.aclose()
+    assert aidx2._index._conn_cache == {}
 
     # 3. Top-level sync legisbr.query() with Source enum and strings.
     top_hits = legisbr.query("mobilidade", data_dir=data_dir, year=2024)

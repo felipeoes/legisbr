@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import io
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel
 from pydantic_core import to_jsonable_python
@@ -24,6 +24,7 @@ from legisbr.core.pdf import pdf_page_count, render_pdf_batch, slice_pdf_pages
 
 if TYPE_CHECKING:
     from pydantic_ai import BinaryContent
+    from pydantic_ai.settings import ModelSettings
     from pydantic_ai.usage import RunUsage
 
 __all__ = [
@@ -76,6 +77,7 @@ class OCR:
         concurrency: int = 8,
         pdf_input: bool = False,
         dpi: int = 150,
+        model_settings: Mapping[str, Any] | None = None,
     ) -> None:
         try:
             from pydantic_ai import Agent, BinaryContent
@@ -90,8 +92,19 @@ class OCR:
             raise ValueError("OCR needs models and positive batch_size/concurrency/dpi")
         self._binary_content = BinaryContent
         self._model_http_error = ModelHTTPError
+        effective_settings: dict[str, Any] = {"thinking": False}
+        if all(name.startswith("anthropic:") for name in names):
+            effective_settings["anthropic_cache_instructions"] = True
+        if model_settings is not None:
+            effective_settings.update(model_settings)
+        self.model_settings: dict[str, Any] = effective_settings
         model = FallbackModel(*names) if len(names) > 1 else names[0]
-        self.agent = Agent(model, instructions=prompt, output_type=OCROutput)
+        self.agent = Agent(
+            model,
+            instructions=prompt,
+            output_type=OCROutput,
+            model_settings=cast("ModelSettings", effective_settings),
+        )
         self.sem = asyncio.Semaphore(concurrency)
         # Bound local PDF batch rendering to 1 concurrent open document to prevent
         # multi-GB RSS spikes on large scanned PDFs while keeping LLM calls concurrent.
@@ -173,7 +186,6 @@ class OCR:
     async def pdf(self, data: bytes) -> str:
         try:
             count = await asyncio.to_thread(pdf_page_count, data)
-            texts = []
 
             async def batch(start: int) -> str:
                 async with self.sem:
@@ -190,18 +202,15 @@ class OCR:
                         parts.clear()
 
             starts = range(0, count, self.batch_size)
-            for offset in range(0, len(starts), self.concurrency):
-                tasks = [
-                    asyncio.create_task(batch(start))
-                    for start in starts[offset : offset + self.concurrency]
-                ]
-                try:
-                    texts.extend(await asyncio.gather(*tasks))
-                finally:
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-            return "\n\n".join(texts)
+            tasks: list[asyncio.Task[str]] = []
+            async with asyncio.TaskGroup() as group:
+                for start in starts:
+                    tasks.append(group.create_task(batch(start)))
+            return "\n\n".join(task.result() for task in tasks)
+        except ExceptionGroup as exc:
+            cause = exc.exceptions[0] if len(exc.exceptions) == 1 else exc
+            raise OCRError(
+                "PDF OCR failed; no partial document was returned"
+            ) from cause
         except Exception as exc:
             raise OCRError("PDF OCR failed; no partial document was returned") from exc

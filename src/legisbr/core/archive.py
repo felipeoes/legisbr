@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
-from collections.abc import Mapping, Sequence
+import threading
+import weakref
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Self, TypeVar
 
 from legisbr.core.store import (
     SearchHit,
@@ -17,6 +23,9 @@ from legisbr.core.store import (
     _search_connection,
 )
 from legisbr.registry import SourceInput, get_spec
+
+_T = TypeVar("_T")
+_MAX_FANOUT_WORKERS = 8
 
 _IMMUTABLE_FALLBACK_CODES: frozenset[int] = frozenset(
     {
@@ -112,6 +121,54 @@ def _read_meta(connection: sqlite3.Connection) -> dict[str, str]:
     }
 
 
+def _db_signature(resolved: Path) -> tuple[int, int, int, int] | None:
+    """Return ``(mtime_ns, size, wal_mtime_ns, wal_size)`` or ``None`` if missing."""
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return None
+    try:
+        wal_st = os.stat(f"{resolved}-wal")
+        return (st.st_mtime_ns, st.st_size, wal_st.st_mtime_ns, wal_st.st_size)
+    except OSError:
+        return (st.st_mtime_ns, st.st_size, 0, 0)
+
+
+@dataclass
+class _CachedArchive:
+    """Cached read-only SQLite handle guarded by a per-archive lock."""
+
+    signature: tuple[int, int, int, int]
+    conn: sqlite3.Connection
+    immutable: bool
+    has_fts: bool
+    has_docs: bool
+    fts5_checked: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
+
+
+def _close_cached_entry(entry: _CachedArchive) -> None:
+    with entry.lock:
+        if not entry.closed:
+            entry.closed = True
+            try:
+                entry.conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def _close_all_cached(
+    cache: dict[Path, _CachedArchive],
+    lock: threading.Lock,
+) -> None:
+    with lock:
+        entries = list(cache.values())
+        cache.clear()
+    for entry in entries:
+        _close_cached_entry(entry)
+
+
 class ArchiveIndex:
     """Synchronous read-only index over one or more SQLite legislation archives."""
 
@@ -131,12 +188,104 @@ class ArchiveIndex:
                 for raw_path in databases:
                     path = Path(raw_path)
                     self._explicit[_source_name_for(path)] = path
+        cache: dict[Path, _CachedArchive] = {}
+        cache_lock = threading.Lock()
+        self._conn_cache: dict[Path, _CachedArchive] = cache
+        self._cache_lock: threading.Lock = cache_lock
+        self._finalizer = weakref.finalize(self, _close_all_cached, cache, cache_lock)
+
+    def close(self) -> None:
+        """Close and release all cached read-only SQLite connections."""
+        _close_all_cached(self._conn_cache, self._cache_lock)
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        return None
+        self.close()
+
+    @contextmanager
+    def _checkout(self, db_path: Path) -> Iterator[_CachedArchive]:
+        """Borrow a cached read-only connection, re-opening on external DB changes."""
+        resolved = db_path.resolve()
+        while True:
+            sig = _db_signature(resolved)
+            stale: _CachedArchive | None = None
+            with self._cache_lock:
+                entry = self._conn_cache.get(resolved)
+                if entry is not None and (sig is None or entry.signature != sig):
+                    stale = self._conn_cache.pop(resolved)
+                    entry = None
+            if stale is not None:
+                _close_cached_entry(stale)
+
+            if entry is None:
+                conn, immutable = _open_readonly(resolved)
+                try:
+                    tables = {
+                        str(row[0])
+                        for row in conn.execute(
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type='table' AND name IN ('documents', 'documents_fts')"
+                        )
+                    }
+                    has_fts = "documents_fts" in tables
+                    has_docs = "documents" in tables
+                except BaseException:
+                    conn.close()
+                    raise
+                fresh_sig = _db_signature(resolved)
+                if fresh_sig is None:
+                    ephemeral = _CachedArchive(
+                        signature=(0, 0, 0, 0),
+                        conn=conn,
+                        immutable=immutable,
+                        has_fts=has_fts,
+                        has_docs=has_docs,
+                    )
+                    try:
+                        yield ephemeral
+                    finally:
+                        _close_cached_entry(ephemeral)
+                    return
+
+                new_entry = _CachedArchive(
+                    signature=fresh_sig,
+                    conn=conn,
+                    immutable=immutable,
+                    has_fts=has_fts,
+                    has_docs=has_docs,
+                )
+                replaced: _CachedArchive | None = None
+                with self._cache_lock:
+                    existing = self._conn_cache.get(resolved)
+                    if existing is not None and existing.signature == fresh_sig:
+                        replaced = new_entry
+                        entry = existing
+                    else:
+                        replaced = existing
+                        self._conn_cache[resolved] = new_entry
+                        entry = new_entry
+                if replaced is not None:
+                    _close_cached_entry(replaced)
+
+            with entry.lock:
+                if entry.closed:
+                    continue
+                yield entry
+                return
+
+    @staticmethod
+    def _map_targets(
+        fn: Callable[[tuple[str, Path]], _T],
+        targets: list[tuple[str, Path]],
+    ) -> list[_T]:
+        if len(targets) <= 1:
+            return [fn(target) for target in targets]
+        with ThreadPoolExecutor(
+            max_workers=min(_MAX_FANOUT_WORKERS, len(targets))
+        ) as pool:
+            return list(pool.map(fn, targets))
 
     def _discover(self) -> dict[str, Path]:
         discovered: dict[str, Path] = {}
@@ -167,42 +316,38 @@ class ArchiveIndex:
                 return by_lower[alias]
         return None
 
+    def _inspect_source(self, target: tuple[str, Path]) -> dict[str, Any]:
+        name, db_path = target
+        with self._checkout(db_path) as entry:
+            conn = entry.conn
+            meta = _read_meta(conn)
+            if entry.has_docs:
+                row = conn.execute(
+                    "SELECT count(*) AS total, min(year) AS min_year, max(year) AS max_year "
+                    "FROM documents"
+                ).fetchone()
+                total = int(row["total"]) if row else 0
+                min_year = row["min_year"] if row else None
+                max_year = row["max_year"] if row else None
+            else:
+                total = 0
+                min_year = None
+                max_year = None
+            return {
+                "source": name,
+                "path": str(db_path),
+                "documents": total,
+                "fts_enabled": entry.has_fts,
+                "schema_version": meta.get("schema_version", "2"),
+                "min_year": min_year,
+                "max_year": max_year,
+                "immutable": entry.immutable,
+            }
+
     def sources(self) -> list[dict[str, Any]]:
         """List discovered archives with document counts and FTS5 status."""
-        results: list[dict[str, Any]] = []
-        for name, db_path in self._discover().items():
-            conn, immutable = _open_readonly(db_path)
-            try:
-                meta = _read_meta(conn)
-                has_docs = _has_table(conn, "documents")
-                if has_docs:
-                    row = conn.execute(
-                        "SELECT count(*) AS total, min(year) AS min_year, max(year) AS max_year "
-                        "FROM documents"
-                    ).fetchone()
-                    total = int(row["total"]) if row else 0
-                    min_year = row["min_year"] if row else None
-                    max_year = row["max_year"] if row else None
-                else:
-                    total = 0
-                    min_year = None
-                    max_year = None
-                fts_ready = _has_table(conn, "documents_fts")
-                results.append(
-                    {
-                        "source": name,
-                        "path": str(db_path),
-                        "documents": total,
-                        "fts_enabled": fts_ready,
-                        "schema_version": meta.get("schema_version", "2"),
-                        "min_year": min_year,
-                        "max_year": max_year,
-                        "immutable": immutable,
-                    }
-                )
-            finally:
-                conn.close()
-        return results
+        targets = list(self._discover().items())
+        return self._map_targets(self._inspect_source, targets)
 
     def query(
         self,
@@ -217,28 +362,35 @@ class ArchiveIndex:
         if limit <= 0 or not text.strip():
             return []
         wanted = _expand_source_aliases(sources) if sources is not None else None
+        targets = [
+            (name, db_path)
+            for name, db_path in self._discover().items()
+            if wanted is None or name.lower() in wanted
+        ]
+        if not targets:
+            return []
+
+        def _query_one(target: tuple[str, Path]) -> list[SearchHit]:
+            name, db_path = target
+            with self._checkout(db_path) as entry:
+                if not entry.fts5_checked:
+                    _check_fts5_available(entry.conn)
+                    entry.fts5_checked = True
+                if not entry.has_fts:
+                    return []
+                return _search_connection(
+                    entry.conn,
+                    text,
+                    default_source=name,
+                    year=year,
+                    type=doc_type,
+                    limit=limit,
+                    check_fts=False,
+                )
 
         hits: list[SearchHit] = []
-        for name, db_path in self._discover().items():
-            if wanted is not None and name.lower() not in wanted:
-                continue
-            conn, _ = _open_readonly(db_path)
-            try:
-                _check_fts5_available(conn)
-                if not _has_table(conn, "documents_fts"):
-                    continue
-                hits.extend(
-                    _search_connection(
-                        conn,
-                        text,
-                        default_source=name,
-                        year=year,
-                        type=doc_type,
-                        limit=limit,
-                    )
-                )
-            finally:
-                conn.close()
+        for part in self._map_targets(_query_one, targets):
+            hits.extend(part)
         hits.sort(key=lambda hit: (hit.rank, hit.source, hit.id))
         return hits[:limit]
 
@@ -248,90 +400,84 @@ class ArchiveIndex:
         if resolved is None:
             return None
         name, db_path = resolved
-        conn, _ = _open_readonly(db_path)
-        try:
-            if not _has_table(conn, "documents"):
+        with self._checkout(db_path) as entry:
+            if not entry.has_docs:
                 return None
-            row = conn.execute(
+            row = entry.conn.execute(
                 "SELECT * FROM documents WHERE id = ?",
                 (doc_id,),
             ).fetchone()
             return _row_to_dict(row, default_source=name) if row else None
-        finally:
-            conn.close()
+
+    def _inspect_stats(self, target: tuple[str, Path]) -> dict[str, Any]:
+        name, db_path = target
+        with self._checkout(db_path) as entry:
+            conn = entry.conn
+            meta = _read_meta(conn)
+            if entry.has_docs:
+                row = conn.execute(
+                    "SELECT count(*) AS total, min(year) AS min_year, max(year) AS max_year "
+                    "FROM documents"
+                ).fetchone()
+                total = int(row["total"]) if row else 0
+                min_year = row["min_year"] if row else None
+                max_year = row["max_year"] if row else None
+                by_year = [
+                    {"year": int(r["year"]), "documents": int(r["documents"])}
+                    for r in conn.execute(
+                        "SELECT year, count(*) AS documents FROM documents "
+                        "GROUP BY year ORDER BY year"
+                    )
+                ]
+            else:
+                total = 0
+                min_year = None
+                max_year = None
+                by_year = []
+
+            error_count = 0
+            if _has_table(conn, "errors"):
+                err_row = conn.execute(
+                    "SELECT count(*) AS total FROM errors"
+                ).fetchone()
+                error_count = int(err_row["total"]) if err_row else 0
+
+            last_run: dict[str, Any] | None = None
+            if _has_table(conn, "runs"):
+                run_row = conn.execute(
+                    "SELECT id, scraper, started_at, finished_at, docs, errors, "
+                    "llm_usage, stats FROM runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if run_row is not None:
+                    last_run = {
+                        "id": int(run_row["id"]),
+                        "scraper": str(run_row["scraper"]),
+                        "started_at": run_row["started_at"],
+                        "finished_at": run_row["finished_at"],
+                        "docs": int(run_row["docs"]),
+                        "errors": int(run_row["errors"]),
+                        "llm_usage": json.loads(run_row["llm_usage"] or "{}"),
+                        "stats": json.loads(run_row["stats"] or "{}"),
+                    }
+
+            return {
+                "source": name,
+                "path": str(db_path),
+                "documents": total,
+                "fts_enabled": entry.has_fts,
+                "schema_version": meta.get("schema_version", "2"),
+                "min_year": min_year,
+                "max_year": max_year,
+                "errors": error_count,
+                "by_year": by_year,
+                "last_run": last_run,
+                "immutable": entry.immutable,
+            }
 
     def stats(self) -> list[dict[str, Any]]:
         """Return archive summary statistics without loading document bodies."""
-        results: list[dict[str, Any]] = []
-        for name, db_path in self._discover().items():
-            conn, immutable = _open_readonly(db_path)
-            try:
-                meta = _read_meta(conn)
-                has_docs = _has_table(conn, "documents")
-                if has_docs:
-                    row = conn.execute(
-                        "SELECT count(*) AS total, min(year) AS min_year, max(year) AS max_year "
-                        "FROM documents"
-                    ).fetchone()
-                    total = int(row["total"]) if row else 0
-                    min_year = row["min_year"] if row else None
-                    max_year = row["max_year"] if row else None
-                    by_year = [
-                        {"year": int(r["year"]), "documents": int(r["documents"])}
-                        for r in conn.execute(
-                            "SELECT year, count(*) AS documents FROM documents "
-                            "GROUP BY year ORDER BY year"
-                        )
-                    ]
-                else:
-                    total = 0
-                    min_year = None
-                    max_year = None
-                    by_year = []
-
-                error_count = 0
-                if _has_table(conn, "errors"):
-                    err_row = conn.execute(
-                        "SELECT count(*) AS total FROM errors"
-                    ).fetchone()
-                    error_count = int(err_row["total"]) if err_row else 0
-
-                last_run: dict[str, Any] | None = None
-                if _has_table(conn, "runs"):
-                    run_row = conn.execute(
-                        "SELECT id, scraper, started_at, finished_at, docs, errors, "
-                        "llm_usage, stats FROM runs ORDER BY id DESC LIMIT 1"
-                    ).fetchone()
-                    if run_row is not None:
-                        last_run = {
-                            "id": int(run_row["id"]),
-                            "scraper": str(run_row["scraper"]),
-                            "started_at": run_row["started_at"],
-                            "finished_at": run_row["finished_at"],
-                            "docs": int(run_row["docs"]),
-                            "errors": int(run_row["errors"]),
-                            "llm_usage": json.loads(run_row["llm_usage"] or "{}"),
-                            "stats": json.loads(run_row["stats"] or "{}"),
-                        }
-
-                results.append(
-                    {
-                        "source": name,
-                        "path": str(db_path),
-                        "documents": total,
-                        "fts_enabled": _has_table(conn, "documents_fts"),
-                        "schema_version": meta.get("schema_version", "2"),
-                        "min_year": min_year,
-                        "max_year": max_year,
-                        "errors": error_count,
-                        "by_year": by_year,
-                        "last_run": last_run,
-                        "immutable": immutable,
-                    }
-                )
-            finally:
-                conn.close()
-        return results
+        targets = list(self._discover().items())
+        return self._map_targets(self._inspect_stats, targets)
 
 
 class AsyncArchiveIndex:
@@ -349,11 +495,15 @@ class AsyncArchiveIndex:
     def data_dir(self) -> Path | None:
         return self._index.data_dir
 
+    async def aclose(self) -> None:
+        """Close and release all cached read-only SQLite connections."""
+        await asyncio.to_thread(self._index.close)
+
     async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        return None
+        await self.aclose()
 
     def _discover(self) -> dict[str, Path]:
         return self._index._discover()

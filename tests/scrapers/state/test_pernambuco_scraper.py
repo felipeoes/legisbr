@@ -257,3 +257,102 @@ async def test_fetch_combines_all_word_sections_without_truncating_annexes():
     assert "ANEXO I - Tabela de valores do IPVA." in doc.text_markdown
     assert "ANEXO II - Metas fiscais complementares." in doc.text_markdown
     assert "color: red" not in doc.text_markdown
+
+
+def test_preclean_document_bytes_strips_viewstate_mso_comments_and_styles():
+    raw = (
+        b"<!DOCTYPE html>"
+        b"<!--[if lt IE 7]> <html class='ie6'> <![endif]-->"
+        b"<!--[if gt IE 8]><!--><html lang='pt-br'><!--<![endif]-->"
+        b"<body>"
+        b'<input type="hidden" name="__VIEWSTATE" value="' + b"A" * 5000 + b'" />'
+        b'<div id="divRevogada">Revogada</div>'
+        b'<div id="divTexto"><html><head>'
+        b"<style>span.msoDel { text-decoration: line-through; }</style>"
+        b"<!--[if gte mso 9]><xml><w:WordDocument/></xml><![endif]-->"
+        b"</head><body>"
+        b"<div class=WordSection1>"
+        b"<p style='font-size:12pt'>Art. 1\xc2\xba Vigente.</p>"
+        b"<p style='text-decoration:line-through'>Art. 2\xc2\xba Revogado.</p>"
+        b"</div></body></html></div></body></html>"
+    )
+    cleaned, has_revogada = PernambucoAlepeScraper._preclean_document_bytes(raw)
+    assert has_revogada is True
+    assert b"__VIEWSTATE" not in cleaned
+    assert b"AAAAA" not in cleaned
+    assert b"msoDel" not in cleaned
+    assert b"WordDocument" not in cleaned
+    assert b"font-size:12pt" not in cleaned
+    assert b"line-through" in cleaned
+    assert b"Art. 1\xc2\xba Vigente." in cleaned
+
+
+async def test_fetch_giant_word_html_fast_path_and_lxml_disclaimer_fallback():
+    scraper = _make_scraper()
+    # Build a synthetic multi-row Word table exceeding _GIANT_HTML_BYTES (150 KB).
+    row = (
+        "<tr style='height:8pt'>"
+        "<td width=48 nowrap valign=bottom style='border:solid 1pt'>"
+        "<p class=MsoNormal align=right><span style='font-size:6pt'>1.520,04</span></p>"
+        "</td>"
+        "<td width=48 colspan=2 valign=bottom style='border:solid 1pt'>"
+        "<p class=MsoNormal align=right><span style='font-size:6pt'>2.000,00</span></p>"
+        "</td></tr>"
+    )
+    rows_html = row * 1200  # > 180 KB even after stripping inline styles
+    body = (
+        '<html><body><input type="hidden" name="__VIEWSTATE" value="'
+        + ("B" * 200_000)
+        + '" /><div id="divRevogada">Revogada</div><div id="divTexto"><html><head>'
+        "<style>p { color: red; }</style></head><body>"
+        "<div class=WordSection1>"
+        "<p><b>DECRETO Nº 38.979/2012</b></p>"
+        "<p>Art. 1º Estabelece tabela de valores do IPVA.</p>"
+        "<table>" + rows_html + "</table>"
+        "</div></body></html></div></body></html>"
+    ).encode("utf-8")
+
+    text_url = "https://legis.alepe.pe.gov.br/texto.aspx?id=999&tipo=TEXTOATUALIZADO"
+    scraper.http.request = AsyncMock(return_value=make_mock_response(body))
+    doc = await scraper.fetch(
+        {
+            "year": 2012,
+            "type": "Decreto do Executivo",
+            "title": "Decreto nº 38.979",
+            "summary": "",
+            "situation": "Não consta revogação expressa",
+            "document_url": text_url,
+            "additional_data_url": "",
+            "_candidate_document_urls": [text_url],
+        }
+    )
+    assert doc.situation == "Revogada"
+    assert doc.raw == body
+    assert "DECRETO Nº 38.979/2012" in doc.text_markdown
+    assert "1.520,04" in doc.text_markdown
+    assert "2.000,00" in doc.text_markdown
+    assert "color: red" not in doc.text_markdown
+
+    # Also exercise the giant lxml.html fallback path (when a disclaimer is present).
+    body_with_disclaimer = body.replace(
+        b"</table>",
+        b"</table><p>Este texto n\xc3\xa3o substitui o publicado no DOE.</p>"
+        b'<p><a href="/lei">Art. 2\xc2\xba Disposi\xc3\xa7\xc3\xa3o final.</a></p>',
+    )
+    scraper.http.request = AsyncMock(
+        return_value=make_mock_response(body_with_disclaimer)
+    )
+    doc2 = await scraper.fetch(
+        {
+            "year": 2012,
+            "type": "Decreto do Executivo",
+            "title": "Decreto nº 38.979",
+            "summary": "",
+            "situation": "Não consta revogação expressa",
+            "document_url": text_url,
+            "additional_data_url": "",
+            "_candidate_document_urls": [text_url],
+        }
+    )
+    assert "não substitui" not in doc2.text_markdown
+    assert "Art. 2º Disposição final." in doc2.text_markdown

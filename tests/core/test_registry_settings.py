@@ -32,6 +32,9 @@ def test_all_30_sources_resolve_cleanly_and_match_classes():
         Source.AC,
         Source.BA,
     }
+    rs_spec = get_spec(Source.RS)
+    assert rs_spec.workers == 32
+    assert rs_spec.rps == 10
 
     seen_names: set[str] = set()
     for spec in SCRAPERS:

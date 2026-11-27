@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator
@@ -8,7 +10,14 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
-from legisbr.core.convert import clean_norm_soup, valid_markdown, wrap_html
+from legisbr.core.convert import (
+    _DISCLAIMER_RE,
+    _STRIKETHROUGH_HINT_RE,
+    clean_norm_soup,
+    html_to_markdown,
+    valid_markdown,
+    wrap_html,
+)
 from legisbr.core.document import Document
 from legisbr.core.scraper import (
     DEFAULT_INVALID_SITUATION,
@@ -39,6 +48,47 @@ SITUATIONS: dict[str, str] = {}
 _SEARCH_PATH = "/Paginas/pesquisaAvancada.aspx"
 _TEXT_VERSION_PRIORITY = ("TEXTOATUALIZADO", "TEXTOORIGINAL", "TEXTOANOTADO", "")
 _WORD_SECTION_CLASS_RE = re.compile(r"^WordSection\d*$")
+_THREAD_OFFLOAD_BYTES = 65_536
+_GIANT_HTML_BYTES = 150_000
+_ASPNET_HIDDEN_INPUT_RE = re.compile(
+    rb'<input\b[^>]*\bname\s*=\s*["\']__(?:VIEWSTATE|EVENTVALIDATION|VIEWSTATEGENERATOR)["\'][^>]*>',
+    re.IGNORECASE,
+)
+_NON_CONTENT_BLOCK_RE = re.compile(
+    rb"<(style|script|xml)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+_HTML_COMMENT_RE = re.compile(rb"<!--.*?-->", re.DOTALL)
+_DIV_TEXTO_RE = re.compile(
+    rb'<div\b[^>]*\bid\s*=\s*(?:"divTexto"|\'divTexto\'|divTexto(?=[\s>]))[^>]*>',
+    re.IGNORECASE,
+)
+_DIV_REVOGADA_RE = re.compile(
+    rb'<div\b[^>]*\bid\s*=\s*(?:"divRevogada"|\'divRevogada\'|divRevogada(?=[\s>]))',
+    re.IGNORECASE,
+)
+_EMBEDDED_HTML_END_RE = re.compile(rb"</html\s*>", re.IGNORECASE)
+_EMBEDDED_BODY_RE = re.compile(
+    rb"<body\b[^>]*>(.*)</body\s*>", re.IGNORECASE | re.DOTALL
+)
+_LINE_THROUGH_BYTES_RE = re.compile(rb"line-through", re.IGNORECASE)
+_INLINE_STYLE_ATTR_RE = re.compile(
+    rb"""\s+style\s*=\s*(?:'[^']*'|\"[^\"]*\")""", re.IGNORECASE
+)
+_BARE_SPAN_LEAF_RE = re.compile(rb"<span\s*>([^<]*)</span>", re.IGNORECASE)
+_TD_SINGLE_P_RE = re.compile(
+    rb"(<td\b[^>]*>)\s*<p(?:\s+(?:class|align|lang)=[^\s>]+)*\s*>([^<]*)</p>\s*(</td>)",
+    re.IGNORECASE,
+)
+_TD_PLAIN_OPEN_RE = re.compile(
+    rb"""<td(?:\s+(?:width|height|valign|align|nowrap|bgcolor)(?:=(?:"[^"]*"|'[^']*'|[^\s>]+))?)*\s*>""",
+    re.IGNORECASE,
+)
+_TD_PRESENTATIONAL_ATTR_RE = re.compile(
+    rb"""\s+(?:width|height|valign|align|nowrap|bgcolor)(?:=(?:"[^"]*"|'[^']*'|[^\s>]+))?""",
+    re.IGNORECASE,
+)
+_TD_OPEN_RE = re.compile(rb"<td\b[^>]*>", re.IGNORECASE)
+_WORD_SECTION_BYTES_RE = re.compile(rb"WordSection\d*")
 _TYPE_ALIASES = {
     "ato administrativo normativo": "Ato Administrativo Normativo",
     "ato administrativo parlamentar": "Ato Administrativo Parlamentar",
@@ -378,6 +428,195 @@ class PernambucoAlepeScraper(BaseScraper):
             return div_texto
         return None
 
+    @staticmethod
+    def _strip_presentational_td_attrs(match: re.Match[bytes]) -> bytes:
+        tag = match.group(0)
+        if b"line-through" in tag.lower():
+            return tag
+        return _TD_PRESENTATIONAL_ATTR_RE.sub(b"", tag)
+
+    @classmethod
+    def _preclean_document_bytes(cls, raw: bytes) -> tuple[bytes, bool]:
+        """Strip ASP.NET ViewState, MSO comments, style/script blocks, and inline styles before DOM parsing."""
+        has_div_revogada = False
+        if b"divRevogada" in raw:
+            # Verify outside comments/scripts without expanding giant __VIEWSTATE.
+            check_region = _ASPNET_HIDDEN_INPUT_RE.sub(b"", raw)
+            check_region = _NON_CONTENT_BLOCK_RE.sub(b"", check_region)
+            check_region = _HTML_COMMENT_RE.sub(b"", check_region)
+            has_div_revogada = bool(_DIV_REVOGADA_RE.search(check_region))
+            del check_region
+
+        # Fast C substring lookup to skip giant __VIEWSTATE before divTexto (57%+ of PE pages).
+        div_start = -1
+        for marker in (b'id="divTexto"', b"id='divTexto'"):
+            pos = raw.find(marker)
+            if pos != -1:
+                open_pos = raw.rfind(b"<div", max(0, pos - 256), pos)
+                if open_pos != -1:
+                    div_start = open_pos
+                    break
+        if div_start == -1:
+            div_match = _DIV_TEXTO_RE.search(raw)
+            if div_match is not None:
+                div_start = div_match.start()
+
+        if div_start != -1:
+            chunk = raw[div_start:]
+            end_match = _EMBEDDED_HTML_END_RE.search(chunk)
+            if end_match is not None:
+                chunk = chunk[: end_match.end()]
+        else:
+            chunk = _ASPNET_HIDDEN_INPUT_RE.sub(b"", raw)
+
+        chunk = _NON_CONTENT_BLOCK_RE.sub(b"", chunk)
+        chunk = _HTML_COMMENT_RE.sub(b"", chunk)
+        if not _LINE_THROUGH_BYTES_RE.search(chunk):
+            chunk = _INLINE_STYLE_ATTR_RE.sub(b"", chunk)
+        else:
+            chunk = _INLINE_STYLE_ATTR_RE.sub(
+                lambda m: (
+                    m.group(0) if _LINE_THROUGH_BYTES_RE.search(m.group(0)) else b""
+                ),
+                chunk,
+            )
+        return (chunk, has_div_revogada)
+
+    @classmethod
+    def _extract_giant_word_html(
+        cls, chunk: bytes, charset: str
+    ) -> tuple[str | None, bool]:
+        """Low-memory extraction path for multi-megabyte Word table HTML exports."""
+        chunk = _BARE_SPAN_LEAF_RE.sub(rb"\1", chunk)
+        chunk = _TD_SINGLE_P_RE.sub(rb"\1\2\3", chunk)
+        chunk = _TD_PLAIN_OPEN_RE.sub(b"<td>", chunk)
+        chunk = _TD_OPEN_RE.sub(cls._strip_presentational_td_attrs, chunk)
+
+        has_word_section = bool(_WORD_SECTION_BYTES_RE.search(chunk))
+        has_disclaimer_hint = b"substitui" in chunk.lower()
+        has_linked_img = b"<img" in chunk.lower() and b"<a" in chunk.lower()
+        body_match = _EMBEDDED_BODY_RE.search(chunk)
+        if (
+            body_match is not None
+            and has_word_section
+            and not has_disclaimer_hint
+            and not has_linked_img
+        ):
+            body_html = body_match.group(1).decode(charset, errors="replace")
+            full_html = wrap_html(body_html)
+            return (full_html, not _STRIKETHROUGH_HINT_RE.search(full_html))
+
+        import lxml.html
+
+        doc = lxml.html.fromstring(chunk.decode(charset, errors="replace"))
+        del chunk
+        div_texto_list = doc.xpath(".//div[@id='divTexto']")
+        root = (
+            div_texto_list[0]
+            if div_texto_list
+            else (doc if doc.tag == "div" and doc.get("id") == "divTexto" else doc)
+        )
+        sections = [
+            el
+            for el in root.xpath(".//div[@class]")
+            if _WORD_SECTION_CLASS_RE.match((el.get("class") or "").strip())
+        ]
+        if sections:
+            targets = sections
+        elif div_texto_list or (doc.tag == "div" and doc.get("id") == "divTexto"):
+            for unwanted in root.xpath(".//style | .//title | .//meta | .//script"):
+                parent = unwanted.getparent()
+                if parent is not None:
+                    parent.remove(unwanted)
+            targets = [root]
+        else:
+            return (None, False)
+
+        for target in targets:
+            if has_disclaimer_hint:
+                candidates: list[Any] = []
+                seen_ids: set[int] = set()
+                for el in target.iter():
+                    hit_self = bool(el.text and "substitui" in el.text.lower())
+                    hit_tail = bool(el.tail and "substitui" in el.tail.lower())
+                    if not hit_self and not hit_tail:
+                        continue
+                    start = el if hit_self else el.getparent()
+                    ancestors: list[Any] = []
+                    cur = start
+                    while cur is not None and cur is not target:
+                        if cur.tag in ("p", "span", "div"):
+                            ancestors.append(cur)
+                        cur = cur.getparent()
+                    for anc in reversed(ancestors):
+                        key = id(anc)
+                        if key not in seen_ids:
+                            seen_ids.add(key)
+                            candidates.append(anc)
+                for el in candidates:
+                    parent = el.getparent()
+                    if parent is None:
+                        continue
+                    parts: list[str] = []
+                    total_len = 0
+                    too_long = False
+                    for piece in el.itertext():
+                        stripped = piece.strip()
+                        if not stripped:
+                            continue
+                        total_len += len(stripped)
+                        if total_len >= 300:
+                            too_long = True
+                            break
+                        parts.append(stripped)
+                    if not too_long and _DISCLAIMER_RE.search("".join(parts)):
+                        parent.remove(el)
+            for anchor in list(target.xpath(".//a")):
+                parent = anchor.getparent()
+                if parent is None:
+                    continue
+                if not "".join(anchor.itertext()).strip() and not anchor.xpath(
+                    ".//img"
+                ):
+                    parent.remove(anchor)
+                else:
+                    anchor.drop_tag()
+
+        serialized = "".join(
+            lxml.html.tostring(target, encoding="unicode") for target in targets
+        )
+        full_html = wrap_html(serialized)
+        return (full_html, not _STRIKETHROUGH_HINT_RE.search(full_html))
+
+    @classmethod
+    def _prepare_document_html(
+        cls, raw: bytes, charset: str
+    ) -> tuple[str | None, bool, bool]:
+        """Extract and clean PE document HTML, avoiding giant BS4 trees on massive Word exports."""
+        chunk, has_div_revogada = cls._preclean_document_bytes(raw)
+        if len(chunk) >= _GIANT_HTML_BYTES:
+            full_html, strike_normalized = cls._extract_giant_word_html(chunk, charset)
+            return (full_html, has_div_revogada, strike_normalized)
+
+        soup = BeautifulSoup(chunk, "lxml", from_encoding=charset)
+        del chunk
+        if not has_div_revogada and soup.find("div", id="divRevogada") is not None:
+            has_div_revogada = True
+        content_div = cls._extract_content_container(soup)
+        if not isinstance(content_div, Tag):
+            return (None, has_div_revogada, False)
+        clean_norm_soup(
+            content_div,
+            remove_disclaimers=True,
+            unwrap_links=True,
+            remove_empty_tags=True,
+            strip_styles=True,
+            remove_style_tags=True,
+            remove_script_tags=True,
+        )
+        full_html = wrap_html(str(content_div))
+        return (full_html, has_div_revogada, True)
+
     async def fetch(self, doc_info: dict) -> Document | None:
         year = doc_info["year"]
         norm_type = doc_info.get("type", "")
@@ -390,10 +629,14 @@ class PernambucoAlepeScraper(BaseScraper):
         candidate_urls = [url for url in candidate_urls if url]
         additional_data_url = doc_info.get("additional_data_url", "")
         selected_url = ""
-        selected_soup: BeautifulSoup | None = None
+        selected_revogada = False
         raw = b""
         text_markdown = ""
         last_failure_reason = "Failed to retrieve document page"
+
+        async def _fetch_image(url: str) -> bytes:
+            return (await self.http.request(url)).content
+
         for candidate_url in candidate_urls:
             fetch_result = await self.http.request(
                 candidate_url, timeout=60, ok_statuses=(404,)
@@ -401,34 +644,41 @@ class PernambucoAlepeScraper(BaseScraper):
             if fetch_result.status == 404:
                 last_failure_reason = f"No document at {candidate_url}"
                 continue
-            soup = fetch_result.soup()
-            content_div = self._extract_content_container(soup)
-            if not isinstance(content_div, Tag):
+            charset = fetch_result.charset
+            if len(fetch_result.content) >= _THREAD_OFFLOAD_BYTES:
+                (
+                    full_html,
+                    has_div_revogada,
+                    strike_normalized,
+                ) = await asyncio.to_thread(
+                    self._prepare_document_html, fetch_result.content, charset
+                )
+            else:
+                full_html, has_div_revogada, strike_normalized = (
+                    self._prepare_document_html(fetch_result.content, charset)
+                )
+            if full_html is None:
                 last_failure_reason = (
                     "Could not find WordSection or divTexto in document page"
                 )
                 continue
-            clean_norm_soup(
-                content_div,
-                remove_disclaimers=True,
-                unwrap_links=True,
-                remove_empty_tags=True,
-                strip_styles=True,
-                remove_style_tags=True,
-                remove_script_tags=True,
+            candidate_markdown = await html_to_markdown(
+                full_html,
+                self.base_url,
+                _fetch_image,
+                cache=self.image_cache,
+                strikethrough_normalized=strike_normalized,
             )
-            full_html = wrap_html(str(content_div))
-            candidate_markdown = await self.markdown(html=full_html)
             valid, reason = valid_markdown(candidate_markdown)
             if not valid:
                 last_failure_reason = f"Invalid markdown: {reason}"
                 continue
             selected_url = candidate_url
-            selected_soup = soup
+            selected_revogada = has_div_revogada
             raw = fetch_result.content
             text_markdown = candidate_markdown
             break
-        if selected_soup is None or not selected_url:
+        if not selected_url:
             raise ValueError(last_failure_reason)
         reference_page: BeautifulSoup | None = None
         if additional_data_url:
@@ -444,9 +694,9 @@ class PernambucoAlepeScraper(BaseScraper):
             "raw_ext": ".html",
         }
         result.pop("_candidate_document_urls", None)
-        additional_data = self._get_additional_data(
-            reference_page, text_soup=selected_soup
-        )
+        additional_data = self._get_additional_data(reference_page)
+        if selected_revogada:
+            additional_data["situation"] = DEFAULT_INVALID_SITUATION
         for key, value in additional_data.items():
             if value or key == "situation":
                 result[key] = value

@@ -529,24 +529,79 @@ async def test_mcp_alias_resolution_does_not_open_unrelated_archive_dbs(
 
     monkeypatch.setattr(archive_mod, "_open_readonly", spy_open)
     server = create_mcp_server(tmp_path)
-
-    hits = _extract_tool_result(
-        await server.call_tool(
-            "search_legislation", {"query": "hidricos", "sources": ["sp"]}
+    try:
+        hits = _extract_tool_result(
+            await server.call_tool(
+                "search_legislation", {"query": "hidricos", "sources": ["sp"]}
+            )
         )
-    )
-    assert len(hits) == 1
-    assert all(p.parent.name == "SAO_PAULO" for p in opened)
-    assert not any(p.parent.name == "ACRE" for p in opened)
+        assert len(hits) == 1
+        assert [p.parent.name for p in opened] == ["SAO_PAULO"]
+        assert not any(p.parent.name == "ACRE" for p in opened)
 
+        # Follow-up get_legislation on the same server reuses the cached SAO_PAULO connection.
+        opened.clear()
+        doc = _extract_tool_result(
+            await server.call_tool(
+                "get_legislation", {"source": "sp", "doc_id": hits[0]["id"]}
+            )
+        )
+        assert doc is not None
+        assert opened == []
+    finally:
+        await server.aclose()
+
+    # On a fresh server, get_legislation opens only SAO_PAULO and never ACRE.
     opened.clear()
-    doc = _extract_tool_result(
-        await server.call_tool(
-            "get_legislation", {"source": "sp", "doc_id": hits[0]["id"]}
+    fresh_server = create_mcp_server(tmp_path)
+    try:
+        doc2 = _extract_tool_result(
+            await fresh_server.call_tool(
+                "get_legislation", {"source": "sp", "doc_id": hits[0]["id"]}
+            )
         )
+        assert doc2 is not None
+        assert [p.parent.name for p in opened] == ["SAO_PAULO"]
+    finally:
+        await fresh_server.aclose()
+
+
+async def test_mcp_server_aclose_and_lifespan_close_archive_index(
+    tmp_path, monkeypatch
+):
+    from legisbr import mcp_server as mcp_mod
+
+    await _build_archive(tmp_path)
+    created_indexes: list[Any] = []
+    real_async_index = mcp_mod.AsyncArchiveIndex
+
+    def spy_index(*args: Any, **kwargs: Any) -> Any:
+        idx = real_async_index(*args, **kwargs)
+        created_indexes.append(idx)
+        return idx
+
+    monkeypatch.setattr(mcp_mod, "AsyncArchiveIndex", spy_index)
+
+    server = create_mcp_server(tmp_path)
+    assert len(created_indexes) == 1
+    idx = created_indexes[0]
+
+    # Populate cached connections via list_sources, then verify server.aclose() clears them.
+    _extract_tool_result(await server.call_tool("list_sources", {}))
+    assert len(idx._index._conn_cache) == 2
+    await server.aclose()
+    assert idx._index._conn_cache == {}
+
+    # Also verify the MCP lifespan shutdown hook closes cached archive connections.
+    lifespan_fn = getattr(server, "_lifespan", None) or getattr(
+        getattr(server, "_mcp_server", None), "lifespan", None
     )
-    assert doc is not None
-    assert [p.parent.name for p in opened] == ["SAO_PAULO"]
+    if lifespan_fn is not None:
+        _extract_tool_result(await server.call_tool("list_sources", {}))
+        assert len(idx._index._conn_cache) == 2
+        async with lifespan_fn(server):
+            assert len(idx._index._conn_cache) == 2
+        assert idx._index._conn_cache == {}
 
 
 def test_mcp_allowed_domains_cover_all_registered_sources():

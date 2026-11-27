@@ -429,3 +429,170 @@ class TestHtmlConversionFixes:
         assert "| ~~Col A~~ | ~~Col B~~ |" in md
         assert "| ~~Val 1~~ | ~~Val 2~~ |" in md
         assert "~~Item 1~~" in md and "~~Item 2~~" in md
+
+
+class TestHtmlPipelinePerformanceOptimizations:
+    def test_bottom_up_empty_element_removal_parity_and_deep_nesting(self):
+        from bs4 import BeautifulSoup
+
+        from legisbr.core.convert import _remove_empty_elements
+
+        html = (
+            "<div>"
+            "  <div class='nested-empty'><span><b>   </b></span></div>"
+            "  <div class='only-br'><br/></div>"
+            "  <div class='only-empty-p'><p>   </p></div>"
+            "  <div class='only-comment'><!-- hidden comment --></div>"
+            "  <div class='has-img'><b><img src='a.png'/></b><span> </span></div>"
+            "  <p>Art. 1º Texto mantido.</p>"
+            "</div>"
+        )
+        soup = BeautifulSoup(html, "lxml")
+        _remove_empty_elements(soup)
+        assert soup.find("div", class_="nested-empty") is None
+        assert soup.find("div", class_="only-br") is None
+        assert soup.find("div", class_="only-empty-p") is None
+        assert soup.find("div", class_="only-comment") is None
+        img_div = soup.find("div", class_="has-img")
+        assert img_div is not None
+        assert img_div.find("img") is not None
+        assert img_div.find("span") is None
+        assert "Art. 1º Texto mantido." in soup.get_text()
+
+        # Deep nesting must run iteratively in O(N) without hitting RecursionError.
+        depth = 1500
+        deep_html = "<div>" * depth + "<span> </span>" + "</div>" * depth + "<p>Fim</p>"
+        deep_soup = BeautifulSoup(deep_html, "lxml")
+        _remove_empty_elements(deep_soup)
+        assert deep_soup.find("div") is None
+        assert (
+            deep_soup.find("p") is not None and deep_soup.find("p").get_text() == "Fim"
+        )
+
+    def test_strip_boilerplate_fast_path_and_long_container_safety(self):
+        from bs4 import BeautifulSoup
+
+        from legisbr.core.convert import _strip_boilerplate
+
+        html = (
+            "<div>"
+            "  <p>Art. 1º Esta lei dispõe sobre matéria estadual.</p>"
+            "  <p><b>Este texto não substitui</b> o publicado no Diário Oficial.</p>"
+            "  <p>"
+            + ("Art. 2º Este texto não substitui dispositivos antigos " + "x " * 180)
+            + "</p>"
+            "</div>"
+        )
+        soup = BeautifulSoup(html, "lxml")
+        _strip_boilerplate(soup)
+        text = soup.get_text()
+        assert "publicado no Diário Oficial" not in text
+        assert "Art. 1º Esta lei" in text
+        assert "Art. 2º Este texto não substitui" in text
+
+        # raw_html hint without "substitui" skips tree walk completely.
+        soup_skip = BeautifulSoup(
+            "<p>Este texto não substitui o publicado.</p>", "lxml"
+        )
+        _strip_boilerplate(soup_skip, raw_html="<p>sem aviso</p>")
+        assert "não substitui" in soup_skip.get_text()
+
+    def test_normalize_strikethrough_fast_path_skips_non_revoked_and_handles_revoked(
+        self, monkeypatch
+    ):
+        from bs4 import BeautifulSoup
+
+        import legisbr.core.convert as convert_mod
+
+        plain_soup = BeautifulSoup(
+            "<div><p style='color:blue'>Art. 1º Texto vigente.</p></div>", "lxml"
+        )
+        called = False
+
+        def fail_find_all(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("find_all should not be called on non-revoked soup")
+
+        monkeypatch.setattr(plain_soup, "find_all", fail_find_all)
+        convert_mod._normalize_strikethrough_soup(plain_soup)
+        assert not called
+
+    @pytest.mark.asyncio
+    async def test_html_to_markdown_avoids_double_bs4_parse_when_normalized(
+        self, monkeypatch
+    ):
+        from unittest.mock import AsyncMock
+
+        import legisbr.core.convert as convert_mod
+
+        parse_calls = 0
+        real_bs = convert_mod.BeautifulSoup
+
+        def spy_bs(*args, **kwargs):
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_bs(*args, **kwargs)
+
+        monkeypatch.setattr(convert_mod, "BeautifulSoup", spy_bs)
+
+        # Already clean <s> (e.g., produced by clean_norm_soup) skips BS4 even by default.
+        clean_html = "<p>Art. 1º <s>Texto revogado.</s></p>"
+        md1 = await convert_mod.html_to_markdown(
+            clean_html, "https://x.org", AsyncMock()
+        )
+        assert "~~Texto revogado.~~" in md1
+        assert parse_calls == 0
+
+        # Explicit strikethrough_normalized=True also skips BS4.
+        md2 = await convert_mod.html_to_markdown(
+            clean_html,
+            "https://x.org",
+            AsyncMock(),
+            strikethrough_normalized=True,
+        )
+        assert "~~Texto revogado.~~" in md2
+        assert parse_calls == 0
+
+        # Unnormalized strikethroughs (adjacent/nested/ordinal/CSS) still invoke BS4.
+        dirty_html = "<p><s>Art. 1º </s><s>Revogado.</s> N<s>º</s> 5</p>"
+        md3 = await convert_mod.html_to_markdown(
+            dirty_html, "https://x.org", AsyncMock()
+        )
+        assert "~~~~" not in md3
+        assert "~~º~~" not in md3
+        assert "~~Art. 1º Revogado.~~" in md3
+        assert parse_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_html_to_markdown_offloads_only_large_html_to_thread(
+        self, monkeypatch
+    ):
+        from unittest.mock import AsyncMock
+
+        import legisbr.core.convert as convert_mod
+
+        to_thread_calls: list[int] = []
+        real_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(fn, *args, **kwargs):
+            to_thread_calls.append(len(args[0]))
+            return await real_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(convert_mod.asyncio, "to_thread", spy_to_thread)
+
+        small_html = "<p>Art. 1º Pequena norma estadual.</p>"
+        small_md = await convert_mod.html_to_markdown(
+            small_html, "https://x.org", AsyncMock()
+        )
+        assert "Pequena norma estadual." in small_md
+        assert to_thread_calls == []
+
+        large_html = "<p>" + ("Art. 1º Norma estadual extensa. " * 2500) + "</p>"
+        assert len(large_html) >= 65_536
+        large_md = await convert_mod.html_to_markdown(
+            large_html, "https://x.org", AsyncMock()
+        )
+        assert "Norma estadual extensa." in large_md
+        assert len(to_thread_calls) == 1
+        assert to_thread_calls[0] == len(large_html)

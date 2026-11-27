@@ -167,14 +167,16 @@ def _search_connection(
     type: str | None = None,
     situation: str | None = None,
     limit: int = 20,
+    check_fts: bool = True,
 ) -> list[SearchHit]:
     if limit <= 0 or not query.strip():
         return []
-    _check_fts5_available(connection)
-    if not _has_table(connection, "documents_fts"):
-        raise RuntimeError(
-            "FTS5 index is not built for this archive; call rebuild_fts() or open Store with fts=True."
-        )
+    if check_fts:
+        _check_fts5_available(connection)
+        if not _has_table(connection, "documents_fts"):
+            raise RuntimeError(
+                "FTS5 index is not built for this archive; call rebuild_fts() or open Store with fts=True."
+            )
 
     clauses = ["documents_fts MATCH ?"]
     filter_params: list[Any] = []
@@ -319,6 +321,7 @@ class Store:
         connection = sqlite3.connect(self.path, check_same_thread=False)
         try:
             connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA temp_store=MEMORY")
@@ -500,17 +503,17 @@ class Store:
     ) -> None:
         if doc.raw is not None and self.save_raw and self.path == ":memory:":
             raise ValueError("Raw files require a filesystem store")
-        row = self.connection.execute(
-            "SELECT file_path FROM documents WHERE ref_url=? AND ref_title=?",
-            (ref_url, ref_title),
-        ).fetchone()
-        old = self._owned_raw(row[0]) if row else None
-        # Validates raw_ext before anything is written.
-        new = (
-            self.root / self._raw_path(doc, ref_url, ref_title)
-            if doc.raw is not None and self.save_raw
-            else None
-        )
+        old: Path | None = None
+        new: Path | None = None
+        if self.save_raw:
+            row = self.connection.execute(
+                "SELECT file_path FROM documents WHERE ref_url=? AND ref_title=?",
+                (ref_url, ref_title),
+            ).fetchone()
+            old = self._owned_raw(row[0]) if row else None
+            # Validates raw_ext before anything is written.
+            if doc.raw is not None:
+                new = self.root / self._raw_path(doc, ref_url, ref_title)
         try:
             with self.connection:
                 self._insert(doc, ref_url, ref_title, file_path)

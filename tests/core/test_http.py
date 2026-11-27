@@ -70,6 +70,97 @@ def test_json_ignores_meta_charset_inside_strings():
     assert response.json()["conteudo"].endswith("Resolução")
 
 
+def test_response_charset_slices_head_to_8kb_and_avoids_message_allocations(
+    monkeypatch,
+):
+    from bs4.dammit import EncodingDetector
+    from multidict import CIMultiDict
+
+    import legisbr.core.http as http_mod
+
+    bom_lengths: list[int] = []
+    declared_lengths: list[int] = []
+    real_strip_bom = EncodingDetector.strip_byte_order_mark
+    real_find_declared = EncodingDetector.find_declared_encoding
+
+    def spy_strip_bom(data: bytes):
+        bom_lengths.append(len(data))
+        return real_strip_bom(data)
+
+    def spy_find_declared(markup, *args, **kwargs):
+        declared_lengths.append(len(markup))
+        return real_find_declared(markup, *args, **kwargs)
+
+    monkeypatch.setattr(EncodingDetector, "strip_byte_order_mark", spy_strip_bom)
+    monkeypatch.setattr(EncodingDetector, "find_declared_encoding", spy_find_declared)
+
+    # Normal headers must never allocate email.message.Message().
+    def fail_message(*args, **kwargs):
+        raise AssertionError("Message() should not be allocated for standard headers")
+
+    monkeypatch.setattr(http_mod, "Message", fail_message)
+
+    # Meta charset at offset ~3000 (within 8KB head, past default 2KB) on a 200KB payload.
+    padding = b" " * 3000
+    body = (
+        b"<html><head>"
+        + padding
+        + b'<meta charset="windows-1252"></head><body>Resolu\xe7\xe3o'
+        + b"x" * 200_000
+        + b"</body></html>"
+    )
+    resp = Response(
+        "https://example.org",
+        200,
+        CIMultiDict(
+            {
+                "Content-Type": "text/html",
+                "Content-Disposition": 'attachment; filename="norma.html"',
+            }
+        ),
+        body,
+    )
+    assert resp.content_type == "text/html"
+    assert resp.filename == "norma.html"
+    assert resp.charset == "windows-1252"
+    assert "Resolução" in resp.text
+    assert bom_lengths == [8192]
+    assert declared_lengths == [8192]
+
+    # BOM on a large payload also inspects only the first 8KB slice.
+    bom_lengths.clear()
+    bom_resp = Response(
+        "https://example.org", 200, {}, b"\xef\xbb\xbf" + b"a" * 100_000
+    )
+    assert bom_resp.charset == "utf-8"
+    assert bom_lengths == [8192]
+    assert bom_resp.content_type == "text/plain"
+    assert bom_resp.filename == "document"
+
+
+def test_response_header_parsing_edge_cases():
+    # RFC 2231 encoded filename* falls back cleanly to Message.
+    r1 = Response(
+        "u",
+        200,
+        {
+            "Content-Type": 'TEXT/HTML; foo=bar; CHARSET="ISO-8859-1"',
+            "Content-Disposition": "attachment; filename*=UTF-8''lei%20n%C2%BA%201.pdf",
+        },
+        b"Lei \x96 1",
+    )
+    assert r1.content_type == "text/html"
+    assert r1.charset == "cp1252"
+    assert r1.text == "Lei – 1"
+    assert r1.filename == "lei nº 1.pdf"
+
+    # Invalid/empty content-type defaults to text/plain like email.message.Message.
+    r2 = Response("u", 200, {"Content-Type": "invalid"}, b"ok")
+    assert r2.content_type == "text/plain"
+    r3 = Response("u", 200, {"Content-Type": ""}, b"ok")
+    assert r3.content_type == "text/plain"
+
+
 @pytest.mark.parametrize("status", [400, 404, 503])
 async def test_http_errors_raise_after_retry_budget(status):
     http = HttpClient(max_retries=1)
