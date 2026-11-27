@@ -178,6 +178,7 @@ scripts/*
 !scripts/check_proxies.py
 !scripts/check_licenses.py
 proxies*.txt
+outputs/
 /docs/
 
 # AI-RELATED
