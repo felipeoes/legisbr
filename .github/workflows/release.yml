@@ -22,13 +22,13 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME#v}"
-          VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          VERSION=$(uv run --no-sync python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
           if [ "$TAG" != "$VERSION" ]; then
             echo "ERROR: Git tag '$GITHUB_REF_NAME' ($TAG) does not match pyproject.toml version '$VERSION'"
             exit 1
           fi
       - name: Run offline unit tests
-        run: uv run pytest tests -m "not integration" -n auto --timeout=60
+        run: uv run --no-sync pytest tests -m "not integration" -n auto --timeout=60
       - name: Build sdist and wheel
         run: uv build
       - name: Verify sdist contains no local secrets or artifacts

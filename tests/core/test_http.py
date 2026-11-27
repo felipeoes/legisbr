@@ -241,7 +241,7 @@ def _proxy_service(tmp_path, *proxies: str):
     from legisbr.core.proxy import ProxyService
 
     path = tmp_path / "proxies.txt"
-    path.write_text("\n".join(proxies))
+    path.write_text("\n".join(proxies), encoding="utf-8")
     return ProxyService({"file_path": str(path)})
 
 
@@ -412,17 +412,51 @@ async def test_gcra_rate_limiter_enforces_burst_one_spacing_at_0_3_rps(monkeypat
         assert actual == pytest.approx(exp, rel=1e-6)
 
 
-async def test_gcra_rate_limiter_enforces_burst_one_spacing_at_100_rps():
+async def test_gcra_rate_limiter_enforces_burst_one_spacing_at_100_rps(monkeypatch):
+    import legisbr.core.http as module
     from legisbr.core.http import RateLimiter
+
+    # Real wall-clock check using an interval (50 ms) safely above Windows's 15.6 ms
+    # monotonic clock resolution so asyncio.sleep cannot fire early on coarse timers.
+    real_limiter = RateLimiter(20)
+    start = time.monotonic()
+    for _ in range(4):
+        await real_limiter.acquire()
+    assert time.monotonic() - start >= 0.12
+
+    # Deterministic virtual-clock check: exact 10 ms burst=1 spacing at 100 rps.
+    clock = 100.0
+
+    def fake_monotonic() -> float:
+        return clock
+
+    async def fake_sleep(delay: float) -> None:
+        nonlocal clock
+        clock += delay
+
+    monkeypatch.setattr(module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
 
     limiter = RateLimiter(100)
     stamps: list[float] = []
     for _ in range(6):
         await limiter.acquire()
-        stamps.append(time.monotonic())
+        stamps.append(clock)
     gaps = [stamps[i + 1] - stamps[i] for i in range(len(stamps) - 1)]
-    assert stamps[-1] - stamps[0] >= 0.045
-    assert all(gap >= 0.007 for gap in gaps)
+    assert stamps[-1] - stamps[0] == pytest.approx(0.05, rel=1e-6)
+    assert all(gap == pytest.approx(0.01, rel=1e-6) for gap in gaps)
+
+    # Concurrent callers at 100 rps reserve strictly spaced slots with burst=1.
+    clock = 200.0
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(module.asyncio, "sleep", record_sleep)
+    concurrent_limiter = RateLimiter(100)
+    await asyncio.gather(*(concurrent_limiter.acquire() for _ in range(6)))
+    assert sleeps == pytest.approx([0.01, 0.02, 0.03, 0.04, 0.05], rel=1e-6)
 
 
 async def test_gcra_rate_limiter_does_not_hold_lock_while_sleeping():

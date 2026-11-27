@@ -231,7 +231,7 @@ async def test_import_and_export_jsonl_and_parquet_single_file(tmp_path, monkeyp
     database = spec.database_path(tmp_path)
     source = database.parent / "2024/data.json"
     source.parent.mkdir(parents=True)
-    source.write_text(json.dumps([document().model_dump()]))
+    source.write_text(json.dumps([document().model_dump()]), encoding="utf-8")
     monkeypatch.setattr(cli, "SCRAPERS", [spec])
 
     assert await cli.async_main(["import-json", "-s", "AC"], settings=cfg) == 0
@@ -244,7 +244,7 @@ async def test_import_and_export_jsonl_and_parquet_single_file(tmp_path, monkeyp
         == 0
     )
     assert (
-        json.loads((out_jsonl / "2024/data.jsonl").read_text())["title"]
+        json.loads((out_jsonl / "2024/data.jsonl").read_text(encoding="utf-8"))["title"]
         == document().title
     )
 
@@ -270,7 +270,9 @@ async def test_import_and_export_jsonl_and_parquet_single_file(tmp_path, monkeyp
     assert table.column("title").to_pylist() == [document().title]
 
     assert source.exists()
-    source.write_text(json.dumps([{**document().model_dump(), "situation": ""}]))
+    source.write_text(
+        json.dumps([{**document().model_dump(), "situation": ""}]), encoding="utf-8"
+    )
     assert await cli.async_main(["import-json", "-s", "AC"], settings=cfg) == 1
 
 

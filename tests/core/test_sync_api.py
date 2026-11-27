@@ -564,14 +564,18 @@ async def test_store_for_source_export_archive_and_sync_async_archive_index(
 
     jsonl_out = legisbr.export(sp_store, tmp_path / "sp.jsonl")
     assert jsonl_out == tmp_path / "sp.jsonl"
-    lines = [json.loads(line) for line in jsonl_out.read_text().splitlines() if line]
+    lines = [
+        json.loads(line)
+        for line in jsonl_out.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
     assert len(lines) == 2
 
     json_out = legisbr.export(
         data_dir / "SAO_PAULO", tmp_path / "sp_2023.json", year=2023
     )
     assert json_out == tmp_path / "sp_2023.json"
-    rows = json.loads(json_out.read_text())
+    rows = json.loads(json_out.read_text(encoding="utf-8"))
     assert len(rows) == 1 and rows[0]["year"] == 2023
 
     # Directory export (no known extension -> single_file=False, per-year shards).

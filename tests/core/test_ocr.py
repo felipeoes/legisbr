@@ -144,6 +144,7 @@ async def test_pdf_batch_rendering_is_serialized_while_llm_calls_stay_concurrent
     render_lock = threading.Lock()
     render_active = render_peak = 0
     llm_active = llm_peak = 0
+    reached_two = asyncio.Event()
     real_render = ocr._render_batch
 
     def tracked_render(data: bytes, start: int, end: int):
@@ -163,8 +164,13 @@ async def test_pdf_batch_rendering_is_serialized_while_llm_calls_stay_concurrent
         nonlocal llm_active, llm_peak
         llm_active += 1
         llm_peak = max(llm_peak, llm_active)
-        await asyncio.sleep(0.05)
-        llm_active -= 1
+        try:
+            if llm_active >= 2:
+                reached_two.set()
+            else:
+                await asyncio.wait_for(reached_two.wait(), timeout=5.0)
+        finally:
+            llm_active -= 1
         return ModelResponse(
             parts=[ToolCallPart(info.output_tools[0].name, {"text_markdown": "page"})]
         )

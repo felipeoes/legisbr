@@ -37,7 +37,7 @@ async def test_long_titles_and_stable_listing_identity(tmp_path):
         assert len(list((tmp_path / "2024/docs").glob("*.pdf"))) == 2
         for fmt in ("json", "jsonl"):
             assert await store.export(tmp_path / "export", fmt) == 2
-            text = (tmp_path / f"export/2024/data.{fmt}").read_text()
+            text = (tmp_path / f"export/2024/data.{fmt}").read_text(encoding="utf-8")
             rows = (
                 json.loads(text)
                 if fmt == "json"
@@ -51,7 +51,9 @@ async def test_underscore_listing_fields_are_not_stored(tmp_path):
     async with Store(tmp_path / "documents.db") as store:
         await store.save(document(_pdf_link="https://example.org/1.pdf", number="1"))
         await store.export(tmp_path / "export")
-        row = json.loads((tmp_path / "export/2024/data.jsonl").read_text())
+        row = json.loads(
+            (tmp_path / "export/2024/data.jsonl").read_text(encoding="utf-8")
+        )
         assert row["number"] == "1" and "_pdf_link" not in row
 
 
@@ -84,12 +86,14 @@ async def test_summary_does_not_load_bodies(tmp_path):
 async def test_import_fails_loudly_without_deleting_inputs(tmp_path):
     source = tmp_path / "2024/data.json"
     source.parent.mkdir()
-    source.write_text("[broken")
+    source.write_text("[broken", encoding="utf-8")
     async with Store(tmp_path / "documents.db") as store:
         with pytest.raises(json.JSONDecodeError):
             await store.import_json(tmp_path)
-        assert source.read_text() == "[broken"
-        source.write_text(json.dumps([document(file_path="old.pdf").model_dump()]))
+        assert source.read_text(encoding="utf-8") == "[broken"
+        source.write_text(
+            json.dumps([document(file_path="old.pdf").model_dump()]), encoding="utf-8"
+        )
         assert await store.import_json(tmp_path) == (1, 0)
         assert (
             store.connection.execute("SELECT file_path FROM documents").fetchone()[0]
@@ -113,7 +117,7 @@ async def test_import_records_invalid_rows_and_rejects_non_list(tmp_path):
     source.parent.mkdir()
     rows = [document().model_dump(), {**document(title="Lei 2").model_dump()}]
     rows[1]["situation"] = ""
-    source.write_text(json.dumps(rows))
+    source.write_text(json.dumps(rows), encoding="utf-8")
     async with Store(tmp_path / "documents.db") as store:
         assert await store.import_json(tmp_path) == (1, 1)
         assert len(await store.keys()) == 1
@@ -122,7 +126,7 @@ async def test_import_records_invalid_rows_and_rejects_non_list(tmp_path):
         ).fetchone()
         assert title == "Lei 2" and "situation" in message
 
-        source.write_text(json.dumps({"documents": rows}))
+        source.write_text(json.dumps({"documents": rows}), encoding="utf-8")
         with pytest.raises(ValueError, match="JSON array"):
             await store.import_json(tmp_path)
 
@@ -168,7 +172,7 @@ def test_document_normalizes_title_whitespace_and_null_summary():
 async def test_import_normalizes_ref_title_like_listing_keys(tmp_path):
     (tmp_path / "2024").mkdir()
     row = document().model_dump() | {"ref_url": "listing", "ref_title": "Lei\n   1"}
-    (tmp_path / "2024/data.json").write_text(json.dumps([row]))
+    (tmp_path / "2024/data.json").write_text(json.dumps([row]), encoding="utf-8")
     async with Store(tmp_path / "documents.db") as store:
         assert await store.import_json(tmp_path) == (1, 0)
         assert await store.keys() == {("listing", "Lei 1")}

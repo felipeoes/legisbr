@@ -83,7 +83,7 @@ async def main() -> None:
     proxies = list(
         dict.fromkeys(
             _with_scheme(line.strip())
-            for line in args.source.read_text().splitlines()
+            for line in args.source.read_text(encoding="utf-8").splitlines()
             if line.strip()
         )
     )
@@ -102,7 +102,7 @@ async def main() -> None:
         ok = await asyncio.gather(*(_reaches_site(p) for p in batch))
         working += [p for p, good in zip(batch, ok, strict=True) if good]
     working = working[: args.count]
-    args.out.write_text("".join(f"{p}\n" for p in working))
+    args.out.write_text("".join(f"{p}\n" for p in working), encoding="utf-8")
     print(f"{len(working)} reach the site; wrote {args.out}")
 
 

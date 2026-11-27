@@ -19,7 +19,7 @@ FIXTURES = Path(__file__).parents[2] / "fixtures" / "para"
 
 
 def _html(name: str) -> str:
-    return (FIXTURES / name).read_text()
+    return (FIXTURES / name).read_text(encoding="utf-8")
 
 
 def _pdf(text: str) -> bytes:

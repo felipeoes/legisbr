@@ -21,7 +21,7 @@ FIXTURES = Path(__file__).parents[2] / "fixtures" / "rio_grande_do_norte"
 
 
 def _html(name: str) -> str:
-    return (FIXTURES / name).read_text()
+    return (FIXTURES / name).read_text(encoding="utf-8")
 
 
 def _make_scraper(**kwargs) -> RNAlrnScraper:

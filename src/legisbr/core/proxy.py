@@ -69,7 +69,9 @@ class ProxyService:
             sources: list[str] = []
             if file_path:
                 try:
-                    content = await asyncio.to_thread(Path(file_path).read_text)
+                    content = await asyncio.to_thread(
+                        Path(file_path).read_text, encoding="utf-8"
+                    )
                     file_proxies = [
                         p.strip() for p in content.splitlines() if p.strip()
                     ]

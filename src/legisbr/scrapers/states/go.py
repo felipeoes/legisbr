@@ -52,6 +52,10 @@ _HEADER_CHROME_RE = re.compile(
     re.IGNORECASE,
 )
 _WINZIP_TEXT_RE = re.compile(r"^\s*download\s+dos?\s+anexos?\s*$", re.IGNORECASE)
+_CONCAT_HTML_SPLIT_RE = re.compile(
+    r"(?<=</html>)(?=\s*<(?:!doctype|html|body)\b)",
+    re.IGNORECASE,
+)
 
 
 def _decode_cp1252_c1(text: str) -> str:
@@ -261,15 +265,26 @@ class LegislaGoias(BaseScraper):
     def _prepare_inline_html(self, html_content: str) -> tuple[str, str, bool]:
         """Clean inline HTML and return ``(clean_html, pdf_link, redirect)``."""
         raw_html = self._ensure_html_document(html_content)
-        soup = BeautifulSoup(raw_html, "lxml")
-        if _REDIRECT_MARKER.lower() in soup.get_text(" ", strip=True).lower():
+        # Some API contents prepend an empty HTML shell; split concatenated HTML
+        # documents before parsing because some libxml2 builds stop at the first </html>.
+        chunks = [
+            chunk for chunk in _CONCAT_HTML_SPLIT_RE.split(raw_html) if chunk.strip()
+        ] or [raw_html]
+        soups = [BeautifulSoup(chunk, "lxml") for chunk in chunks]
+        if any(
+            _REDIRECT_MARKER.lower() in s.get_text(" ", strip=True).lower()
+            for s in soups
+        ):
             return ("", "", True)
-        pdf_link = self._extract_pdf_link(soup)
-        # Some API contents prepend an empty HTML shell; keep the body with the text.
+        pdf_link = next(
+            (link for s in soups if (link := self._extract_pdf_link(s))),
+            "",
+        )
+        bodies = [body for s in soups for body in s.find_all("body")]
         root = max(
-            soup.find_all("body"),
+            bodies,
             key=lambda body: len(body.get_text(strip=True)),
-            default=soup,
+            default=soups[0],
         )
         for tag_name in ["meta", "link", "title", "input", "label"]:
             for tag in root.find_all(tag_name):
