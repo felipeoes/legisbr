@@ -296,7 +296,7 @@ uv run pytest tests -m integration
 uv run pre-commit run --all-files
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the 10-minute broken-scraper fix guide and PR checklist, and [SECURITY.md](SECURITY.md) for our TLS and disclosure policy.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the 10-minute broken-scraper fix guide and PR checklist.
 
 ## License
 
